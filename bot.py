@@ -471,14 +471,15 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                             text = block.get("text", "")
                             if text:
                                 # Add spacing between text chunks if needed
+                                spacing = ""
                                 if accumulated_text and not accumulated_text.endswith('\n') and not text.startswith('\n'):
                                     # Check if we need a newline (new paragraph) or space
                                     if accumulated_text.endswith(('.', '!', '?', ':')):
-                                        accumulated_text += "\n\n"
+                                        spacing = "\n\n"
                                     elif not accumulated_text.endswith(' '):
-                                        accumulated_text += " "
-                                accumulated_text += text
-                                current_chunk_text += text
+                                        spacing = " "
+                                accumulated_text += spacing + text
+                                current_chunk_text += spacing + text
                                 current_tool = None
 
                                 # Check if current chunk is getting too long - start new message
