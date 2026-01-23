@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=kafar
+WorkingDirectory=/home/kafar/claude-telegram-bot
+EnvironmentFile=/home/kafar/claude-telegram-bot/.env
+Environment="PATH=/home/kafar/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/kafar/claude-telegram-bot/venv/bin/python /home/kafar/claude-telegram-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

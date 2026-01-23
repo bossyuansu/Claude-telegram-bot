@@ -1,0 +1,32 @@
+# Environment and secrets
+.env
+*.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Session data (contains user info and Claude session IDs)
+data/sessions.json
+
+# Telegram session files (contains auth tokens)
+*.session
+*.session-journal
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
