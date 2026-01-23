@@ -74,9 +74,30 @@ chmod 600 "$ENV_FILE"
 echo "Saved to $ENV_FILE"
 echo
 
-# Install systemd service
+# Generate and install systemd service
 echo "[4/4] Setting up systemd service..."
 echo
+
+# Generate service file with correct paths
+CURRENT_USER="$(whoami)"
+cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=Claude Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=$CURRENT_USER
+WorkingDirectory=$SCRIPT_DIR
+EnvironmentFile=$SCRIPT_DIR/.env
+Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$SCRIPT_DIR/venv/bin/python $SCRIPT_DIR/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 if [ "$EUID" -ne 0 ]; then
     echo "Need sudo to install systemd service."
