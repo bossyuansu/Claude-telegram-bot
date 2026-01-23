@@ -524,7 +524,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                                 path = tool_input.get("file_path") or tool_input.get("command") or tool_input.get("pattern") or ""
                                 file_changes.append({
                                     "type": tool_name.lower(),
-                                    "path": path[:50]
+                                    "path": path[:100]
                                 })
                                 current_tool = tool_name
                                 # Show tool activity
@@ -570,11 +570,11 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 elif change["type"] == "edit":
                     final_chunk += f"\n  ✅ Edited: `{shorten_path(change['path'])}`"
                 elif change["type"] == "bash":
-                    final_chunk += f"\n  ✅ Ran: `{change['path'][:40]}`"
+                    final_chunk += f"\n  ✅ Ran: `{change['path'][:80]}{'...' if len(change['path']) > 80 else ''}`"
                 elif change["type"] == "read":
                     final_chunk += f"\n  📖 Read: `{shorten_path(change['path'])}`"
                 elif change["type"] in ["glob", "grep"]:
-                    final_chunk += f"\n  🔍 Search: `{change['path'][:40]}`"
+                    final_chunk += f"\n  🔍 Search: `{change['path'][:60]}{'...' if len(change['path']) > 60 else ''}`"
 
         # Add completion indicator
         if cancelled:
