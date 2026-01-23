@@ -28,6 +28,7 @@ CLAUDE_ALLOWED_TOOLS = os.environ.get(
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
+UPLOADS_DIR = DATA_DIR / "uploads"  # Directory for downloaded files
 
 last_update_id = 0
 
@@ -36,6 +37,43 @@ user_sessions = {}  # chat_id -> {sessions: [], active: session_id}
 pending_questions = {}  # chat_id -> {questions, session, awaiting_text}
 active_processes = {}  # session_id -> subprocess.Popen (allows parallel sessions)
 message_queue = {}  # session_id -> [queued messages]
+
+
+def download_telegram_file(file_id, filename=None):
+    """Download a file from Telegram and return the local path."""
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Get file path from Telegram
+        resp = requests.get(f"{API_URL}/getFile", params={"file_id": file_id}, timeout=30)
+        file_info = resp.json().get("result", {})
+        file_path = file_info.get("file_path")
+
+        if not file_path:
+            return None
+
+        # Download the file
+        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        resp = requests.get(download_url, timeout=60)
+
+        if resp.status_code != 200:
+            return None
+
+        # Determine filename
+        if not filename:
+            filename = file_path.split("/")[-1]
+
+        # Save to uploads directory with timestamp to avoid collisions
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_path = UPLOADS_DIR / f"{timestamp}_{filename}"
+
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+
+        return str(local_path)
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return None
 
 
 def load_sessions():
@@ -1259,14 +1297,72 @@ def main():
             # Handle messages
             message = update.get("message", {})
             chat_id = message.get("chat", {}).get("id")
-            text = message.get("text", "")
 
-            if not chat_id or not text:
+            if not chat_id:
                 continue
 
             if not is_allowed(chat_id):
                 print(f"Unauthorized access attempt from chat_id: {chat_id}")
                 send_message(chat_id, "Unauthorized. Your chat ID is not in the allowed list.")
+                continue
+
+            # Get text from message or caption (for photos/files)
+            text = message.get("text", "") or message.get("caption", "")
+
+            # Handle photo uploads
+            if message.get("photo"):
+                # Get the largest photo (last in array)
+                photo = message["photo"][-1]
+                file_id = photo.get("file_id")
+
+                send_message(chat_id, "📷 _Downloading image..._")
+                local_path = download_telegram_file(file_id, "image.jpg")
+
+                if local_path:
+                    # Create prompt with image path for Claude to read
+                    prompt = f"[User uploaded an image: {local_path}]\n\n"
+                    if text:
+                        prompt += text
+                    else:
+                        prompt += "Please analyze this image."
+
+                    print(f"Received photo from {chat_id}, saved to {local_path}")
+                    handle_message(chat_id, prompt)
+                else:
+                    send_message(chat_id, "❌ Failed to download image.")
+                continue
+
+            # Handle document/file uploads
+            if message.get("document"):
+                doc = message["document"]
+                file_id = doc.get("file_id")
+                file_name = doc.get("file_name", "file")
+                file_size = doc.get("file_size", 0)
+
+                # Limit file size (10MB)
+                if file_size > 10 * 1024 * 1024:
+                    send_message(chat_id, "❌ File too large. Maximum size is 10MB.")
+                    continue
+
+                send_message(chat_id, f"📄 _Downloading {file_name}..._")
+                local_path = download_telegram_file(file_id, file_name)
+
+                if local_path:
+                    # Create prompt with file path for Claude to read
+                    prompt = f"[User uploaded a file: {local_path}]\n\n"
+                    if text:
+                        prompt += text
+                    else:
+                        prompt += "Please analyze this file."
+
+                    print(f"Received file from {chat_id}: {file_name}, saved to {local_path}")
+                    handle_message(chat_id, prompt)
+                else:
+                    send_message(chat_id, "❌ Failed to download file.")
+                continue
+
+            # Skip if no text content
+            if not text:
                 continue
 
             print(f"Received from {chat_id}: {text[:50]}...")
