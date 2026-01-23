@@ -67,9 +67,13 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
 
 ## Systemd Service
 
-Install as a service:
+Use the setup script to automatically install as a service:
 ```bash
-sudo cp claude-telegram-bot.service /etc/systemd/system/
+./setup.sh
+```
+
+Or manually:
+```bash
 sudo systemctl enable claude-telegram-bot
 sudo systemctl start claude-telegram-bot
 ```
