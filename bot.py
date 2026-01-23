@@ -1343,9 +1343,9 @@ def main():
                 file_name = doc.get("file_name", "file")
                 file_size = doc.get("file_size", 0)
 
-                # Limit file size (10MB)
-                if file_size > 10 * 1024 * 1024:
-                    send_message(chat_id, "❌ File too large. Maximum size is 10MB.")
+                # Limit file size (50MB)
+                if file_size > 50 * 1024 * 1024:
+                    send_message(chat_id, "❌ File too large. Maximum size is 50MB.")
                     continue
 
                 send_message(chat_id, f"📄 _Downloading {file_name}..._")
