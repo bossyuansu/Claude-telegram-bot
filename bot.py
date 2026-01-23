@@ -565,9 +565,13 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                                     "path": path[:100]
                                 })
                                 current_tool = tool_name
-                                # Show tool activity
+                                # Show tool activity with command preview for Bash
                                 display_text = current_chunk_text or ""
-                                status = f"\n\n🔧 _Running {tool_name}..._"
+                                if tool_name == "Bash" and path:
+                                    cmd_preview = path[:60] + "..." if len(path) > 60 else path
+                                    status = f"\n\n🔧 _Running:_ `{cmd_preview}`"
+                                else:
+                                    status = f"\n\n🔧 _Running {tool_name}..._"
                                 edit_message(chat_id, message_id, display_text + status)
                                 last_update = time.time()
 
