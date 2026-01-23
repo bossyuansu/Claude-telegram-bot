@@ -2,6 +2,9 @@
 .env
 *.env
 
+# Local service file (contains user-specific paths)
+claude-telegram-bot.service.local
+
 # Python
 venv/
 __pycache__/
