@@ -12,6 +12,7 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
 - **Long message chunking** - Splits long responses into multiple messages
 - **Parallel tasks** - Run tasks in different sessions concurrently
 - **Question handling** - Interactive buttons for Claude's questions
+- **Photo & file uploads** - Send images and files for Claude to analyze (up to 50MB)
 
 ### Userbot (`userbot.py`)
 - **Readonly mode** - Can only read files, search code, answer questions
