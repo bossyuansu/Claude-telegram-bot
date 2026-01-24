@@ -272,6 +272,7 @@ async def process_messages(event, initial_text):
     # Combine initial text with any pending messages
     all_messages = [initial_text] + pending_messages
     pending_messages = []
+    thinking_msg = None  # Reset at start
 
     if len(all_messages) > 1:
         combined = "\n\n".join(all_messages)
@@ -280,26 +281,25 @@ async def process_messages(event, initial_text):
         prompt = all_messages[0]
 
     # Send immediate "thinking" message
-    thinking_msg = await event.reply(f"{BOT_INDICATOR} ⏳ _thinking..._")
+    initial_msg = await event.reply(f"{BOT_INDICATOR} ⏳ _thinking..._")
+    thinking_msg = initial_msg  # Set global for cancellation handling
 
     # Rate limit updates and handle chunking for long responses
     last_update = [0]  # Use list for mutable closure
     last_text = [""]
     current_chunk = [""]  # Track current chunk text
-    message_ids = [thinking_msg]  # Track all messages for chunked responses
+    current_msg = [initial_msg]  # Use list for mutable closure
     max_chunk_len = 3500  # Start new message before hitting Telegram's 4096 limit
 
     async def update_message(text):
-        nonlocal thinking_msg
         now = asyncio.get_event_loop().time()
 
         # Check if we need to start a new message chunk
         if len(text) > max_chunk_len and len(current_chunk[0]) <= max_chunk_len:
             # Finalize current message and start new one
             try:
-                await thinking_msg.edit(f"{BOT_INDICATOR} {current_chunk[0]}\n\n———\n_continued..._")
-                thinking_msg = await client.send_message(event.chat_id, f"{BOT_INDICATOR} ⏳ _continuing..._")
-                message_ids.append(thinking_msg)
+                await current_msg[0].edit(f"{BOT_INDICATOR} {current_chunk[0]}\n\n———\n_continued..._")
+                current_msg[0] = await client.send_message(event.chat_id, f"{BOT_INDICATOR} ⏳ _continuing..._")
                 current_chunk[0] = text[max_chunk_len:]  # Start tracking from overflow point
             except:
                 pass
@@ -319,7 +319,7 @@ async def process_messages(event, initial_text):
                 full_text = f"{BOT_INDICATOR} {chunk_text}"
                 if len(full_text) > 4000:
                     full_text = full_text[:3950] + "\n\n_(...generating)_"
-                await thinking_msg.edit(full_text)
+                await current_msg[0].edit(full_text)
                 last_update[0] = now
                 last_text[0] = text
             except Exception as e:
@@ -343,10 +343,10 @@ async def process_messages(event, initial_text):
         # Chunk long responses instead of truncating
         max_len = 3900  # Leave room for safety
         if len(full_response) <= max_len:
-            await thinking_msg.edit(full_response)
+            await current_msg[0].edit(full_response)
         else:
-            # For long responses, delete thinking msg and send fresh chunked messages
-            await thinking_msg.delete()
+            # For long responses, delete current msg and send fresh chunked messages
+            await current_msg[0].delete()
             chunks = [full_response[i:i + max_len] for i in range(0, len(full_response), max_len)]
             for i, chunk in enumerate(chunks):
                 if i == 0:
@@ -358,9 +358,7 @@ async def process_messages(event, initial_text):
 
         print(f"Replied: {response[:50]}... (total {len(full_response)} chars)")
     else:
-        await thinking_msg.edit(f"{BOT_INDICATOR} No response")
-
-    thinking_msg = None
+        await current_msg[0].edit(f"{BOT_INDICATOR} No response")
 
 
 async def main():
