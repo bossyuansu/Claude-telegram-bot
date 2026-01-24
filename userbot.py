@@ -132,7 +132,7 @@ def run_claude_process(prompt, cwd=None):
 
 async def stream_response(process, update_callback, update_interval=1.5):
     """Stream Claude response, calling update_callback periodically with accumulated text.
-    Returns (response_text, new_session_id)."""
+    Returns (response_text, context_overflow)."""
     global current_process, claude_session_id
 
     accumulated_text = ""
@@ -203,11 +203,22 @@ async def stream_response(process, update_callback, update_interval=1.5):
         if new_session_id:
             claude_session_id = new_session_id
 
-        return accumulated_text.strip() or "Done."
+        result = accumulated_text.strip() or "Done."
+
+        # Check for context overflow error
+        context_overflow = ("prompt is too long" in result.lower() or
+                           "context length" in result.lower() or
+                           "too much media" in result.lower())
+
+        return result, context_overflow
 
     except Exception as e:
         current_process = None
-        return f"Error: {e}"
+        error_msg = str(e)
+        context_overflow = ("prompt is too long" in error_msg.lower() or
+                           "context length" in error_msg.lower() or
+                           "too much media" in error_msg.lower())
+        return f"Error: {e}", context_overflow
 
 
 def cancel_current():
@@ -328,7 +339,42 @@ async def process_messages(event, initial_text):
 
     # Start Claude process and stream
     process = run_claude_process(prompt)
-    response = await stream_response(process, update_message)
+    response, context_overflow = await stream_response(process, update_message)
+
+    # Handle context overflow with smart compaction
+    if context_overflow:
+        await current_msg[0].edit(f"{BOT_INDICATOR} ⚠️ *Context too long* - compacting session...")
+
+        # Try to get summary from old session
+        summary_prompt = """Before we reset, provide a brief summary (max 300 words) of:
+1. What we've been discussing
+2. Key points or decisions
+3. Current context
+
+Format as a compact bullet list."""
+
+        try:
+            summary_process = run_claude_process(summary_prompt)
+            summary_response, _ = await stream_response(summary_process, lambda x: None)
+            summary = summary_response.split("———")[0].strip() if summary_response else ""
+        except:
+            summary = ""
+
+        # Reset session
+        global claude_session_id
+        claude_session_id = None
+
+        # Retry with context
+        if summary and len(summary) > 50:
+            context_prompt = f"[Session compacted - Previous context:]\n{summary}\n\n[New request:]\n{prompt}"
+            await current_msg[0].edit(f"{BOT_INDICATOR} 🔄 Session reset with context preserved. Continuing...")
+        else:
+            context_prompt = prompt
+            await current_msg[0].edit(f"{BOT_INDICATOR} 🔄 Session reset. Continuing...")
+
+        await asyncio.sleep(1)
+        process = run_claude_process(context_prompt)
+        response, _ = await stream_response(process, update_message)
 
     # Check if new messages came in while processing
     if pending_messages:
