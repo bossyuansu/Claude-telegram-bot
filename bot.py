@@ -1942,11 +1942,9 @@ Format as a compact bullet list."""
             # Clean response for review
             clean_response = response.split("———")[0].strip() if response else "No output"
 
-            # Update rolling history
+            # Update rolling history — no cap, Codex models have large context windows
             step_summary = clean_response[:1500]
             history_summary += f"\n\nStep {step}: {step_summary}"
-            if len(history_summary) > 8000:
-                history_summary = history_summary[-6000:]
 
             # --- Phase 2: Pause (human-like pacing) ---
             time.sleep(3)
