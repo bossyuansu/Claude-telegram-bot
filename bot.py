@@ -1592,9 +1592,13 @@ Pay special attention to design and architecture flaws:
 - Do NOT say DONE during this phase.""",
 
             "testing": """CURRENT PHASE: TESTING
-Claude should be writing and running tests. Drive comprehensive test coverage.
+Claude should be writing and running tests. Prioritize integration and end-to-end tests
+over unit tests — verify that components work together correctly, not just in isolation.
 
-- If tests need to be written, tell Claude which tests to write.
+- Focus on INTEGRATION TESTS first: test real workflows, API interactions, data flowing
+  through multiple components, and realistic user scenarios end-to-end.
+- Unit tests are secondary — only add them for complex pure logic or tricky edge cases.
+- If tests need to be written, tell Claude which integration/e2e tests to write.
 - If tests are failing, tell Claude to fix them. Be specific.
 - If tests are written AND passing, DO NOT say DONE yet. Instead, ask Claude to verify
   by re-running ALL tests and confirming everything passes.
