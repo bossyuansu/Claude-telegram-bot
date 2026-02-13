@@ -1530,7 +1530,7 @@ def is_quota_error_response(text):
     return bool(QUOTA_REGEX.search(text))
 
 
-def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None):
+def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None, claude_plan=None):
     """Call Codex to review Claude's output and determine next action.
 
     Returns: (next_prompt: str or None, is_done: bool, reasoning: str)
@@ -1624,12 +1624,23 @@ over unit tests — verify that components work together correctly, not just in 
         }
         phase_block = phase_instructions.get(phase, phase_instructions["implementing"])
 
+    plan_section = ""
+    if claude_plan:
+        plan_section = f"""
+CLAUDE'S IMPLEMENTATION PLAN:
+{claude_plan}
+
+IMPORTANT: Track progress against ALL items in this plan. Don't let Claude get stuck
+polishing one item while other plan items remain unstarted. If the current item looks
+complete, direct Claude to the NEXT unfinished item in the plan.
+"""
+
     codex_prompt = f"""You are a senior engineering project manager overseeing an autonomous coding session.
 You are responsible for driving the work through three phases: implementation → code review → testing.
 
 ORIGINAL TASK:
 {original_task}
-
+{plan_section}
 PROGRESS SO FAR (step {step}):
 {history_summary}
 
@@ -1792,6 +1803,7 @@ def run_justdoit_loop(chat_id, task, session):
     step = 0
     phase = "implementing"
     history_summary = ""
+    claude_plan = ""  # Captured from Claude's first response to give Codex full plan visibility
     codex_fail_streak = 0
     pending_transition = None  # Set when Codex says VERIFY:<target>, cleared after verification
     verify_attempts = 0  # Track consecutive verification attempts to prevent loops
@@ -1944,6 +1956,11 @@ Format as a compact bullet list."""
             # Clean response for review
             clean_response = response.split("———")[0].strip() if response else "No output"
 
+            # Capture Claude's plan from early steps (usually step 1-2)
+            # so Codex can track progress against the full plan
+            if not claude_plan and step <= 3 and len(clean_response) > 200:
+                claude_plan = clean_response[:3000]
+
             # Update rolling history — no cap, Codex models have large context windows
             step_summary = clean_response[:1500]
             history_summary += f"\n\nStep {step}: {step_summary}"
@@ -1982,7 +1999,8 @@ Format as a compact bullet list."""
             print(f"{log_prefix} Step {step}: Calling Codex review. Phase: {phase}, pending_transition: {pending_transition}", flush=True)
             next_prompt, is_done, reasoning = run_codex_review(
                 task, clean_response, step, history_summary, cwd, phase=phase,
-                pending_transition=pending_transition, stale_warning=stale_warning
+                pending_transition=pending_transition, stale_warning=stale_warning,
+                claude_plan=claude_plan
             )
             # Clear pending_transition after it's been used
             pending_transition = None
@@ -2054,7 +2072,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                 send_message(chat_id, "🔄 *Resuming after rate-limit wait...*")
                 next_prompt, is_done, reasoning = run_codex_review(
                     task, clean_response, step, history_summary, cwd, phase=phase,
-                    pending_transition=pending_transition
+                    pending_transition=pending_transition, claude_plan=claude_plan
                 )
                 pending_transition = None
 
