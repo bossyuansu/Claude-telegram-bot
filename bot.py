@@ -37,6 +37,9 @@ CLAUDE_ALLOWED_TOOLS = os.environ.get(
     "Write,Edit,Bash,Read,Glob,Grep,Task,WebFetch,WebSearch,NotebookEdit,TodoWrite"
 )
 
+# Codex model for JustDoIt orchestration (update when newer models release)
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.3-codex")
+
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
@@ -319,17 +322,30 @@ def save_sessions():
         print(f"Error saving sessions: {e}")
 
 
+_tg_poll_failures = 0
+
 def get_updates(offset=0):
-    """Poll for new messages and callback queries."""
+    """Poll for new messages and callback queries with timeout backoff."""
+    global _tg_poll_failures
     try:
         resp = requests.get(
             f"{API_URL}/getUpdates",
             params={"offset": offset, "timeout": 30},
-            timeout=35
+            timeout=(10, 40)  # connect/read
         )
+        resp.raise_for_status()
+        _tg_poll_failures = 0
         return resp.json().get("result", [])
+    except requests.exceptions.ReadTimeout:
+        _tg_poll_failures = min(_tg_poll_failures + 1, 10)
+        if _tg_poll_failures % 5 == 0:
+            print(f"Telegram getUpdates read timeout x{_tg_poll_failures}; backing off")
+        time.sleep(min(2 ** min(_tg_poll_failures, 4), 15))
+        return []
     except Exception as e:
-        print(f"Error getting updates: {e}")
+        _tg_poll_failures = min(_tg_poll_failures + 1, 10)
+        print(f"Error getting updates (#{_tg_poll_failures}): {e}")
+        time.sleep(min(2 ** min(_tg_poll_failures, 4), 15))
         return []
 
 
@@ -1361,7 +1377,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
             if codex_sid:
                 cmd = [
                     "codex", "exec", "resume", codex_sid,
-                    "-m", "gpt-5.2-codex",
+                    "-m", CODEX_MODEL,
                     "-c", 'model_reasoning_effort="xhigh"',
                     "--full-auto", "--json",
                     task
@@ -1369,7 +1385,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
             else:
                 cmd = [
                     "codex", "exec",
-                    "-m", "gpt-5.2-codex",
+                    "-m", CODEX_MODEL,
                     "-c", 'model_reasoning_effort="xhigh"',
                     "--full-auto", "--json",
                     task
@@ -1627,7 +1643,12 @@ GENERAL RULES:
 2. If Claude presented a plan and is waiting for approval, approve it and tell Claude to proceed.
 3. If there are errors or failing tests, craft a specific follow-up prompt to fix them.
 4. If Claude seems stuck or going in circles, try a different approach.
-5. Be specific and actionable. Don't just say "continue" — say exactly what to do next.
+5. NEVER ask Claude for a status update — you can already see its output above. Prompts like
+   "what's the status?", "please continue", or "keep going" waste a step and produce no work.
+   Instead, tell Claude what to do NEXT. If you're unsure of specifics (you don't have full
+   codebase context), it's fine to say something like "Now implement the error handling for
+   the upload feature" without specifying exact files — Claude has the full session context
+   and will figure out the details. The key is: every prompt must drive NEW work forward.
 6. Keep prompts concise but complete. Claude has full conversation context from the session.
 7. Always watch for design and architecture flaws in Claude's output: poor abstractions, tight coupling, scalability issues, inconsistent patterns, or structural problems. If you spot any, include them in your next prompt so Claude addresses them.
 
@@ -1647,7 +1668,7 @@ RESPOND WITH ONE OF:
         process = subprocess.Popen(
             [
                 "codex", "exec",
-                "-m", "gpt-5.2-codex",
+                "-m", CODEX_MODEL,
                 "-c", 'model_reasoning_effort="xhigh"',
                 "--full-auto",
                 codex_prompt
@@ -1922,10 +1943,10 @@ Format as a compact bullet list."""
             clean_response = response.split("———")[0].strip() if response else "No output"
 
             # Update rolling history
-            step_summary = clean_response[:500]
+            step_summary = clean_response[:1500]
             history_summary += f"\n\nStep {step}: {step_summary}"
-            if len(history_summary) > 3000:
-                history_summary = history_summary[-2000:]
+            if len(history_summary) > 8000:
+                history_summary = history_summary[-6000:]
 
             # --- Phase 2: Pause (human-like pacing) ---
             time.sleep(3)
