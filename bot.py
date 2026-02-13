@@ -38,7 +38,7 @@ CLAUDE_ALLOWED_TOOLS = os.environ.get(
 )
 
 # Codex model for JustDoIt orchestration (update when newer models release)
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.3-codex")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.2-codex")
 
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
@@ -1699,8 +1699,10 @@ RESPOND WITH ONE OF:
             return None, False, f"QUOTA: Codex rate limited — {stderr_filtered[:200]}"
 
         if not output:
-            if error_output:
-                return None, False, f"Codex error: {error_output[:200]}"
+            # Use filtered stderr (banner removed) for clearer error messages
+            error_msg = stderr_filtered[:300] if stderr_filtered else error_output[:300]
+            if error_msg:
+                return None, False, f"Codex error: {error_msg}"
             return None, False, "Codex produced no output"
 
         if output.startswith("DONE"):
