@@ -1751,7 +1751,7 @@ RESPOND WITH ONE OF:
     except subprocess.TimeoutExpired:
         process.kill()
         print(f"[Codex] TIMEOUT after 120s", flush=True)
-        return "Please continue with the current task. What's the status?", False, "Codex timed out"
+        return "Continue implementing the next unfinished item from the plan.", False, "Codex timed out"
     except FileNotFoundError:
         print(f"[Codex] ERROR: codex binary not found", flush=True)
         return None, False, "Codex not found"
@@ -1803,7 +1803,8 @@ def run_justdoit_loop(chat_id, task, session):
     step = 0
     phase = "implementing"
     history_summary = ""
-    claude_plan = ""  # Captured from Claude's first response to give Codex full plan visibility
+    plan_file = os.path.join(cwd, "PLAN.md")
+    claude_plan = ""  # Read from plan file to give Codex full plan visibility
     codex_fail_streak = 0
     pending_transition = None  # Set when Codex says VERIFY:<target>, cleared after verification
     verify_attempts = 0  # Track consecutive verification attempts to prevent loops
@@ -1818,7 +1819,38 @@ Task: _{task[:200]}_
 _Starting autonomous implementation..._
 _Use /cancel to stop at any time._""")
 
-        current_prompt = task
+        # Step 0: Ask Claude to consolidate/create a plan file
+        # Claude knows its own session context — it knows if it already created a plan somewhere
+        print(f"{log_prefix} Step 0: Asking Claude for plan file", flush=True)
+        plan_setup_prompt = (
+            "Before we begin autonomous implementation, I need a plan file.\n"
+            "1. If you already created a plan/todo file in this project, copy its content to PLAN.md in the project root.\n"
+            "2. If no plan exists yet, create PLAN.md with a structured checklist for the task.\n"
+            "Use markdown checkboxes: - [ ] for pending, - [x] for done.\n"
+            "Then reply with ONLY the text: PLAN_READY"
+        )
+        plan_response, _, _, plan_sid, _ = run_claude_streaming(
+            plan_setup_prompt, chat_id, cwd=cwd, continue_session=True,
+            session_id=session_id, session=session
+        )
+        if plan_sid:
+            update_claude_session_id(chat_id, session, plan_sid)
+            session = get_session_by_id(chat_id, session_id) or session
+
+        # Read the plan file Claude just created/updated
+        try:
+            if os.path.exists(plan_file):
+                with open(plan_file, "r") as f:
+                    claude_plan = f.read()[:5000]
+                print(f"{log_prefix} Step 0: PLAN.md loaded ({len(claude_plan)} chars)", flush=True)
+            else:
+                print(f"{log_prefix} Step 0: PLAN.md not found after setup", flush=True)
+        except Exception:
+            pass
+
+        current_prompt = task + (
+            "\n\nRemember to update PLAN.md checkboxes (- [ ] → - [x]) as you complete each item."
+        )
 
         while True:
             # Check cancellation
@@ -1956,10 +1988,13 @@ Format as a compact bullet list."""
             # Clean response for review
             clean_response = response.split("———")[0].strip() if response else "No output"
 
-            # Capture Claude's plan from early steps (usually step 1-2)
-            # so Codex can track progress against the full plan
-            if not claude_plan and step <= 3 and len(clean_response) > 200:
-                claude_plan = clean_response[:3000]
+            # Re-read PLAN.md after each step (Claude may have updated checkboxes)
+            try:
+                if os.path.exists(plan_file):
+                    with open(plan_file, "r") as f:
+                        claude_plan = f.read()[:5000]
+            except Exception:
+                pass
 
             # Update rolling history — no cap, Codex models have large context windows
             step_summary = clean_response[:1500]
@@ -2119,7 +2154,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                     print(f"{log_prefix} Step {step}: Codex failed 3x in a row. Stopping.", flush=True)
                     send_message(chat_id, "❌ *Codex failed 3 times in a row.* Stopping justdoit.\n_Session preserved for manual continuation._")
                     break
-                next_prompt = "Please continue with the current task. What's the current status and what's left to do?"
+                next_prompt = "Continue implementing the next unfinished item from the plan."
             else:
                 codex_fail_streak = 0
 
