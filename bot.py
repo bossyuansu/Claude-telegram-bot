@@ -1310,7 +1310,7 @@ def create_session(chat_id, project_name, cwd):
         "created_at": datetime.now().isoformat(),
         "last_prompt": None,  # Track last prompt for context
         "claude_session_id": None,  # Claude CLI's session ID for --resume
-        "message_count": 0,  # Track messages for proactive compaction
+        "message_counts": {"claude": 0, "codex": 0, "gemini": 0},  # Per-CLI compaction counters
     }
 
     user_sessions[chat_key]["sessions"].append(session)
@@ -1535,33 +1535,42 @@ def save_session_summary(chat_id, session, summary):
 COMPACTION_THRESHOLD = 30
 
 
-def increment_message_count(chat_id, session):
-    """Increment message count and return True if compaction is needed."""
+def increment_message_count(chat_id, session, cli_name):
+    """Increment per-CLI message count and return True if compaction is needed."""
     if not session:
         return False
 
     chat_key = str(chat_id)
     session_id = get_session_id(session)
+    key = cli_name.lower()
 
     for s in user_sessions.get(chat_key, {}).get("sessions", []):
         if get_session_id(s) == session_id:
-            s["message_count"] = s.get("message_count", 0) + 1
+            # Migrate old single counter to per-CLI dict
+            counts = s.get("message_counts")
+            if not isinstance(counts, dict):
+                s["message_counts"] = {"claude": 0, "codex": 0, "gemini": 0}
+                counts = s["message_counts"]
+            counts[key] = counts.get(key, 0) + 1
             save_sessions()
-            return s["message_count"] >= COMPACTION_THRESHOLD
+            return counts[key] >= COMPACTION_THRESHOLD
     return False
 
 
-def reset_message_count(chat_id, session):
-    """Reset the message count after compaction."""
+def reset_message_count(chat_id, session, cli_name):
+    """Reset per-CLI message count after compaction."""
     if not session:
         return
 
     chat_key = str(chat_id)
     session_id = get_session_id(session)
+    key = cli_name.lower()
 
     for s in user_sessions.get(chat_key, {}).get("sessions", []):
         if get_session_id(s) == session_id:
-            s["message_count"] = 0
+            counts = s.get("message_counts")
+            if isinstance(counts, dict):
+                counts[key] = 0
             save_sessions()
             break
 
@@ -1694,7 +1703,7 @@ Format as a compact bullet list. This summary will be used to restore context af
         save_session_summary(chat_id, session, summary)
         # Reset the specific CLI session ID
         update_cli_session_id(chat_id, session, cli_name, None)
-        reset_message_count(chat_id, session)
+        reset_message_count(chat_id, session, cli_name)
         return summary
     
     return None
@@ -1714,7 +1723,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
         processed_item_ids = set()
         try:
             if session:
-                needs_compaction = increment_message_count(chat_id, session)
+                needs_compaction = increment_message_count(chat_id, session, "Codex")
                 if needs_compaction:
                     perform_proactive_compaction(chat_id, session, "Codex")
 
@@ -1984,7 +1993,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
         processed_tool_ids = set()
         try:
             if session:
-                needs_compaction = increment_message_count(chat_id, session)
+                needs_compaction = increment_message_count(chat_id, session, "Gemini")
                 if needs_compaction:
                     perform_proactive_compaction(chat_id, session, "Gemini")
 
@@ -2730,7 +2739,7 @@ _Use /cancel to stop at any time._""")
                     print(f"{log_prefix} Step {step}: Context overflow, resetting Claude session", flush=True)
                     send_message(chat_id, "⚠️ Context overflow — resetting Claude session...")
                     update_claude_session_id(chat_id, session, None)
-                    reset_message_count(chat_id, session)
+                    reset_message_count(chat_id, session, "Claude")
 
                 # Auto-answer any questions
                 if questions:
@@ -2970,7 +2979,7 @@ _Use /cancel to stop at any time._""")
             send_message(chat_id, f"🔄 *Step {step}* — Sending to Claude...")
 
             # Handle compaction
-            needs_compaction = increment_message_count(chat_id, session)
+            needs_compaction = increment_message_count(chat_id, session, "Claude")
 
             if needs_compaction:
                 print(f"{log_prefix} Step {step}: Auto-compaction triggered", flush=True)
@@ -3000,7 +3009,7 @@ Format as a compact bullet list."""
                     save_session_summary(chat_id, session, summary)
 
                 update_claude_session_id(chat_id, session, None)
-                reset_message_count(chat_id, session)
+                reset_message_count(chat_id, session, "Claude")
 
                 if summary and len(summary) > 50:
                     current_prompt = f"""[Session compacted - Previous context summary:]
@@ -3045,7 +3054,7 @@ Format as a compact bullet list."""
                 print(f"{log_prefix} Step {step}: Context overflow detected, compacting.", flush=True)
                 send_message(chat_id, "⚠️ Context overflow — compacting...")
                 update_claude_session_id(chat_id, session, None)
-                reset_message_count(chat_id, session)
+                reset_message_count(chat_id, session, "Claude")
 
                 response, questions, _, claude_sid, _ = run_claude_streaming(
                     current_prompt, chat_id, cwd=cwd, continue_session=True,
@@ -3655,7 +3664,7 @@ After fixing everything you find, report what you fixed and what looks clean."""
 After fixing, do another pass to make sure you didn't introduce regressions. Report exactly what you changed. If you disagree with any feedback, explain why."""
 
             # Handle compaction
-            needs_compaction = increment_message_count(chat_id, session)
+            needs_compaction = increment_message_count(chat_id, session, "Claude")
             if needs_compaction:
                 send_message(chat_id, "📦 *Auto-compacting* session context...")
                 try:
@@ -3670,7 +3679,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
                 if summary and len(summary) > 50:
                     save_session_summary(chat_id, session, summary)
                 update_claude_session_id(chat_id, session, None)
-                reset_message_count(chat_id, session)
+                reset_message_count(chat_id, session, "Claude")
                 if summary and len(summary) > 50:
                     prompt = f"[Session compacted - Previous context summary:]\n{summary}\n\n[Continuing task:]\n{prompt}"
                 send_message(chat_id, "🔄 Context preserved. Continuing...")
@@ -3687,7 +3696,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
             if context_overflow:
                 send_message(chat_id, "⚠️ Context overflow — compacting...")
                 update_claude_session_id(chat_id, session, None)
-                reset_message_count(chat_id, session)
+                reset_message_count(chat_id, session, "Claude")
                 response, questions, _, claude_sid, _ = run_claude_streaming(
                     prompt, chat_id, cwd=cwd, continue_session=True,
                     session_id=session_id, session=session
@@ -3917,7 +3926,7 @@ If you find problems, fix them immediately and report what you changed.
 If Codex's work is solid and the code is clean, say exactly: ALL_CLEAN"""
 
             # Handle compaction
-            needs_compaction = increment_message_count(chat_id, session)
+            needs_compaction = increment_message_count(chat_id, session, "Claude")
             if needs_compaction:
                 send_message(chat_id, "📦 *Auto-compacting* session context...")
                 try:
@@ -3932,7 +3941,7 @@ If Codex's work is solid and the code is clean, say exactly: ALL_CLEAN"""
                 if summary and len(summary) > 50:
                     save_session_summary(chat_id, session, summary)
                 update_claude_session_id(chat_id, session, None)
-                reset_message_count(chat_id, session)
+                reset_message_count(chat_id, session, "Claude")
                 if summary and len(summary) > 50:
                     critique_prompt = f"[Session compacted - Previous context summary:]\n{summary}\n\n[Continuing task:]\n{critique_prompt}"
                 send_message(chat_id, "🔄 Context preserved. Continuing...")
@@ -3946,7 +3955,7 @@ If Codex's work is solid and the code is clean, say exactly: ALL_CLEAN"""
                 session = get_session_by_id(chat_id, session_id) or session
             if context_overflow:
                 update_claude_session_id(chat_id, session, None)
-                reset_message_count(chat_id, session)
+                reset_message_count(chat_id, session, "Claude")
                 response, _, _, claude_sid, _ = run_claude_streaming(
                     critique_prompt, chat_id, cwd=cwd, continue_session=True,
                     session_id=session_id, session=session
@@ -4779,7 +4788,7 @@ def run_claude_in_thread(chat_id, text, session=None):
         try:
             if session:
                 # Check if proactive compaction is needed BEFORE sending to Claude
-                needs_compaction = increment_message_count(chat_id, session)
+                needs_compaction = increment_message_count(chat_id, session, "Claude")
 
                 if needs_compaction:
                     perform_proactive_compaction(chat_id, session, "Claude")
@@ -4821,7 +4830,7 @@ Format as a compact bullet list. This will be used to restore context after rese
 
                     # Reset the session
                     update_claude_session_id(chat_id, session, None)
-                    reset_message_count(chat_id, session)
+                    reset_message_count(chat_id, session, "Claude")
 
                     # Retry with fresh session, including summary as context
                     if summary and len(summary) > 50:
