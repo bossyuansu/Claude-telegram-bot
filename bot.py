@@ -234,7 +234,7 @@ def check_memory_pressure():
 
 
 def check_interrupted_tasks():
-    """On startup, check if justdoit tasks were interrupted by a crash and notify users."""
+    """On startup, check if justdoit/omni tasks were interrupted by a crash and notify users."""
     if not ACTIVE_TASKS_FILE.exists():
         return
 
@@ -262,11 +262,13 @@ def check_interrupted_tasks():
                 session_name = info.get("session_name", "unknown")
                 step = info.get("step", "?")
                 phase = info.get("phase", "")
-                msg += f"\n• *{session_name}* JustDoIt step {step}"
+                task_type = info.get("type", "justdoit")
+                type_label = {"justdoit": "JustDoIt", "omni": "Omni"}.get(task_type, task_type.title())
+                msg += f"\n• *{session_name}* {type_label} step {step}"
                 if phase:
                     msg += f" ({phase})"
                 msg += f": _{task_desc[:100]}_"
-            msg += "\n\n_Sessions preserved. Use `/justdoit` to restart or send a message to continue manually._"
+            msg += "\n\n_Sessions preserved. Use the original command to restart or send a message to continue manually._"
             try:
                 send_message(int(chat_id), msg)
             except Exception as e:
