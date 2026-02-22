@@ -907,13 +907,27 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             cwd=work_dir,
             start_new_session=True  # Own process group so we can kill the whole tree on cancel
         )
 
         # Track active process for cancellation (by session_id for parallel support)
         active_processes[process_key] = process
+
+        # Drain stderr in background so errors are logged instead of silently lost
+        claude_stderr_lines = []
+        def _drain_claude_stderr():
+            try:
+                for raw_line in process.stderr:
+                    line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+                    if line:
+                        claude_stderr_lines.append(line[:500])
+                        print(f"[Claude stderr] {line[:300]}", flush=True)
+            except Exception:
+                pass
+        stderr_thread = threading.Thread(target=_drain_claude_stderr, daemon=True)
+        stderr_thread.start()
 
         # Track for crash recovery
         session_name = session.get("name", "default") if session else "default"
@@ -1198,9 +1212,17 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 elif change["type"] in ["glob", "grep"]:
                     final_chunk += f"\n  🔍 Search: `{change['path'][:60]}{'...' if len(change['path']) > 60 else ''}`"
 
+        # Wait for stderr drain
+        try:
+            stderr_thread.join(timeout=5)
+        except Exception:
+            pass
+
         # Add completion indicator
         if cancelled:
             final_chunk += "\n\n———\n⚠️ _cancelled_"
+        elif not accumulated_text.strip() and claude_stderr_lines:
+            final_chunk += f"\n\n———\n❌ _No output:_ {claude_stderr_lines[-1][:200]}"
         else:
             final_chunk += "\n\n———\n✓ _complete_"
 
@@ -1729,12 +1751,26 @@ def run_codex_task(chat_id, task, cwd, session=None):
 
             process = subprocess.Popen(
                 cmd, cwd=cwd,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 start_new_session=True
             )
 
             # Track as active so messages get queued
             active_processes[session_id] = process
+
+            # Drain stderr in background so errors are logged instead of silently lost
+            codex_stderr_lines = []
+            def _drain_codex_stderr():
+                try:
+                    for raw_line in process.stderr:
+                        line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+                        if line:
+                            codex_stderr_lines.append(line[:500])
+                            print(f"[Codex stderr] {line[:300]}", flush=True)
+                except Exception:
+                    pass
+            stderr_thread = threading.Thread(target=_drain_codex_stderr, daemon=True)
+            stderr_thread.start()
 
             # Mark active for crash recovery
             session_name = session.get("name", "default") if session else "default"
@@ -1869,8 +1905,16 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 for change in file_changes:
                     final_chunk += f"\n  ✅ Ran: `{change['path'][:80]}{'...' if len(change['path']) > 80 else ''}`"
 
+            # Wait for stderr drain
+            try:
+                stderr_thread.join(timeout=5)
+            except Exception:
+                pass
+
             if cancelled:
                 final_chunk += "\n\n———\n⚠️ _cancelled_"
+            elif not accumulated_text.strip() and codex_stderr_lines:
+                final_chunk += f"\n\n———\n❌ _No output:_ {codex_stderr_lines[-1][:200]}"
             else:
                 final_chunk += "\n\n———\n✓ _complete_"
 
@@ -1916,8 +1960,16 @@ def run_codex_task(chat_id, task, cwd, session=None):
 
 
 def run_gemini_task(chat_id, task, cwd, session=None):
-    """Run a Gemini task on the project in background thread. Resumes session if available."""
+    """Run a Gemini task on the project in background thread. Resumes session if available.
+
+    Returns (thread, result_dict) where result_dict is populated after thread completes:
+        - "output": accumulated assistant text
+        - "stderr": list of stderr lines
+        - "exit_code": process return code
+        - "error": exception message if any
+    """
     session_id = get_session_id(session) if session else str(chat_id)
+    result = {"output": "", "stderr": [], "exit_code": None, "error": None}
 
     def gemini_thread():
         process = None
@@ -1959,12 +2011,26 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
             process = subprocess.Popen(
                 cmd, cwd=cwd,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 start_new_session=True
             )
 
             # Track as active so messages get queued
             active_processes[session_id] = process
+
+            # Drain stderr in background so errors are logged instead of silently lost
+            gemini_stderr_lines = []
+            def _drain_gemini_stderr():
+                try:
+                    for raw_line in process.stderr:
+                        line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+                        if line:
+                            gemini_stderr_lines.append(line[:500])
+                            print(f"[Gemini stderr] {line[:300]}", flush=True)
+                except Exception:
+                    pass
+            stderr_thread = threading.Thread(target=_drain_gemini_stderr, daemon=True)
+            stderr_thread.start()
 
             # Mark active for crash recovery
             session_name = session.get("name", "default") if session else "default"
@@ -2087,6 +2153,11 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             active_processes.pop(session_id, None)
             mark_session_done(session_id)
 
+            # Populate result for callers that join the thread
+            result["output"] = accumulated_text
+            result["stderr"] = gemini_stderr_lines
+            result["exit_code"] = process.returncode
+
             # Save gemini session ID for resume
             if new_session_id and session:
                 chat_key = str(chat_id)
@@ -2126,12 +2197,22 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             timed_out = (time.time() - last_output_time) > gemini_stale_timeout - 10
             exit_code = process.returncode
 
+            # Wait for stderr drain to finish
+            try:
+                stderr_thread.join(timeout=5)
+            except Exception:
+                pass
+
             if cancelled:
                 final_chunk += "\n\n———\n⚠️ _cancelled_"
             elif timed_out:
                 final_chunk += "\n\n———\n⏱️ _timed out (no output for 5 min)_"
             elif exit_code and exit_code != 0:
-                final_chunk += f"\n\n———\n⚠️ _exited with code {exit_code}_"
+                stderr_hint = f": {gemini_stderr_lines[-1][:150]}" if gemini_stderr_lines else ""
+                final_chunk += f"\n\n———\n⚠️ _exited with code {exit_code}{stderr_hint}_"
+            elif not accumulated_text.strip() and gemini_stderr_lines:
+                # No output at all + stderr = Gemini failed silently
+                final_chunk += f"\n\n———\n❌ _Gemini produced no output:_ {gemini_stderr_lines[-1][:200]}"
             elif gemini_errors:
                 final_chunk += f"\n\n———\n⚠️ _complete with errors:_ {gemini_errors[-1][:150]}"
             else:
@@ -2153,6 +2234,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
         except FileNotFoundError:
             active_processes.pop(session_id, None)
             mark_session_done(session_id)
+            result["error"] = "Gemini CLI not found"
             if message_id:
                 edit_message(chat_id, message_id, "❌ Gemini CLI not found.", force=True)
             else:
@@ -2160,6 +2242,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
         except Exception as e:
             active_processes.pop(session_id, None)
             mark_session_done(session_id)
+            result["error"] = str(e)[:300]
             error_text = accumulated_text + f"\n\n———\n❌ Gemini error: {str(e)[:200]}"
             if message_id:
                 edit_message(chat_id, message_id, error_text[:4000], force=True)
@@ -2180,7 +2263,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
         active_processes[session_id] = None
     thread = threading.Thread(target=gemini_thread, daemon=True)
     thread.start()
-    return thread
+    return thread, result
 
 
 def handle_justdoit_questions(questions):
@@ -2679,18 +2762,25 @@ _Use /cancel to stop at any time._""")
                 send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
 
                 # Update session state for context bridge (Gemini handles bridge injection internally)
-                gemini_start = time.time()
-                t = run_gemini_task(chat_id, exec_prompt, cwd, session=session)
+                t, gemini_result = run_gemini_task(chat_id, exec_prompt, cwd, session=session)
                 if t:
                     t.join()
-                gemini_elapsed = time.time() - gemini_start
 
-                print(f"{log_prefix} Step {step}: Gemini finished in {gemini_elapsed:.0f}s", flush=True)
-
-                # If Gemini finished suspiciously fast, it probably failed — fall back to Claude
-                if gemini_elapsed < 30:
-                    print(f"{log_prefix} Step {step}: Gemini too fast ({gemini_elapsed:.0f}s), falling back to Claude for execution", flush=True)
-                    send_message(chat_id, f"⚠️ Gemini finished in {gemini_elapsed:.0f}s — may have failed. Falling back to Claude...")
+                # Check if Gemini failed — fall back to Claude
+                gemini_failed = (
+                    gemini_result.get("error")
+                    or gemini_result.get("stderr")
+                    or (gemini_result.get("exit_code") or 0) != 0
+                    or not gemini_result.get("output", "").strip()
+                )
+                if gemini_failed:
+                    reason = gemini_result.get("error") or ""
+                    if gemini_result.get("stderr"):
+                        reason = reason or gemini_result["stderr"][-1]
+                    if not reason and not gemini_result.get("output", "").strip():
+                        reason = "no output produced"
+                    print(f"{log_prefix} Step {step}: Gemini failed ({reason[:200]}), falling back to Claude", flush=True)
+                    send_message(chat_id, f"⚠️ Gemini failed: _{reason[:150]}_\nFalling back to Claude...")
 
                     update_session_state(chat_id, session, original_task, "Claude")
                     fallback_response, _, _, claude_sid, _ = run_claude_streaming(
