@@ -38,7 +38,7 @@ CLAUDE_ALLOWED_TOOLS = os.environ.get(
 
 # Codex model for JustDoIt orchestration (update when newer models release)
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.3-codex")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-pro-preview")
 
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
@@ -1398,17 +1398,20 @@ def get_context_bridge(session, current_cli):
             # Dynamically calculate project-specific paths
             abs_cwd = os.path.abspath(session["cwd"])
             project_name = os.path.basename(abs_cwd)
-            
-            # Claude projects IDs use hyphens instead of slashes, keeping the leading one
+
+            # Claude: session .jsonl files live directly in the project dir (no sessions/ subdir)
             claude_proj_id = abs_cwd.replace(os.sep, "-")
-            claude_path = f"~/.claude/projects/{claude_proj_id}/sessions/"
-            
-            # Gemini organizes history by project directory name
-            gemini_path = f"~/.gemini/history/{project_name}/"
-            
+            claude_path = f"~/.claude/projects/{claude_proj_id}/"
+
+            # Gemini: session files are in ~/.gemini/tmp/<project>/chats/
+            gemini_path = f"~/.gemini/tmp/{project_name}/chats/"
+
+            # Codex: sessions are date-structured under ~/.codex/sessions/YYYY/MM/DD/
+            codex_path = "~/.codex/sessions/"
+
             cli_paths = {
                 "Claude": claude_path,
-                "Codex": "~/.codex/sessions/",
+                "Codex": codex_path,
                 "Gemini": gemini_path
             }
             
