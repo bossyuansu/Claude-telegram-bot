@@ -2677,9 +2677,29 @@ _Use /cancel to stop at any time._""")
                 send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
 
                 # Update session state for context bridge (Gemini handles bridge injection internally)
+                gemini_start = time.time()
                 t = run_gemini_task(chat_id, exec_prompt, cwd, session=session)
                 if t:
                     t.join()
+                gemini_elapsed = time.time() - gemini_start
+
+                print(f"{log_prefix} Step {step}: Gemini finished in {gemini_elapsed:.0f}s", flush=True)
+
+                # If Gemini finished suspiciously fast, it probably failed — fall back to Claude
+                if gemini_elapsed < 30:
+                    print(f"{log_prefix} Step {step}: Gemini too fast ({gemini_elapsed:.0f}s), falling back to Claude for execution", flush=True)
+                    send_message(chat_id, f"⚠️ Gemini finished in {gemini_elapsed:.0f}s — may have failed. Falling back to Claude...")
+
+                    update_session_state(chat_id, session, original_task, "Claude")
+                    fallback_response, _, _, claude_sid, _ = run_claude_streaming(
+                        exec_prompt, chat_id, cwd=cwd, continue_session=True,
+                        session_id=session_id, session=session
+                    )
+                    if claude_sid:
+                        update_claude_session_id(chat_id, session, claude_sid)
+                        session = get_session_by_id(chat_id, session_id) or session
+                    if fallback_response:
+                        print(f"{log_prefix} Step {step}: Claude fallback response: {fallback_response[:300]}...", flush=True)
 
                 # Refresh session in case Gemini updated session IDs
                 session = get_session_by_id(chat_id, session_id) or session
