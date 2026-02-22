@@ -38,7 +38,7 @@ CLAUDE_ALLOWED_TOOLS = os.environ.get(
 
 # Codex model for JustDoIt orchestration (update when newer models release)
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.3-codex")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-pro-preview")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
