@@ -90,7 +90,7 @@ Type=simple
 User=$CURRENT_USER
 WorkingDirectory=$SCRIPT_DIR
 EnvironmentFile=$SCRIPT_DIR/.env
-Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=$SCRIPT_DIR/venv/bin/python $SCRIPT_DIR/bot.py
 Restart=always
 RestartSec=10

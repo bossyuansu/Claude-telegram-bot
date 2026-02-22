@@ -12,7 +12,6 @@ import time
 import json
 import threading
 import uuid
-import select
 import ctypes
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -38,7 +37,8 @@ CLAUDE_ALLOWED_TOOLS = os.environ.get(
 )
 
 # Codex model for JustDoIt orchestration (update when newer models release)
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.2-codex")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.3-codex")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro")
 
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
@@ -55,12 +55,17 @@ pending_questions = {}  # chat_id -> {questions: [], answers: {}, current_idx: 0
 active_processes = {}  # session_id -> subprocess.Popen (allows parallel sessions)
 message_queue = {}  # session_id -> [queued messages]
 justdoit_active = {}  # "chat_id:session_id" -> {"active": True, "task": str, "step": int, "chat_id": str}
+deepreview_active = {}  # "chat_id:session_id" -> {"active": True, "phase": str, "step": int, ...}
 session_locks = {}  # session_id -> threading.Lock (prevents race conditions)
 session_locks_lock = threading.Lock()  # protects session_locks dict itself
+_sessions_file_lock = threading.Lock()  # protects user_sessions dict and sessions.json writes
+
+omni_active = {}  # "chat_id:session_id" -> state
+cancelled_sessions = set()  # session_ids explicitly cancelled via /cancel
 
 
 def save_active_tasks():
-    """Persist active justdoit tasks to disk for crash recovery detection."""
+    """Persist active justdoit/omni tasks to disk for crash recovery detection."""
     try:
         tasks = {}
         for jdi_key, state in justdoit_active.items():
@@ -72,6 +77,18 @@ def save_active_tasks():
                     "phase": state.get("phase", ""),
                     "chat_id": state.get("chat_id", ""),
                     "session_name": state.get("session_name", ""),
+                    "type": "justdoit",
+                }
+        for omni_key, state in omni_active.items():
+            if state.get("active"):
+                tasks[omni_key] = {
+                    "started": time.time(),
+                    "task": state.get("task", "")[:200],
+                    "step": state.get("step", 0),
+                    "phase": state.get("phase", ""),
+                    "chat_id": state.get("chat_id", ""),
+                    "session_name": state.get("session_name", ""),
+                    "type": "omni",
                 }
         DATA_DIR.mkdir(exist_ok=True)
         if tasks:
@@ -103,14 +120,21 @@ def _save_active_sessions_file(sessions_dict):
     """Write active sessions dict to disk (caller must hold _active_sessions_lock)."""
     try:
         DATA_DIR.mkdir(exist_ok=True)
-        with open(ACTIVE_SESSIONS_FILE, "w") as f:
+        tmp_file = ACTIVE_SESSIONS_FILE.with_suffix(".tmp")
+        with open(tmp_file, "w") as f:
             json.dump(sessions_dict, f)
+        tmp_file.replace(ACTIVE_SESSIONS_FILE)  # Atomic on POSIX
     except Exception as e:
         print(f"Error saving active sessions: {e}")
 
 
 def mark_session_active(chat_id, session_name, session_id, prompt):
     """Record that a Claude process is running for this session."""
+    # Strip context bridge prefix so crash recovery shows the actual user prompt
+    if "[NEW REQUEST]\n" in prompt:
+        prompt = prompt.split("[NEW REQUEST]\n", 1)[1]
+    elif "[NEW TASK]\n" in prompt:
+        prompt = prompt.split("[NEW TASK]\n", 1)[1]
     with _active_sessions_lock:
         try:
             if ACTIVE_SESSIONS_FILE.exists():
@@ -303,23 +327,56 @@ def load_sessions():
     """Load sessions from disk."""
     global user_sessions
     DATA_DIR.mkdir(exist_ok=True)
-    if SESSIONS_FILE.exists():
-        try:
-            with open(SESSIONS_FILE) as f:
-                user_sessions = json.load(f)
-        except Exception as e:
-            print(f"Error loading sessions: {e}")
-            user_sessions = {}
+    with _sessions_file_lock:
+        if SESSIONS_FILE.exists():
+            try:
+                with open(SESSIONS_FILE) as f:
+                    user_sessions = json.load(f)
+            except Exception as e:
+                print(f"Error loading sessions: {e}")
+                user_sessions = {}
 
 
-def save_sessions():
-    """Save sessions to disk."""
+_save_sessions_last = 0  # Timestamp of last actual save
+_save_sessions_dirty = False  # Whether there are unsaved changes
+_SAVE_DEBOUNCE_SECS = 5  # Minimum seconds between disk writes
+
+
+def save_sessions(force=False):
+    """Save sessions to disk atomically. Debounced to avoid excessive I/O.
+
+    Args:
+        force: If True, write immediately regardless of debounce timer.
+               Use for important state changes (session creation, session ID updates).
+    """
+    global _save_sessions_last, _save_sessions_dirty
+    now = time.time()
+
+    if not force and (now - _save_sessions_last) < _SAVE_DEBOUNCE_SECS:
+        _save_sessions_dirty = True
+        return
+
     DATA_DIR.mkdir(exist_ok=True)
-    try:
-        with open(SESSIONS_FILE, "w") as f:
-            json.dump(user_sessions, f, indent=2)
-    except Exception as e:
-        print(f"Error saving sessions: {e}")
+    with _sessions_file_lock:
+        tmp_file = SESSIONS_FILE.with_suffix(".tmp")
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(user_sessions, f, indent=2)
+            tmp_file.replace(SESSIONS_FILE)  # Atomic on POSIX
+            _save_sessions_last = now
+            _save_sessions_dirty = False
+        except Exception as e:
+            print(f"Error saving sessions: {e}")
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _flush_sessions_if_dirty():
+    """Called periodically to flush any debounced session changes to disk."""
+    if _save_sessions_dirty:
+        save_sessions(force=True)
 
 
 _tg_poll_failures = 0
@@ -504,7 +561,7 @@ def send_typing(chat_id):
     try:
         requests.post(f"{API_URL}/sendChatAction",
                      json={"chat_id": chat_id, "action": "typing"}, timeout=10)
-    except:
+    except Exception:
         pass
 
 
@@ -525,7 +582,7 @@ def edit_message_reply_markup(chat_id, message_id, reply_markup=None):
         requests.post(f"{API_URL}/editMessageReplyMarkup",
                      json={"chat_id": chat_id, "message_id": message_id,
                            "reply_markup": reply_markup}, timeout=10)
-    except:
+    except Exception:
         pass
 
 
@@ -798,27 +855,26 @@ def run_claude(prompt, cwd=None, continue_session=False, extra_args=None):
 
 def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, session_id=None, session=None):
     """Run Claude CLI with streaming output to Telegram."""
-    global active_processes
-
     cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--model", "opus"]
 
     # Add pre-approved tools to avoid permission prompts
     if CLAUDE_ALLOWED_TOOLS:
         cmd.extend(["--allowedTools", CLAUDE_ALLOWED_TOOLS])
 
+    # Inject bridge to provide awareness of other CLI actions since this tool was last used
+    if session:
+        bridge = get_context_bridge(session, "Claude")
+        if bridge:
+            prompt = bridge + "[NEW REQUEST]\n" + prompt
+
     # Resume with Claude's session ID if available
-    # Only use --resume with a valid session ID, never use --continue
-    # (--continue resumes the global last conversation, which breaks new sessions)
     claude_session_id = session.get("claude_session_id") if session else None
     if claude_session_id:
         cmd.extend(["--resume", claude_session_id])
-    elif session and session.get("last_summary"):
-        # No session to resume but we have a saved summary from compaction (e.g. crash recovery)
-        prompt = f"""[Session compacted - Previous context summary:]
-{session['last_summary']}
 
-[New request:]
-{prompt}"""
+    # Update session with the latest action
+    if session:
+        update_session_state(chat_id, session, prompt, "Claude")
 
     # Use -- to separate options from prompt (prevents arg parsing issues)
     cmd.append("--")
@@ -843,6 +899,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
     cancelled = False
     processed_tool_ids = set()  # Track processed tool_use IDs to avoid duplicates
     new_claude_session_id = None  # Capture Claude's session ID from init
+    process = None  # Initialize before try block so exception handler can safely reference it
 
     try:
         process = subprocess.Popen(
@@ -871,6 +928,13 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         def _process_tool_use(tool_id, tool_name, tool_input):
             """Handle a tool_use block (shared between normal and large-line paths)."""
             nonlocal current_tool, last_update
+            
+            # Deduplicate by tool_id (critical for ExitPlanMode/AskUserQuestion)
+            if tool_id:
+                if tool_id in processed_tool_ids:
+                    return
+                processed_tool_ids.add(tool_id)
+
             if tool_name == "AskUserQuestion":
                 new_qs = tool_input.get("questions", [])
                 print(f"[DEBUG] AskUserQuestion tool_id={tool_id}, adding {len(new_qs)} questions", flush=True)
@@ -1066,10 +1130,6 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                             _process_text(block.get("text", ""))
                         elif block.get("type") == "tool_use":
                             tool_id = block.get("id")
-                            if tool_id and tool_id in processed_tool_ids:
-                                continue
-                            if tool_id:
-                                processed_tool_ids.add(tool_id)
                             _process_tool_use(tool_id, block.get("name"), block.get("input", {}))
 
                 elif msg_type == "result":
@@ -1096,8 +1156,10 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         stdout_reader.close()
         process.wait()
 
-        # Check if cancelled
-        cancelled = process_key not in active_processes
+        # Check if explicitly cancelled via /cancel (explicit flag, no race condition)
+        cancelled = process_key in cancelled_sessions
+        if cancelled:
+            cancelled_sessions.discard(process_key)
 
         # Clean up process tracking
         active_processes.pop(process_key, None)
@@ -1153,7 +1215,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 try:
                     requests.post(f"{API_URL}/deleteMessage",
                                 json={"chat_id": chat_id, "message_id": message_id}, timeout=5)
-                except:
+                except Exception:
                     pass
             # Send remaining chunks as new messages
             max_len = 3900
@@ -1229,7 +1291,7 @@ def create_session(chat_id, project_name, cwd):
 
     user_sessions[chat_key]["sessions"].append(session)
     user_sessions[chat_key]["active"] = session_id  # Use session_id as identifier
-    save_sessions()
+    save_sessions(force=True)
 
     return session
 
@@ -1255,7 +1317,7 @@ def set_active_session(chat_id, session_id):
     chat_key = str(chat_id)
     if chat_key in user_sessions:
         user_sessions[chat_key]["active"] = session_id
-        save_sessions()
+        save_sessions(force=True)
 
 
 def get_session_by_id(chat_id, session_id):
@@ -1272,8 +1334,101 @@ def get_session_id(session):
     return session.get("id") or session.get("cwd")
 
 
-def update_session_last_prompt(chat_id, session, prompt):
-    """Update the last prompt for a session."""
+
+def get_context_bridge(session, current_cli):
+    """Generate a context bridge message when switching between tools or starting fresh."""
+    hints = []
+    
+    activity_log = session.get("activity_log", [])
+    
+    if activity_log:
+        # Find the last time *this* current_cli was used
+        last_used_index = -1
+        for i in range(len(activity_log) - 1, -1, -1):
+            if activity_log[i]["cli"] == current_cli:
+                last_used_index = i
+                break
+        
+        # If it was used before, find all activities SINCE then
+        if last_used_index != -1:
+            recent_activities = activity_log[last_used_index + 1:]
+        else:
+            # If never used, show recent activities
+            recent_activities = activity_log[-10:]
+            
+        if recent_activities:
+            # Group contiguous activities by the same CLI to form timeframes
+            grouped = []
+            for act in recent_activities:
+                if not grouped or grouped[-1]["cli"] != act["cli"]:
+                    grouped.append({
+                        "cli": act["cli"],
+                        "start": act["time"],
+                        "end": act["time"]
+                    })
+                else:
+                    grouped[-1]["end"] = act["time"]
+            
+            activity_strings = []
+            
+            # Dynamically calculate project-specific paths
+            abs_cwd = os.path.abspath(session["cwd"])
+            project_name = os.path.basename(abs_cwd)
+            
+            # Claude projects IDs use hyphens instead of slashes, keeping the leading one
+            claude_proj_id = abs_cwd.replace(os.sep, "-")
+            claude_path = f"~/.claude/projects/{claude_proj_id}/sessions/"
+            
+            # Gemini organizes history by project directory name
+            gemini_path = f"~/.gemini/history/{project_name}/"
+            
+            cli_paths = {
+                "Claude": claude_path,
+                "Codex": "~/.codex/sessions/",
+                "Gemini": gemini_path
+            }
+            
+            for g in grouped:
+                path_hint = f" (Logs in {cli_paths.get(g['cli'], 'standard locations')})"
+                try:
+                    start_dt = datetime.fromisoformat(g["start"])
+                    start_str = start_dt.strftime("%I:%M %p")
+                    if g["start"] != g["end"]:
+                        end_dt = datetime.fromisoformat(g["end"])
+                        end_str = end_dt.strftime("%I:%M %p")
+                        activity_strings.append(f"- {g['cli']}{path_hint} from {start_str} to {end_str}")
+                    else:
+                        activity_strings.append(f"- {g['cli']}{path_hint} around {start_str}")
+                except Exception:
+                    activity_strings.append(f"- {g['cli']}{path_hint} at {g['start']}")
+                
+            if activity_strings:
+                hint = (
+                    f"Since you ({current_cli}) were last active on this project, the user has utilized other AI assistants.\n"
+                    f"Please read the session history/log files of these CLIs to understand the recent context:\n"
+                    + "\n".join(activity_strings)
+                    + "\n\nYou should investigate these paths for the specified timeframes to align with the current state of the project."
+                )
+                hints.append(hint)
+    else:
+        # Fallback if no activity log
+        last_cli = session.get("last_cli")
+        last_prompt = session.get("last_prompt")
+        if last_cli and last_cli != current_cli and last_prompt:
+            hints.append(f"Previously, {last_cli} was working on this task: \"{last_prompt}\". Please check its session logs.")
+
+    last_summary = session.get("last_summary")
+    if last_summary:
+        hints.append(f"CONSOLIDATED PROJECT STATE:\n{last_summary}")
+
+
+    if hints:
+        return f"[SHARED CONTEXT FROM PREVIOUS ACTIVITIES]\n" + "\n\n".join(hints) + "\n\n"
+    return ""
+
+
+def update_session_state(chat_id, session, prompt, cli_name):
+    """Update the state for a session, tracking the last CLI used and the prompt."""
     chat_key = str(chat_id)
     if chat_key not in user_sessions:
         return
@@ -1281,27 +1436,56 @@ def update_session_last_prompt(chat_id, session, prompt):
     session_id = get_session_id(session)
     for s in user_sessions[chat_key]["sessions"]:
         if get_session_id(s) == session_id:
-            # Store truncated prompt
-            s["last_prompt"] = prompt[:100] if len(prompt) > 100 else prompt
-            save_sessions()
+            s["last_prompt"] = prompt[:200] if prompt else None
+            s["last_cli"] = cli_name
+            now_iso = datetime.now().isoformat()
+            s["last_active"] = now_iso
+            
+            if "activity_log" not in s:
+                s["activity_log"] = []
+                
+            s["activity_log"].append({
+                "cli": cli_name,
+                "time": now_iso
+            })
+            
+            # Keep log bounded
+            if len(s["activity_log"]) > 50:
+                s["activity_log"] = s["activity_log"][-50:]
+                
+            save_sessions(force=True)
+            break
+
+
+def update_cli_session_id(chat_id, session, cli_name, new_sid):
+    """Update a specific CLI's session ID for resuming conversations."""
+    chat_key = str(chat_id)
+    if chat_key not in user_sessions:
+        return
+
+    session_id = get_session_id(session)
+    key_map = {
+        "Claude": "claude_session_id",
+        "Codex": "codex_session_id",
+        "Gemini": "gemini_session_id"
+    }
+    sid_key = key_map.get(cli_name)
+    if not sid_key:
+        return
+
+    for s in user_sessions[chat_key]["sessions"]:
+        if get_session_id(s) == session_id:
+            s[sid_key] = new_sid
+            # Clear saved summary once we have a valid session to resume
+            if new_sid:
+                s.pop("last_summary", None)
+            save_sessions(force=True)
             break
 
 
 def update_claude_session_id(chat_id, session, claude_session_id):
-    """Update Claude's session ID for resuming conversations."""
-    chat_key = str(chat_id)
-    if chat_key not in user_sessions:
-        return
-
-    session_id = get_session_id(session)
-    for s in user_sessions[chat_key]["sessions"]:
-        if get_session_id(s) == session_id:
-            s["claude_session_id"] = claude_session_id
-            # Clear saved summary once we have a valid session to resume
-            if claude_session_id:
-                s.pop("last_summary", None)
-            save_sessions()
-            break
+    """Legacy wrapper for Claude session ID updates."""
+    update_cli_session_id(chat_id, session, "Claude", claude_session_id)
 
 
 def save_session_summary(chat_id, session, summary):
@@ -1363,15 +1547,165 @@ def is_allowed(chat_id):
     return str(chat_id) in ALLOWED_CHAT_IDS
 
 
+def run_codex(prompt, cwd=None, session=None, timeout=180):
+    """Run Codex synchronously and return the output text."""
+    codex_sid = session.get("codex_session_id") if session else None
+
+    if codex_sid:
+        cmd = [
+            "codex", "exec", "resume", codex_sid,
+            "-m", CODEX_MODEL,
+            "-c", 'model_reasoning_effort="xhigh"',
+            "--full-auto", "--json",
+            prompt
+        ]
+    else:
+        cmd = [
+            "codex", "exec",
+            "-m", CODEX_MODEL,
+            "-c", 'model_reasoning_effort="xhigh"',
+            "--full-auto", "--json",
+            prompt
+        ]
+
+    try:
+        process = subprocess.Popen(
+            cmd, cwd=cwd or os.getcwd(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, _ = process.communicate(timeout=timeout)
+        
+        # Parse JSONL output to extract agent messages
+        accumulated = []
+        for line in stdout.strip().split("\n"):
+            if not line: continue
+            try:
+                event = json.loads(line)
+                if event.get("type") == "item.completed":
+                    item = event.get("item", {})
+                    if item.get("type") == "agent_message":
+                        accumulated.append(item.get("text", ""))
+            except json.JSONDecodeError:
+                pass
+        
+        return "\n".join(accumulated).strip()
+    except Exception as e:
+        print(f"run_codex error: {e}")
+        return ""
+
+
+def run_gemini(prompt, cwd=None, session=None):
+    """Run Gemini synchronously and return the output text."""
+    gemini_sid = session.get("gemini_session_id") if session else None
+    
+    cmd = ["gemini", "--prompt", prompt, "--output-format", "stream-json", "--yolo"]
+    if gemini_sid:
+        cmd.extend(["--resume", gemini_sid])
+    if GEMINI_MODEL:
+        cmd.extend(["-m", GEMINI_MODEL])
+        
+    try:
+        process = subprocess.Popen(
+            cmd, cwd=cwd or os.getcwd(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, _ = process.communicate(timeout=180)
+        
+        accumulated = []
+        for line in stdout.strip().split("\n"):
+            if not line: continue
+            try:
+                event = json.loads(line)
+                if event.get("type") == "message" and event.get("role") == "assistant":
+                    accumulated.append(event.get("content", ""))
+            except json.JSONDecodeError:
+                pass
+        
+        return "".join(accumulated).strip()
+    except Exception as e:
+        print(f"run_gemini error: {e}")
+        return ""
+
+
+def perform_proactive_compaction(chat_id, session, cli_name):
+    """Perform proactive compaction for any CLI by using that tool to summarize the state."""
+    if not session:
+        return None
+
+    session_id = get_session_id(session)
+    send_message(chat_id, f"📦 *Proactive compaction ({cli_name})* - summarizing context...")
+
+    summary_prompt = """Summarize this session for context continuity (max 500 words). Focus on ACTIONABLE STATE:
+1. Files being edited — exact paths and what changed
+2. Current task — what's in progress, what's done, what's left
+3. Key decisions — architectural choices, approaches chosen and WHY
+4. Bugs/issues — any errors encountered and their status (fixed/open)
+5. Code snippets — any critical code patterns or values needed to continue
+
+Omit: greetings, abandoned approaches, resolved debugging back-and-forth.
+Format as a compact bullet list. This summary will be used to restore context after a session reset."""
+
+    try:
+        summary = ""
+        # Use the tool that has the conversation context to summarize itself
+        if cli_name == "Codex":
+            summary = run_codex(summary_prompt, cwd=session["cwd"], session=session)
+        elif cli_name == "Gemini":
+            summary = run_gemini(summary_prompt, cwd=session["cwd"], session=session)
+        else:
+            # Fallback/Default to Claude
+            summary_response, _, _, _, _ = run_claude_streaming(
+                summary_prompt, chat_id, cwd=session["cwd"], continue_session=True,
+                session_id=session_id, session=session
+            )
+            summary = summary_response.split("———")[0].strip() if summary_response else ""
+    except Exception as e:
+        print(f"Compaction error for {cli_name}: {e}")
+        summary = ""
+
+    if summary and len(summary) > 50:
+        save_session_summary(chat_id, session, summary)
+        # Reset the specific CLI session ID
+        update_cli_session_id(chat_id, session, cli_name, None)
+        reset_message_count(chat_id, session)
+        return summary
+    
+    return None
+
+
 def run_codex_task(chat_id, task, cwd, session=None):
     """Run a Codex task on the project in background thread. Resumes session if available."""
     session_id = get_session_id(session) if session else str(chat_id)
 
     def codex_thread():
+        process = None
+        message_id = None
+        accumulated_text = ""
+        current_chunk_text = ""
+        message_ids = []
+        file_changes = []
+        processed_item_ids = set()
         try:
+            if session:
+                needs_compaction = increment_message_count(chat_id, session)
+                if needs_compaction:
+                    perform_proactive_compaction(chat_id, session, "Codex")
+
             codex_sid = session.get("codex_session_id") if session else None
             mode = "Resuming" if codex_sid else "Starting"
-            send_message(chat_id, f"🔍 *{mode} Codex*\nModel: `gpt-5.2-codex`\nTask: _{task[:100]}_")
+            
+            # Inject bridge to provide awareness of other CLI actions since this tool was last used
+            current_task = task
+            if session:
+                bridge = get_context_bridge(session, "Codex")
+                if bridge:
+                    current_task = bridge + "[NEW TASK]\n" + task
+            
+            # Update session with the latest action
+            if session:
+                update_session_state(chat_id, session, task, "Codex")
+
+            send_message(chat_id, f"🔍 *{mode} Codex*\nModel: `{CODEX_MODEL}`\nTask: _{task[:100]}_")
 
             # Build command — resume existing session or start new
             if codex_sid:
@@ -1380,7 +1714,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                     "-m", CODEX_MODEL,
                     "-c", 'model_reasoning_effort="xhigh"',
                     "--full-auto", "--json",
-                    task
+                    current_task
                 ]
             else:
                 cmd = [
@@ -1388,30 +1722,41 @@ def run_codex_task(chat_id, task, cwd, session=None):
                     "-m", CODEX_MODEL,
                     "-c", 'model_reasoning_effort="xhigh"',
                     "--full-auto", "--json",
-                    task
+                    current_task
                 ]
 
             process = subprocess.Popen(
                 cmd, cwd=cwd,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                start_new_session=True
             )
 
             # Track as active so messages get queued
             active_processes[session_id] = process
 
+            # Mark active for crash recovery
+            session_name = session.get("name", "default") if session else "default"
+            mark_session_active(chat_id, session_name, session_id, task)
+
             new_thread_id = None
-            max_chunk_len = 3800
-            update_interval = 1.5
-            current_chunk_text = ""
+            max_chunk_len = 3500
+            update_interval = 1.0
             message_id = send_message(chat_id, "⏳ _Codex working..._")
-            message_ids = [message_id]
+            message_ids.append(message_id)
             last_update = time.time()
             current_tool = None
 
-            for line in process.stdout:
+            import io
+            stdout_reader = io.TextIOWrapper(process.stdout, encoding='utf-8', errors='replace')
+            # Track per-item accumulated text length so item.updated deltas can be extracted
+            item_text_lengths = {}  # item_id -> length of text already appended
+
+            for line in stdout_reader:
                 line = line.strip()
                 if not line:
                     continue
+
+                line_len = len(line)
                 try:
                     event = json.loads(line)
                     etype = event.get("type", "")
@@ -1419,26 +1764,61 @@ def run_codex_task(chat_id, task, cwd, session=None):
                     if etype == "thread.started":
                         new_thread_id = event.get("thread_id")
 
-                    elif etype == "item.completed":
+                    elif etype in ["item.started", "item.updated", "item.completed"]:
                         item = event.get("item", {})
-                        if item.get("type") == "agent_message":
+                        itype = item.get("type")
+                        item_id = item.get("id")
+
+                        if itype == "agent_message":
                             text = item.get("text", "")
-                            if text:
-                                if current_chunk_text and not current_chunk_text.endswith('\n'):
-                                    current_chunk_text += "\n\n"
-                                current_chunk_text += text
+                            if text and item_id:
+                                if etype == "item.completed":
+                                    # Final text — append only the portion not yet seen
+                                    prev_len = item_text_lengths.get(item_id, 0)
+                                    new_text = text[prev_len:]
+                                    item_text_lengths.pop(item_id, None)
+                                    processed_item_ids.add(item_id)
+                                    current_tool = None
+                                elif etype == "item.updated":
+                                    # Streaming delta — text field is cumulative, extract new portion
+                                    prev_len = item_text_lengths.get(item_id, 0)
+                                    new_text = text[prev_len:]
+                                    item_text_lengths[item_id] = len(text)
+                                else:
+                                    new_text = ""
+
+                                if new_text:
+                                    # Add spacing between separate agent messages
+                                    spacing = ""
+                                    if accumulated_text and not accumulated_text.endswith('\n') and not new_text.startswith('\n'):
+                                        # Only add spacing at the start of a NEW item, not mid-stream
+                                        if item_id not in item_text_lengths or item_text_lengths.get(item_id, 0) == len(new_text):
+                                            if accumulated_text.endswith(('.', '!', '?', ':')):
+                                                spacing = "\n\n"
+                                            elif not accumulated_text.endswith(' '):
+                                                spacing = " "
+                                    accumulated_text += spacing + new_text
+                                    current_chunk_text += spacing + new_text
+
+                        elif itype == "command_execution":
+                            cmd_str = item.get("command", "")
+                            if etype == "item.started":
+                                if item_id and item_id not in processed_item_ids:
+                                    file_changes.append({"type": "bash", "path": cmd_str[:100]})
+                                    if item_id:
+                                        processed_item_ids.add(item_id)
+                                current_tool = "Bash"
+                            elif etype == "item.completed":
                                 current_tool = None
-                        elif item.get("type") == "function_call":
-                            fname = item.get("name", "tool")
-                            current_tool = fname
 
                     # Stream update: chunk overflow
                     while len(current_chunk_text) > max_chunk_len:
                         send_part = current_chunk_text[:max_chunk_len]
-                        current_chunk_text = current_chunk_text[max_chunk_len:]
+                        carry_over = current_chunk_text[max_chunk_len:]
                         edit_message(chat_id, message_id, send_part.strip() + "\n\n———\n_continued..._", force=True)
                         message_id = send_message(chat_id, "⏳ _continuing..._")
                         message_ids.append(message_id)
+                        current_chunk_text = carry_over
                         last_update = time.time()
 
                     # Stream update: periodic edit
@@ -1448,10 +1828,22 @@ def run_codex_task(chat_id, task, cwd, session=None):
                         edit_message(chat_id, message_id, current_chunk_text + suffix)
                         last_update = now
 
+                    # Memory management
+                    if line_len > 50_000:
+                        event = None
+                        line = None
+                        _malloc_trim()
+
                 except json.JSONDecodeError:
                     pass
 
             process.wait()
+            # Check if explicitly cancelled via /cancel (explicit flag, no race condition)
+            cancelled = session_id in cancelled_sessions
+            if cancelled:
+                cancelled_sessions.discard(session_id)
+            active_processes.pop(session_id, None)
+            mark_session_done(session_id)
 
             # Save codex session ID for resume
             if new_thread_id and session:
@@ -1459,22 +1851,57 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 for s in user_sessions.get(chat_key, {}).get("sessions", []):
                     if get_session_id(s) == session_id:
                         s["codex_session_id"] = new_thread_id
-                        save_sessions()
+                        save_sessions(force=True)
                         break
 
-            # Final message
-            if current_chunk_text.strip():
-                edit_message(chat_id, message_id, current_chunk_text.strip(), force=True)
+            # Final update
+            final_chunk = current_chunk_text.strip()
+            if not final_chunk:
+                if len(message_ids) == 1 and accumulated_text.strip():
+                    final_chunk = accumulated_text.strip()[-max_chunk_len:]
+                else:
+                    final_chunk = ""
+
+            if file_changes:
+                final_chunk += "\n\n📁 *File Operations:*"
+                for change in file_changes:
+                    final_chunk += f"\n  ✅ Ran: `{change['path'][:80]}{'...' if len(change['path']) > 80 else ''}`"
+
+            if cancelled:
+                final_chunk += "\n\n———\n⚠️ _cancelled_"
             else:
-                edit_message(chat_id, message_id, "Codex completed but produced no output.", force=True)
+                final_chunk += "\n\n———\n✓ _complete_"
+
+            if len(final_chunk) <= 4000:
+                if message_id:
+                    edit_message(chat_id, message_id, final_chunk, force=True)
+                else:
+                    send_message(chat_id, final_chunk)
+            else:
+                # Split if too long
+                max_len = 3900
+                chunks = [final_chunk[i:i + max_len] for i in range(0, len(final_chunk), max_len)]
+                for chunk in chunks:
+                    send_message(chat_id, chunk)
+                    time.sleep(0.2)
 
         except FileNotFoundError:
-            send_message(chat_id, "❌ Codex not found. Is it installed?")
+            active_processes.pop(session_id, None)
+            mark_session_done(session_id)
+            if message_id:
+                edit_message(chat_id, message_id, "❌ Codex CLI not found.", force=True)
+            else:
+                send_message(chat_id, "❌ Codex CLI not found.")
         except Exception as e:
-            send_message(chat_id, f"❌ Codex error: {str(e)[:200]}")
+            active_processes.pop(session_id, None)
+            mark_session_done(session_id)
+            error_text = accumulated_text + f"\n\n———\n❌ Codex error: {str(e)[:200]}"
+            if message_id:
+                edit_message(chat_id, message_id, error_text[:4000], force=True)
+            else:
+                send_message(chat_id, error_text[:4000])
         finally:
             active_processes.pop(session_id, None)
-            # Process queued messages
             process_message_queue(chat_id, session)
 
     # Mark active under lock to prevent race with incoming messages
@@ -1483,6 +1910,275 @@ def run_codex_task(chat_id, task, cwd, session=None):
         active_processes[session_id] = None
     thread = threading.Thread(target=codex_thread, daemon=True)
     thread.start()
+    return thread
+
+
+def run_gemini_task(chat_id, task, cwd, session=None):
+    """Run a Gemini task on the project in background thread. Resumes session if available."""
+    session_id = get_session_id(session) if session else str(chat_id)
+
+    def gemini_thread():
+        process = None
+        message_id = None
+        accumulated_text = ""
+        current_chunk_text = ""
+        message_ids = []
+        file_changes = []
+        processed_tool_ids = set()
+        try:
+            if session:
+                needs_compaction = increment_message_count(chat_id, session)
+                if needs_compaction:
+                    perform_proactive_compaction(chat_id, session, "Gemini")
+
+            gemini_sid = session.get("gemini_session_id") if session else None
+            mode = "Resuming" if gemini_sid else "Starting"
+            
+            # Inject bridge to provide awareness of other CLI actions since this tool was last used
+            current_task = task
+            if session:
+                bridge = get_context_bridge(session, "Gemini")
+                if bridge:
+                    current_task = bridge + "[NEW TASK]\n" + task
+            
+            # Update session with the latest action
+            if session:
+                update_session_state(chat_id, session, task, "Gemini")
+
+            send_message(chat_id, f"♊️ *{mode} Gemini*\nModel: `{GEMINI_MODEL}`\nTask: _{task[:100]}_")
+
+            # Build command — resume existing session or start new
+            cmd = ["gemini", "--prompt", current_task, "--output-format", "stream-json", "--yolo"]
+            if gemini_sid:
+                cmd.extend(["--resume", gemini_sid])
+
+            if GEMINI_MODEL:
+                cmd.extend(["-m", GEMINI_MODEL])
+
+            process = subprocess.Popen(
+                cmd, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+
+            # Track as active so messages get queued
+            active_processes[session_id] = process
+
+            # Mark active for crash recovery
+            session_name = session.get("name", "default") if session else "default"
+            mark_session_active(chat_id, session_name, session_id, task)
+
+            new_session_id = None
+            max_chunk_len = 3500
+            update_interval = 1.0
+            gemini_stale_timeout = 300  # Kill if no output for 5 minutes
+            gemini_errors = []  # Collect error events from Gemini CLI
+            message_id = send_message(chat_id, "⏳ _Gemini working..._")
+            message_ids.append(message_id)
+            last_output_time = time.time()
+            last_update = last_output_time
+            current_tool = None
+
+            # Watchdog thread: kills Gemini if no stdout activity for gemini_stale_timeout seconds
+            watchdog_stop = threading.Event()
+            def _gemini_watchdog():
+                while not watchdog_stop.is_set():
+                    watchdog_stop.wait(30)  # Check every 30s
+                    if watchdog_stop.is_set():
+                        break
+                    elapsed = time.time() - last_output_time
+                    if elapsed > gemini_stale_timeout:
+                        print(f"[Gemini] Watchdog: no output for {elapsed:.0f}s, killing process", flush=True)
+                        try:
+                            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                            time.sleep(5)
+                            if process.poll() is None:
+                                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        except Exception:
+                            pass
+                        break
+            import signal
+            watchdog_thread = threading.Thread(target=_gemini_watchdog, daemon=True)
+            watchdog_thread.start()
+
+            import io
+            stdout_reader = io.TextIOWrapper(process.stdout, encoding='utf-8', errors='replace')
+
+            for line in stdout_reader:
+                line = line.strip()
+                if not line:
+                    continue
+
+                last_output_time = time.time()
+                line_len = len(line)
+                try:
+                    event = json.loads(line)
+                    etype = event.get("type", "")
+
+                    if etype == "init":
+                        new_session_id = event.get("session_id")
+
+                    elif etype == "message":
+                        if event.get("role") == "assistant":
+                            content = event.get("content", "")
+                            if content:
+                                spacing = ""
+                                if accumulated_text and not accumulated_text.endswith('\n') and not content.startswith('\n'):
+                                    if accumulated_text.endswith(('.', '!', '?', ':')):
+                                        spacing = "\n\n"
+                                    elif not accumulated_text.endswith(' '):
+                                        spacing = " "
+                                accumulated_text += spacing + content
+                                current_chunk_text += spacing + content
+                                current_tool = None
+
+                    elif etype == "tool_use":
+                        tool_id = event.get("tool_id")
+                        if tool_id and tool_id in processed_tool_ids:
+                            continue
+                        if tool_id:
+                            processed_tool_ids.add(tool_id)
+
+                        tool_name = event.get("tool_name")
+                        params = event.get("parameters", {})
+                        path = params.get("file_path") or params.get("command") or params.get("pattern") or params.get("dir_path") or ""
+                        file_changes.append({"type": tool_name.lower(), "path": path[:100]})
+                        current_tool = tool_name
+
+                    elif etype == "error":
+                        error_msg = event.get("message") or event.get("error") or str(event)
+                        gemini_errors.append(error_msg[:300])
+                        print(f"[Gemini] Error event: {error_msg[:300]}", flush=True)
+
+                    # Stream update: chunk overflow
+                    while len(current_chunk_text) > max_chunk_len:
+                        send_part = current_chunk_text[:max_chunk_len]
+                        carry_over = current_chunk_text[max_chunk_len:]
+                        edit_message(chat_id, message_id, send_part.strip() + "\n\n———\n_continued..._", force=True)
+                        message_id = send_message(chat_id, "⏳ _continuing..._")
+                        message_ids.append(message_id)
+                        current_chunk_text = carry_over
+                        last_update = time.time()
+
+                    # Stream update: periodic edit
+                    now = time.time()
+                    if now - last_update >= update_interval and current_chunk_text.strip():
+                        suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else "\n\n———\n⏳ _generating..._"
+                        edit_message(chat_id, message_id, current_chunk_text + suffix)
+                        last_update = now
+
+                    # Memory management
+                    if line_len > 50_000:
+                        event = None
+                        line = None
+                        _malloc_trim()
+
+                except json.JSONDecodeError:
+                    pass
+
+            watchdog_stop.set()
+            process.wait()
+            # Check if explicitly cancelled via /cancel (explicit flag, no race condition)
+            cancelled = session_id in cancelled_sessions
+            if cancelled:
+                cancelled_sessions.discard(session_id)
+            active_processes.pop(session_id, None)
+            mark_session_done(session_id)
+
+            # Save gemini session ID for resume
+            if new_session_id and session:
+                chat_key = str(chat_id)
+                for s in user_sessions.get(chat_key, {}).get("sessions", []):
+                    if get_session_id(s) == session_id:
+                        s["gemini_session_id"] = new_session_id
+                        save_sessions(force=True)
+                        break
+
+            # Final update
+            final_chunk = current_chunk_text.strip()
+            if not final_chunk:
+                if len(message_ids) == 1 and accumulated_text.strip():
+                    final_chunk = accumulated_text.strip()[-max_chunk_len:]
+                else:
+                    final_chunk = ""
+
+            if file_changes:
+                final_chunk += "\n\n📁 *File Operations:*"
+                for change in file_changes:
+                    ctype = change["type"]
+                    path = change["path"]
+                    if ctype in ["write", "write_file"]:
+                        final_chunk += f"\n  ✅ Created: `{shorten_path(path)}`"
+                    elif ctype in ["edit", "replace"]:
+                        final_chunk += f"\n  ✅ Edited: `{shorten_path(path)}`"
+                    elif ctype in ["bash", "run_shell_command"]:
+                        final_chunk += f"\n  ✅ Ran: `{path[:80]}{'...' if len(path) > 80 else ''}`"
+                    elif ctype in ["read", "read_file"]:
+                        final_chunk += f"\n  📖 Read: `{shorten_path(path)}`"
+                    elif ctype in ["glob", "grep", "grep_search"]:
+                        final_chunk += f"\n  🔍 Search: `{path[:60]}{'...' if len(path) > 60 else ''}`"
+                    else:
+                        final_chunk += f"\n  🔧 {ctype}: `{shorten_path(path)}`"
+
+            # Determine exit status
+            timed_out = (time.time() - last_output_time) > gemini_stale_timeout - 10
+            exit_code = process.returncode
+
+            if cancelled:
+                final_chunk += "\n\n———\n⚠️ _cancelled_"
+            elif timed_out:
+                final_chunk += "\n\n———\n⏱️ _timed out (no output for 5 min)_"
+            elif exit_code and exit_code != 0:
+                final_chunk += f"\n\n———\n⚠️ _exited with code {exit_code}_"
+            elif gemini_errors:
+                final_chunk += f"\n\n———\n⚠️ _complete with errors:_ {gemini_errors[-1][:150]}"
+            else:
+                final_chunk += "\n\n———\n✓ _complete_"
+
+            if len(final_chunk) <= 4000:
+                if message_id:
+                    edit_message(chat_id, message_id, final_chunk, force=True)
+                else:
+                    send_message(chat_id, final_chunk)
+            else:
+                # Split if too long
+                max_len = 3900
+                chunks = [final_chunk[i:i + max_len] for i in range(0, len(final_chunk), max_len)]
+                for chunk in chunks:
+                    send_message(chat_id, chunk)
+                    time.sleep(0.2)
+
+        except FileNotFoundError:
+            active_processes.pop(session_id, None)
+            mark_session_done(session_id)
+            if message_id:
+                edit_message(chat_id, message_id, "❌ Gemini CLI not found.", force=True)
+            else:
+                send_message(chat_id, "❌ Gemini CLI not found.")
+        except Exception as e:
+            active_processes.pop(session_id, None)
+            mark_session_done(session_id)
+            error_text = accumulated_text + f"\n\n———\n❌ Gemini error: {str(e)[:200]}"
+            if message_id:
+                edit_message(chat_id, message_id, error_text[:4000], force=True)
+            else:
+                send_message(chat_id, error_text[:4000])
+        finally:
+            # Stop watchdog if it was started
+            try:
+                watchdog_stop.set()
+            except UnboundLocalError:
+                pass
+            active_processes.pop(session_id, None)
+            process_message_queue(chat_id, session)
+
+    # Mark active under lock to prevent race with incoming messages
+    lock = get_session_lock(session_id)
+    with lock:
+        active_processes[session_id] = None
+    thread = threading.Thread(target=gemini_thread, daemon=True)
+    thread.start()
+    return thread
 
 
 def handle_justdoit_questions(questions):
@@ -1516,18 +2212,56 @@ def handle_justdoit_questions(questions):
 # "capacity", "quota" in non-error contexts, or line numbers like "4296".
 QUOTA_REGEX = re.compile(
     r'\b(?:rate[ _-]?limit(?:ed)?|ratelimit|quota exceeded|too many requests'
-    r'|resource ?exhausted|usage limit|token limit exceeded)\b'
+    r'|resource ?exhausted|usage limit|token limit exceeded'
+    r"|out of (?:extra )?usage|usage (?:cap|reset))\b"
     r'|(?:^|\s)429(?:\s|$|[,.\-:])'  # 429 only as standalone number
     r'|\berror.*(?:overloaded|over capacity)\b',
     re.IGNORECASE
 )
 
-QUOTA_WAIT_SECONDS = 3600  # 1 hour
+QUOTA_WAIT_SECONDS = 3600  # 1 hour fallback
+
+# Regex to extract reset time from quota error messages.
+# Covers Codex ("Try again at 3:45 PM"), Claude ("resets at 3:45 PM"), etc.
+_RESET_TIME_RE = re.compile(
+    r'(?:[Tt]ry again (?:at|after|later\.? or try again at)|[Rr]esets? at)\s+(.+?)\.?\s*$',
+    re.MULTILINE,
+)
 
 
-def is_quota_error_response(text):
-    """Check if text indicates a quota/rate-limit error using strict regex."""
-    return bool(QUOTA_REGEX.search(text))
+def _parse_reset_wait(error_msg):
+    """Parse an error message for reset time and return seconds to wait.
+
+    Works for both Codex ("Try again at 3:45 PM") and Claude ("resets at 3:45 PM") messages.
+    Returns (wait_seconds, reset_time_str) or (QUOTA_WAIT_SECONDS, None) if unparseable.
+    """
+    m = _RESET_TIME_RE.search(error_msg)
+    if not m:
+        return QUOTA_WAIT_SECONDS, None
+
+    time_str = m.group(1).strip()
+    now = datetime.now()
+
+    # Try time-only format first: "3:45 PM"
+    for fmt in ("%I:%M %p", "%b %d, %Y %I:%M %p", "%b %-d, %Y %-I:%M %p",
+                "%B %d, %Y %I:%M %p"):
+        try:
+            parsed = datetime.strptime(time_str, fmt)
+            # If only time was parsed (no date component), set to today
+            if parsed.year == 1900:
+                parsed = parsed.replace(year=now.year, month=now.month, day=now.day)
+                # If the time is in the past, it means tomorrow
+                if parsed < now:
+                    parsed += timedelta(days=1)
+            wait = int((parsed - now).total_seconds())
+            if wait < 60:
+                wait = 60  # Minimum 1 minute
+            return wait, time_str
+        except ValueError:
+            continue
+
+    return QUOTA_WAIT_SECONDS, time_str
+
 
 
 def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None, claude_plan=None):
@@ -1576,14 +2310,28 @@ Claude's output above is the verification result.
     else:
         phase_instructions = {
             "implementing": """CURRENT PHASE: IMPLEMENTATION
-Your goal is to drive the implementation to completion.
+Your goal is to drive the implementation to completion across ALL plan items, not just the current one.
 
-- If implementation is NOT complete, give Claude the next specific implementation step.
-- If implementation looks complete, DO NOT transition yet. Instead, ask Claude to verify
-  its work: craft a prompt telling Claude to re-read the ORIGINAL PLAN and the files it
-  changed, then confirm that EVERY item from the plan has been implemented. Claude must
-  explicitly list each plan item and state whether it is done or missing. Also check for
-  TODOs, placeholder code, missed requirements, or incomplete sections, and report findings.
+HOW TO CHECK IF IMPLEMENTATION IS COMPLETE:
+Look at the plan checkboxes. If ALL items show - [x] (checked), or if Claude's output
+confirms all items are implemented, then implementation IS complete — move to verification.
+If ANY items still show - [ ] (unchecked), implementation is NOT complete.
+
+- First, check if the work Claude just did is complete and correct. If not, tell Claude to finish or fix it.
+- CRITICAL: Examine Claude's output for design and architecture problems BEFORE moving on.
+  Look for: poor abstractions, god functions/classes, tight coupling between modules, patterns
+  that won't scale, inconsistency with the existing codebase, hardcoded values that should be
+  configurable, race conditions, or structural decisions you disagree with. If you spot any of
+  these, INTERVENE IMMEDIATELY — include specific architectural feedback in your next prompt
+  telling Claude what to restructure and why. It's much cheaper to fix design issues during
+  implementation than to catch them in review.
+- Once the current item is done AND architecturally sound, check the plan for the next unchecked item (- [ ]) and direct Claude to it by name.
+- If unchecked items remain, give Claude the next specific implementation step based on the plan.
+- If ALL plan items are checked (- [x]) or Claude's output indicates everything is implemented,
+  DO NOT transition yet. Instead, ask Claude to verify its work: craft a prompt telling Claude
+  to re-read the PLAN.md and the files it changed, then confirm that EVERY item from the plan
+  has been implemented. Claude must explicitly list each plan item and state whether it is done
+  or missing. Also check for TODOs, placeholder code, missed requirements, or incomplete sections.
   Respond with: VERIFY:reviewing
   followed by the verification prompt for Claude.
 - Do NOT say DONE during this phase.""",
@@ -1630,9 +2378,11 @@ over unit tests — verify that components work together correctly, not just in 
 CLAUDE'S IMPLEMENTATION PLAN:
 {claude_plan}
 
-IMPORTANT: Track progress against ALL items in this plan. Don't let Claude get stuck
-polishing one item while other plan items remain unstarted. If the current item looks
-complete, direct Claude to the NEXT unfinished item in the plan.
+IMPORTANT: This plan is your source of truth. Track progress against ALL items — look at
+the checkboxes: - [ ] means not done, - [x] means done. If ALL items are - [x], the plan
+IS complete — proceed to verification/transition. Don't let Claude get stuck polishing one
+item while other plan items remain unstarted. If unchecked items remain, direct Claude to
+the NEXT unchecked (- [ ]) item in the plan by name.
 """
 
     codex_prompt = f"""You are a senior engineering project manager overseeing an autonomous coding session.
@@ -1641,6 +2391,12 @@ You are responsible for driving the work through three phases: implementation �
 ORIGINAL TASK:
 {original_task}
 {plan_section}
+YOUR PRIMARY REFERENCE IS THE PLAN ABOVE. Use it to maintain big-picture awareness:
+1. First, check whether the work Claude just did is actually complete and correct.
+2. Then, check which plan items are still unchecked (- [ ]) to decide what's next.
+3. If ALL items are checked (- [x]), the plan is COMPLETE — proceed to verification.
+Don't tunnel-vision on the current item — but also don't skip ahead until it's done right.
+
 PROGRESS SO FAR (step {step}):
 {history_summary}
 
@@ -1661,9 +2417,21 @@ GENERAL RULES:
    the upload feature" without specifying exact files — Claude has the full session context
    and will figure out the details. The key is: every prompt must drive NEW work forward.
 6. Keep prompts concise but complete. Claude has full conversation context from the session.
-7. Always watch for design and architecture flaws in Claude's output: poor abstractions, tight coupling, scalability issues, inconsistent patterns, or structural problems. If you spot any, include them in your next prompt so Claude addresses them.
+7. DESIGN GUARDIAN ROLE: You are the architectural gatekeeper. Every time you read Claude's output,
+   actively evaluate the design and architecture choices: separation of concerns, abstraction quality,
+   coupling between components, naming conventions, consistency with existing codebase patterns,
+   scalability, and maintainability. If something looks wrong or suboptimal, DO NOT just move on to
+   the next task — intervene and tell Claude to fix the structural issue first. Be specific: name
+   the problem, explain why it's wrong, and suggest how to restructure. Catching bad architecture
+   early saves expensive rework later.
+8. If Claude entered plan mode or is asking for plan approval, tell it to exit plan mode immediately and just implement directly. Plan mode wastes steps in autonomous execution.
 
 RESPOND WITH ONE OF:
+- "QUOTA:<wait_minutes>\\n<details>" if Claude's output indicates it hit a rate limit, quota exceeded,
+  usage cap, or is out of usage. Extract the reset time from Claude's message and calculate how many
+  minutes until the reset. Put that number after QUOTA: (e.g. "QUOTA:45" means wait 45 minutes).
+  If you cannot determine the reset time, use "QUOTA:60". On the next line, include the raw reset
+  info from Claude's output (e.g. "Resets at 3:45 PM").
 - "VERIFY:<next_phase>\\n<verification prompt for Claude>" to ask Claude to verify before transitioning
 - "PHASE:<next_phase>\\n<prompt for Claude>" to transition (ONLY when reviewing a verification result)
 - "DONE\\n<summary>" to finish (ONLY when reviewing a verification result where all tests pass)
@@ -1690,7 +2458,7 @@ RESPOND WITH ONE OF:
             text=True
         )
 
-        stdout, stderr = process.communicate(timeout=120)
+        stdout, stderr = process.communicate(timeout=300)
 
         output = (stdout or "").strip()
         error_output = (stderr or "").strip()
@@ -1698,28 +2466,36 @@ RESPOND WITH ONE OF:
         if error_output:
             print(f"[Codex] Stderr: {error_output[:200]}", flush=True)
 
-        # Check for quota/rate-limit errors in stderr only (not stdout, which is Codex's response)
-        # Exclude banner lines AND session/prompt lines that may contain quota-like words
-        stderr_lines = [l for l in error_output.split("\n")
-                        if l.strip() and not l.startswith(("OpenAI Codex", "---", "workdir:", "model:",
-                                                           "provider:", "approval:", "sandbox:", "reasoning",
-                                                           "session", "user ", "system "))]
-        stderr_filtered = " ".join(stderr_lines)
-        # Use strict regex to avoid false positives from prompt text in stderr
-        if stderr_filtered and QUOTA_REGEX.search(stderr_filtered):
-            return None, False, f"QUOTA: Codex rate limited — {stderr_filtered[:200]}"
+        # Check for ERROR: lines in stderr (quota, auth, model errors).
+        # This is the most reliable detection — Codex CLI prefixes fatal errors with "ERROR:"
+        stderr_error_lines = [l for l in error_output.split("\n") if l.startswith("ERROR:")]
+        if stderr_error_lines:
+            error_msg = stderr_error_lines[-1]
+            wait_secs, _ = _parse_reset_wait(error_msg)
+            wait_min = max(1, wait_secs // 60)
+            print(f"[Codex] Fatal error detected: {error_msg}", flush=True)
+            return None, False, f"QUOTA:{wait_min} Codex error — {error_msg[:200]}"
 
         if not output:
-            # Use filtered stderr (banner removed) for clearer error messages
-            error_msg = stderr_filtered[:300] if stderr_filtered else error_output[:300]
-            if error_msg:
-                return None, False, f"Codex error: {error_msg}"
             return None, False, "Codex produced no output"
 
         if output.startswith("DONE"):
             summary = output[4:].strip().lstrip("\n")
             print(f"[Codex] Decision: DONE. Summary: {summary[:200]}", flush=True)
             return None, True, summary
+
+        # Check if Codex detected Claude hit a quota/rate-limit
+        # Format: "QUOTA:<wait_minutes>\n<details>"
+        if output.startswith("QUOTA:"):
+            first_line, _, rest = output.partition("\n")
+            wait_str = first_line[6:].strip()
+            details = rest.strip() or "no details"
+            try:
+                wait_min = max(1, int(wait_str))
+            except (ValueError, TypeError):
+                wait_min = 60
+            print(f"[Codex] Decision: Claude quota detected. Wait: {wait_min}min. Details: {details[:200]}", flush=True)
+            return None, False, f"QUOTA:{wait_min} {details[:200]}"
 
         # Check for phase transition
         if output.startswith("PHASE:"):
@@ -1750,8 +2526,15 @@ RESPOND WITH ONE OF:
 
     except subprocess.TimeoutExpired:
         process.kill()
-        print(f"[Codex] TIMEOUT after 120s", flush=True)
-        return "Continue implementing the next unfinished item from the plan.", False, "Codex timed out"
+        print(f"[Codex] TIMEOUT after 300s (phase: {phase})", flush=True)
+        # Phase-aware fallback prompts so we don't send nonsensical "continue implementing" during review/test
+        timeout_fallbacks = {
+            "implementing": "Continue implementing the next unfinished item from the plan.",
+            "reviewing": "Continue the code review. Check for bugs, edge cases, design flaws, and anything that needs fixing.",
+            "testing": "Continue writing and running tests. Focus on integration tests for the key workflows.",
+        }
+        fallback = timeout_fallbacks.get(phase, timeout_fallbacks["implementing"])
+        return fallback, False, "Codex timed out"
     except FileNotFoundError:
         print(f"[Codex] ERROR: codex binary not found", flush=True)
         return None, False, "Codex not found"
@@ -1759,7 +2542,7 @@ RESPOND WITH ONE OF:
         print(f"[Codex] EXCEPTION: {e}", flush=True)
         err_str = str(e)
         if QUOTA_REGEX.search(err_str):
-            return None, False, f"QUOTA: Codex exception — {err_str[:200]}"
+            return None, False, f"QUOTA:60 Codex exception — {err_str[:200]}"
         return None, False, f"Codex error: {e}"
 
 
@@ -1778,6 +2561,202 @@ def _justdoit_wait(chat_key, seconds):
         time.sleep(chunk)
         elapsed += chunk
     return justdoit_active.get(chat_key, {}).get("active", False)
+
+
+def run_omni_loop(chat_id, task, session):
+    """Main autonomous execution loop for /omni: Claude (Architect) -> Gemini (Execute) -> Codex (Audit)."""
+    session_id = get_session_id(session)
+    chat_key = f"{chat_id}:{session_id}"
+    cwd = session["cwd"]
+    log_prefix = f"[Omni {chat_id}:{session.get('name', 'unknown')}]"
+    original_task = task  # Preserve original task — don't mutate
+
+    print(f"{log_prefix} Starting. Task: {task[:200]}", flush=True)
+    print(f"{log_prefix} Session ID: {session_id}, CWD: {cwd}", flush=True)
+
+    omni_active[chat_key] = {
+        "active": True,
+        "task": task,
+        "step": 0,
+        "phase": "architecting",
+        "chat_id": str(chat_id),
+        "session_name": session.get("name", "unknown"),
+    }
+    save_active_tasks()
+
+    step = 0
+    phase = "architecting"  # architecting -> executing -> auditing
+    audit_feedback = ""  # Carries Codex feedback into next execute cycle
+    notified_exit = False
+
+    try:
+        send_message(chat_id, f"""🚀 *Omni Task Started* on `{session.get('name', 'unknown')}`
+
+Task: _{task[:200]}_
+
+_Claude (Architect) → Gemini (Execute) → Codex (Audit)_
+_Use /cancel to stop at any time._""")
+
+        while omni_active.get(chat_key, {}).get("active"):
+            step += 1
+            omni_active[chat_key]["step"] = step
+            omni_active[chat_key]["phase"] = phase
+            save_active_tasks()
+
+            # Stop if we hit a runaway limit
+            if step > 20:
+                send_message(chat_id, "⚠️ *Omni limit reached* (20 steps). Stopping to prevent loop.")
+                break
+
+            print(f"{log_prefix} === Step {step} === Phase: {phase}", flush=True)
+
+            # --- Phase 1: Architect (Claude) ---
+            if phase == "architecting":
+                send_message(chat_id, f"🏛️ *Step {step}: Architecting* (Claude)\nUpdating PLAN.md...")
+
+                arch_prompt = (
+                    f"Update PLAN.md in the root directory to reflect the implementation plan for the following task:\n\n"
+                    f"{original_task}\n\n"
+                    f"Use markdown checkboxes: - [ ] for pending, - [x] for done.\n"
+                    f"Ensure architecture is solid and testing is planned.\n"
+                    f"IMPORTANT: Do NOT enter plan mode (EnterPlanMode). Write PLAN.md directly."
+                )
+                if audit_feedback:
+                    arch_prompt += f"\n\nPrevious audit feedback to incorporate:\n{audit_feedback}"
+
+                # Update session state for context bridge
+                update_session_state(chat_id, session, original_task, "Claude")
+
+                response, questions, _, claude_sid, context_overflow = run_claude_streaming(
+                    arch_prompt, chat_id, cwd=cwd, continue_session=True,
+                    session_id=session_id, session=session
+                )
+
+                # Persist Claude session ID
+                if claude_sid:
+                    update_claude_session_id(chat_id, session, claude_sid)
+                    session = get_session_by_id(chat_id, session_id) or session
+
+                # Handle context overflow
+                if context_overflow:
+                    print(f"{log_prefix} Step {step}: Context overflow, resetting Claude session", flush=True)
+                    send_message(chat_id, "⚠️ Context overflow — resetting Claude session...")
+                    update_claude_session_id(chat_id, session, None)
+                    reset_message_count(chat_id, session)
+
+                # Auto-answer any questions
+                if questions:
+                    auto_answer = handle_justdoit_questions(questions)
+                    print(f"{log_prefix} Step {step}: Auto-answering {len(questions)} questions", flush=True)
+                    send_message(chat_id, f"🤖 *Auto-answering:* _{auto_answer[:100]}_")
+                    _, _, _, claude_sid2, _ = run_claude_streaming(
+                        auto_answer, chat_id, cwd=cwd, continue_session=True,
+                        session_id=session_id, session=session
+                    )
+                    if claude_sid2:
+                        update_claude_session_id(chat_id, session, claude_sid2)
+                        session = get_session_by_id(chat_id, session_id) or session
+
+                if response:
+                    print(f"{log_prefix} Step {step}: Claude architect response: {response[:300]}...", flush=True)
+
+                phase = "executing"
+                time.sleep(2)
+                continue
+
+            # --- Phase 2: Execute (Gemini) ---
+            if phase == "executing":
+                # Check cancellation
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
+
+                exec_prompt = "Review the current PLAN.md and project state. Implement the next pending step of the plan. Verify your work with tests where applicable."
+                if audit_feedback:
+                    exec_prompt = f"Fix the issues identified in the recent audit:\n{audit_feedback}\n\nThen proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
+
+                send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
+
+                # Update session state for context bridge (Gemini handles bridge injection internally)
+                t = run_gemini_task(chat_id, exec_prompt, cwd, session=session)
+                if t:
+                    t.join()
+
+                # Refresh session in case Gemini updated session IDs
+                session = get_session_by_id(chat_id, session_id) or session
+
+                phase = "auditing"
+                time.sleep(2)
+                continue
+
+            # --- Phase 3: Audit (Codex) ---
+            if phase == "auditing":
+                # Check cancellation
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
+
+                send_message(chat_id, f"🕵️ *Step {step}: Auditing* (Codex)\nReviewing implementation...")
+
+                # Inject context bridge for Codex
+                codex_prompt = (
+                    f"Review the recent changes and current project state against PLAN.md and the original task:\n\n"
+                    f"{original_task}\n\n"
+                    f"Check for bugs, security issues, or deviations from the plan.\n"
+                    f"If everything looks correct and all plan items are complete, respond with exactly 'SIGN-OFF'.\n"
+                    f"Otherwise, provide precise, actionable feedback on what needs fixing."
+                )
+                if session:
+                    bridge = get_context_bridge(session, "Codex")
+                    if bridge:
+                        codex_prompt = bridge + "[NEW TASK]\n" + codex_prompt
+
+                # Update session state
+                update_session_state(chat_id, session, original_task, "Codex")
+
+                # Run Codex with 600s timeout (audits can be thorough)
+                audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=600)
+
+                if not audit_result:
+                    print(f"{log_prefix} Step {step}: Codex returned empty result", flush=True)
+                    send_message(chat_id, f"⚠️ *Step {step}:* Codex returned no output. Retrying...")
+                    time.sleep(5)
+                    audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=600)
+
+                if audit_result:
+                    print(f"{log_prefix} Step {step}: Codex audit result: {audit_result[:500]}...", flush=True)
+                    # Show audit result to user
+                    send_message(chat_id, f"🔍 *Audit Result (Step {step}):*\n_{audit_result[:1000]}_")
+
+                if audit_result and "SIGN-OFF" in audit_result.upper():
+                    send_message(chat_id, f"""✅ *Omni Task Complete!* (Step {step})
+
+Codex provided final sign-off.
+
+_Session preserved. You can continue chatting in this session._""")
+                    notified_exit = True
+                    break
+                else:
+                    audit_feedback = audit_result[:2000] if audit_result else "Previous audit returned no feedback."
+                    # Loop back: architect incorporates feedback, then execute fixes
+                    phase = "architecting"
+
+                time.sleep(2)
+
+        # Cleanup
+        omni_active[chat_key]["active"] = False
+        save_active_tasks()
+        if not notified_exit:
+            send_message(chat_id, f"🏁 *Omni process finished* for `{session.get('name', 'unknown')}`.")
+
+    except Exception as e:
+        import traceback
+        print(f"{log_prefix} EXCEPTION: {e}", flush=True)
+        print(f"{log_prefix} Traceback:\n{traceback.format_exc()}", flush=True)
+        try:
+            send_message(chat_id, f"❌ *Omni error:* {str(e)[:300]}")
+        except Exception:
+            pass
+        omni_active[chat_key]["active"] = False
+        save_active_tasks()
 
 
 def run_justdoit_loop(chat_id, task, session):
@@ -1824,6 +2803,8 @@ _Use /cancel to stop at any time._""")
         print(f"{log_prefix} Step 0: Asking Claude for plan file", flush=True)
         plan_setup_prompt = (
             "Before we begin autonomous implementation, I need a plan file.\n"
+            "IMPORTANT: If you are currently in plan mode, exit plan mode FIRST (use ExitPlanMode), then proceed.\n"
+            "Do NOT use EnterPlanMode at any point during this autonomous session.\n"
             "1. If you already created a plan/todo file in this project, copy its content to PLAN.md in the project root.\n"
             "2. If no plan exists yet, create PLAN.md with a structured checklist for the task.\n"
             "Use markdown checkboxes: - [ ] for pending, - [x] for done.\n"
@@ -1850,6 +2831,8 @@ _Use /cancel to stop at any time._""")
 
         current_prompt = task + (
             "\n\nRemember to update PLAN.md checkboxes (- [ ] → - [x]) as you complete each item."
+            "\n\nIMPORTANT: Do NOT enter plan mode (EnterPlanMode) during this session. "
+            "Just implement directly — the plan is already in PLAN.md."
         )
 
         while True:
@@ -1894,7 +2877,7 @@ Format as a compact bullet list."""
                         session_id=session_id, session=session
                     )
                     summary = summary_response.split("———")[0].strip() if summary_response else ""
-                except:
+                except Exception:
                     summary = ""
 
                 # Persist summary before clearing session (survives crashes)
@@ -1921,7 +2904,7 @@ Format as a compact bullet list."""
                 notified_exit = True
                 break
 
-            update_session_last_prompt(chat_id, session, f"[justdoit step {step}] {current_prompt[:80]}")
+            update_session_state(chat_id, session, f"[justdoit step {step}] {current_prompt[:80]}", "Claude")
 
             # Run Claude
             response, questions, _, claude_sid, context_overflow = run_claude_streaming(
@@ -1933,20 +2916,9 @@ Format as a compact bullet list."""
             if response:
                 print(f"{log_prefix} Step {step}: Claude response preview: {response[:300]}...", flush=True)
 
-            # Check for Claude quota/rate-limit errors
-            if response and is_quota_error_response(response):
-                print(f"{log_prefix} Step {step}: Claude rate limited. Waiting 1 hour.", flush=True)
-                send_message(chat_id,
-                    f"⏳ *Claude rate limited* at step {step}.\n"
-                    f"_Waiting 1 hour before retrying... ({datetime.now().strftime('%H:%M')} -> "
-                    f"{(datetime.now() + timedelta(hours=1)).strftime('%H:%M')})_\n"
-                    f"_Use /cancel to abort._")
-                if not _justdoit_wait(chat_key, QUOTA_WAIT_SECONDS):
-                    send_message(chat_id, f"⚠️ *JustDoIt cancelled* during rate-limit wait.")
-                    break
-                send_message(chat_id, "🔄 *Resuming after rate-limit wait...*")
-                step -= 1  # Retry same step
-                continue
+            # NOTE: Claude quota/rate-limit detection is handled by Codex.
+            # Codex sees Claude's output, detects quota errors, and responds with QUOTA:<minutes>.
+            # The QUOTA handler below (after run_codex_review) handles the wait.
 
             # Update session ID
             if claude_sid:
@@ -2094,14 +3066,26 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                     pending_transition = target
                     send_message(chat_id, f"🔍 *Step {step}* — Verification requested before moving to {target}")
 
-            # Handle Codex quota errors — wait and retry
+            # Handle quota errors — wait and retry
+            # Format: "QUOTA:<minutes> <details>" from both Codex errors and Codex-detected Claude errors
             if next_prompt is None and reasoning and reasoning.startswith("QUOTA:"):
-                print(f"{log_prefix} Step {step}: Codex rate limited. Waiting 1 hour.", flush=True)
+                # Parse "QUOTA:<minutes> <details>"
+                quota_rest = reasoning[6:].strip()
+                parts = quota_rest.split(" ", 1)
+                try:
+                    wait_min = max(1, int(parts[0]))
+                except (ValueError, IndexError):
+                    wait_min = 60
+                details = parts[1] if len(parts) > 1 else ""
+                wait_secs = wait_min * 60
+                resume_time = (datetime.now() + timedelta(seconds=wait_secs)).strftime('%H:%M')
+                print(f"{log_prefix} Step {step}: Rate limited. Wait: {wait_min}min. {details[:200]}", flush=True)
                 send_message(chat_id,
-                    f"⏳ *Codex rate limited* at step {step}.\n"
-                    f"_Waiting 1 hour before retrying... ({datetime.now().strftime('%H:%M')})_\n"
+                    f"⏳ *Rate limited* at step {step}.\n"
+                    f"{details[:200]}\n"
+                    f"_Waiting ~{wait_min}min... (resume ~{resume_time})_\n"
                     f"_Use /cancel to abort._")
-                if not _justdoit_wait(chat_key, QUOTA_WAIT_SECONDS):
+                if not _justdoit_wait(chat_key, wait_secs):
                     send_message(chat_id, f"⚠️ *JustDoIt cancelled* during rate-limit wait.")
                     break
                 send_message(chat_id, "🔄 *Resuming after rate-limit wait...*")
@@ -2189,6 +3173,738 @@ _Session preserved. You can continue chatting with Claude in this session._""")
         save_active_tasks()
 
 
+def run_codex_deepreview(claude_output, review_history, step, cwd, phase):
+    """Call Codex to review Claude's review output during deepreview.
+
+    Returns: (next_prompt: str or None, is_clean: bool, reasoning: str)
+    - next_prompt: prompt to send to Claude for fixes, or None
+    - is_clean: True if Codex found no issues
+    - reasoning: explanation of Codex's decision (starts with "QUOTA:" if rate-limited)
+    """
+    max_output_len = 8000
+    if len(claude_output) > max_output_len:
+        claude_output = claude_output[:max_output_len] + "\n\n... (output truncated)"
+
+    max_history_len = 6000
+    if len(review_history) > max_history_len:
+        review_history = review_history[-max_history_len:]
+
+    if phase == "codex_reviews_claude":
+        codex_prompt = f"""You are a ruthless senior staff engineer doing a deep code review.
+
+You are reviewing Claude's detailed review output. Your job is to catch things Claude missed or got wrong:
+
+1. DESIGN/ARCHITECTURE FLAWS: Poor abstractions, god functions, tight coupling, wrong patterns
+2. BANDAIDS/HACKS: Quick fixes that don't address root causes, workarounds due to laziness
+3. DEGRADING FALLBACKS: New fallback paths that silently degrade the product instead of failing properly
+4. MISSED ISSUES: Bugs, race conditions, security issues Claude didn't catch
+5. OVER-ENGINEERING: Unnecessary abstractions, premature optimization, gold-plating
+
+REVIEW HISTORY SO FAR:
+{review_history}
+
+CLAUDE'S LATEST REVIEW OUTPUT:
+{claude_output}
+
+If you find ANY of the above issues, respond with a SPECIFIC prompt to give to Claude telling it exactly what to fix and why. Be direct and technical — name the exact function, file, pattern, or line that's wrong.
+
+If Claude's review and fixes are solid — no design flaws, no bandaids, no degrading fallbacks, no hacks — respond with exactly:
+CLEAN
+
+Do NOT be lenient. Do NOT say CLEAN if there are real issues. But also do NOT nitpick style or cosmetic issues — focus on correctness, design, and architecture."""
+
+    elif phase == "codex_final_signoff":
+        codex_prompt = f"""You are a ruthless senior staff engineer doing a FINAL review of a deep code review session.
+
+Throughout this session, Claude has been reviewing and fixing code. Now you must do a final comprehensive check.
+
+FULL REVIEW HISTORY:
+{review_history}
+
+CLAUDE'S LATEST OUTPUT:
+{claude_output}
+
+Check for:
+1. Did Claude actually fix the issues it found, or just describe them?
+2. Are there any design/architecture flaws remaining?
+3. Any bandaids, hacks, or lazy shortcuts that slipped through?
+4. Any new fallbacks that degrade the product?
+5. Any regressions — did fixing one thing break another?
+
+If you find issues, respond with a SPECIFIC prompt to give to Claude to fix them.
+
+If everything is solid and the code is clean, respond with exactly:
+CLEAN
+
+This is the final gate. Be thorough but fair."""
+
+    else:
+        return None, False, f"Unknown phase: {phase}"
+
+    print(f"[DeepReview Codex] Step {step}, phase: {phase}, prompt length: {len(codex_prompt)}", flush=True)
+
+    try:
+        process = subprocess.Popen(
+            [
+                "codex", "exec",
+                "-m", CODEX_MODEL,
+                "-c", 'model_reasoning_effort="xhigh"',
+                "--full-auto",
+                codex_prompt
+            ],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        stdout, stderr = process.communicate(timeout=600)
+        output = (stdout or "").strip()
+        error_output = (stderr or "").strip()
+
+        print(f"[DeepReview Codex] Raw output ({len(output)} chars): {output[:300]}...", flush=True)
+        if error_output:
+            print(f"[DeepReview Codex] Stderr: {error_output[:200]}", flush=True)
+
+        # Check for fatal errors in stderr
+        stderr_error_lines = [l for l in error_output.split("\n") if l.startswith("ERROR:")]
+        if stderr_error_lines:
+            error_msg = stderr_error_lines[-1]
+            wait_secs, _ = _parse_reset_wait(error_msg)
+            wait_min = max(1, wait_secs // 60)
+            return None, False, f"QUOTA:{wait_min} Codex error — {error_msg[:200]}"
+
+        if not output:
+            return None, False, "Codex produced no output"
+
+        if output.strip().startswith("CLEAN"):
+            return None, True, "No issues found"
+
+        if output.startswith("QUOTA:"):
+            first_line, _, rest = output.partition("\n")
+            wait_str = first_line[6:].strip()
+            details = rest.strip() or "no details"
+            try:
+                wait_min = max(1, int(wait_str))
+            except (ValueError, TypeError):
+                wait_min = 60
+            return None, False, f"QUOTA:{wait_min} {details[:200]}"
+
+        # Codex found issues — output is the prompt for Claude
+        return output, False, "Issues found"
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return None, False, "Codex timed out"
+    except FileNotFoundError:
+        return None, False, "Codex not found"
+    except Exception as e:
+        err_str = str(e)
+        if QUOTA_REGEX.search(err_str):
+            return None, False, f"QUOTA:60 Codex exception — {err_str[:200]}"
+        return None, False, f"Codex error: {e}"
+
+
+def run_codex_deepreview_fix(review_history, step, cwd, is_followup=False, claude_feedback=None):
+    """Call Codex to review AND fix code directly (Phase 3).
+
+    Codex runs with --full-auto so it can edit files.
+    Returns: (output: str or None, is_clean: bool, reasoning: str)
+    - output: Codex's report of what it reviewed/fixed, or None on error
+    - is_clean: True if Codex found no issues
+    - reasoning: explanation (starts with "QUOTA:" if rate-limited)
+    """
+    max_history_len = 6000
+    if len(review_history) > max_history_len:
+        review_history = review_history[-max_history_len:]
+
+    if is_followup and claude_feedback:
+        codex_prompt = f"""You are a ruthless senior staff engineer doing a deep code review AND fixing issues directly.
+
+Claude (another AI) reviewed your previous fixes and found problems. Here's Claude's critique:
+
+CLAUDE'S CRITIQUE:
+{claude_feedback[:4000]}
+
+REVIEW HISTORY SO FAR:
+{review_history}
+
+Your job:
+1. Read Claude's critique carefully
+2. Review the actual code files to verify Claude's claims
+3. If Claude is right, fix the issues directly in the files
+4. If Claude is wrong, explain why (but still check for other issues)
+5. Look for anything BOTH you and Claude may have missed
+
+After reviewing and fixing, report exactly what you found and changed.
+
+If the code is solid and you found nothing to fix, respond with exactly:
+ALL_CLEAN
+
+Focus on correctness, design, and architecture — not cosmetics."""
+    else:
+        codex_prompt = f"""You are a ruthless senior staff engineer doing a deep code review AND fixing issues directly.
+
+Claude (another AI) has already done {step} rounds of self-review and fixes. Your job is to find what Claude missed and FIX it yourself.
+
+IMPORTANT: Focus ONLY on the files and code areas mentioned in the review history below. Do NOT review the entire project — only the files that were worked on in this session.
+
+REVIEW HISTORY SO FAR:
+{review_history}
+
+Your job:
+1. Read the actual code files mentioned in the review history
+2. Look for issues Claude missed or got wrong:
+   - BUGS: Logic errors, race conditions, null access, off-by-one
+   - DESIGN FLAWS: Poor abstractions, god functions, tight coupling
+   - BANDAIDS/HACKS: Quick fixes that don't address root causes
+   - SECURITY: Injection, XSS, auth bypasses, secret leaks
+   - OVER-ENGINEERING: Unnecessary abstractions, premature optimization
+3. FIX every issue you find directly in the code files
+4. Report what you found and fixed
+
+After reviewing and fixing, report exactly what you found and changed.
+
+If the code is solid and you found nothing to fix, respond with exactly:
+ALL_CLEAN
+
+Focus on correctness, design, and architecture — not cosmetics."""
+
+    print(f"[DeepReview Codex Fix] Step {step}, is_followup: {is_followup}, prompt length: {len(codex_prompt)}", flush=True)
+
+    try:
+        process = subprocess.Popen(
+            [
+                "codex", "exec",
+                "-m", CODEX_MODEL,
+                "-c", 'model_reasoning_effort="xhigh"',
+                "--full-auto",
+                codex_prompt
+            ],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        stdout, stderr = process.communicate(timeout=600)
+        output = (stdout or "").strip()
+        error_output = (stderr or "").strip()
+
+        print(f"[DeepReview Codex Fix] Raw output ({len(output)} chars): {output[:300]}...", flush=True)
+        if error_output:
+            print(f"[DeepReview Codex Fix] Stderr: {error_output[:200]}", flush=True)
+
+        # Check for fatal errors in stderr
+        stderr_error_lines = [l for l in error_output.split("\n") if l.startswith("ERROR:")]
+        if stderr_error_lines:
+            error_msg = stderr_error_lines[-1]
+            wait_secs, _ = _parse_reset_wait(error_msg)
+            wait_min = max(1, wait_secs // 60)
+            return None, False, f"QUOTA:{wait_min} Codex error — {error_msg[:200]}"
+
+        if not output:
+            return None, False, "Codex produced no output"
+
+        if "ALL_CLEAN" in output.upper():
+            return output, True, "No issues found"
+
+        if output.startswith("QUOTA:"):
+            first_line, _, rest = output.partition("\n")
+            wait_str = first_line[6:].strip()
+            details = rest.strip() or "no details"
+            try:
+                wait_min = max(1, int(wait_str))
+            except (ValueError, TypeError):
+                wait_min = 60
+            return None, False, f"QUOTA:{wait_min} {details[:200]}"
+
+        # Codex found and fixed issues — output is its report
+        return output, False, "Issues found and fixed"
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return None, False, "Codex timed out"
+    except FileNotFoundError:
+        return None, False, "Codex not found"
+    except Exception as e:
+        err_str = str(e)
+        if QUOTA_REGEX.search(err_str):
+            return None, False, f"QUOTA:60 Codex exception — {err_str[:200]}"
+        return None, False, f"Codex error: {e}"
+
+
+def _deepreview_wait(chat_key, seconds):
+    """Sleep for `seconds` while checking deepreview cancellation every 30s."""
+    elapsed = 0
+    interval = 30
+    while elapsed < seconds:
+        state = deepreview_active.get(chat_key, {})
+        if not state.get("active", False):
+            return False
+        chunk = min(interval, seconds - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+    return deepreview_active.get(chat_key, {}).get("active", False)
+
+
+def run_deepreview_loop(chat_id, session):
+    """Main deep review loop for /deepreview."""
+    session_id = get_session_id(session)
+    chat_key = f"{chat_id}:{session_id}"
+    cwd = session["cwd"]
+    log_prefix = f"[DeepReview {chat_id}:{session.get('name', 'unknown')}]"
+
+    print(f"{log_prefix} Starting deep review", flush=True)
+
+    deepreview_active[chat_key] = {
+        "active": True,
+        "phase": "claude_self_review",
+        "step": 0,
+        "chat_id": str(chat_id),
+        "session_name": session.get("name", "unknown"),
+    }
+
+    step = 0
+    review_history = ""
+    all_review_history = ""  # Accumulates everything across all phases
+    codex_fail_streak = 0
+    notified_exit = False
+
+    try:
+        send_message(chat_id, """🔬 *Deep Review Mode Activated*
+
+_Phases 1+2: Claude fixes ↔ Codex reviews (loop until Codex satisfied)_
+_Phases 3+4: Codex fixes ↔ Claude reviews (loop until Claude satisfied)_
+
+_Use /cancel to stop at any time._""")
+
+        # ============================================================
+        # MEGA-LOOP 1: Phases 1+2 (up to 20 bounces)
+        # Phase 1: Claude reviews+fixes (single pass)
+        # Phase 2: Codex cross-reviews → if issues, back to Phase 1
+        # ============================================================
+        max_iterations_12 = 20
+        iteration_12 = 0
+        codex_satisfied = False
+
+        while iteration_12 < max_iterations_12 and not codex_satisfied:
+            iteration_12 += 1
+
+            # Check cancellation
+            if not deepreview_active.get(chat_key, {}).get("active", False):
+                if not notified_exit:
+                    send_message(chat_id, f"⚠️ *Deep review cancelled* at step {step}.")
+                    notified_exit = True
+                break
+
+            # --- PHASE 1: Claude reviews and fixes (single pass) ---
+            phase = "claude_self_review"
+            deepreview_active[chat_key]["phase"] = phase
+            step += 1
+            deepreview_active[chat_key]["step"] = step
+
+            if iteration_12 == 1:
+                send_message(chat_id, f"🔍 *Step {step}* — Phase 1: Claude reviewing & fixing...")
+
+                # Build session-scoped prompt
+                session_context = ""
+                if session.get("last_summary"):
+                    session_context = f"\n\nSESSION CONTEXT (what we've been working on):\n{session['last_summary'][:2000]}\n"
+                elif session.get("last_prompt"):
+                    session_context = f"\n\nLAST TASK: {session['last_prompt']}\n"
+
+                prompt = f"""Do a deep, thorough review of the code you've been working on in this session. Focus on the files and areas we've touched or discussed — NOT the entire project.{session_context}
+Be ruthlessly critical. Look for:
+1. BUGS: Logic errors, off-by-one, null/undefined access, race conditions
+2. DESIGN FLAWS: Poor abstractions, god functions, tight coupling, wrong patterns
+3. SECURITY: Injection, XSS, auth bypasses, secret leaks
+4. ERROR HANDLING: Silent failures, swallowed exceptions, missing error paths
+5. EDGE CASES: Empty inputs, large inputs, concurrent access, network failures
+6. PERFORMANCE: N+1 queries, unnecessary allocations, blocking operations in async code
+
+For each issue found:
+- State the exact file and location
+- Explain why it's a problem
+- Fix it immediately
+
+After fixing everything you find, report what you fixed and what looks clean."""
+            else:
+                # Codex sent us back with feedback
+                codex_feedback = review_history.split("=== Codex cross-review")[-1][:3000] if "=== Codex cross-review" in review_history else review_history[-2000:]
+                send_message(chat_id, f"🔍 *Step {step}* — Phase 1 (iteration {iteration_12}): Claude fixing Codex's findings...")
+                prompt = f"""A senior engineer (Codex) reviewed your code and found these issues. Fix them ALL:
+
+{codex_feedback}
+
+After fixing, do another pass to make sure you didn't introduce regressions. Report exactly what you changed. If you disagree with any feedback, explain why."""
+
+            # Handle compaction
+            needs_compaction = increment_message_count(chat_id, session)
+            if needs_compaction:
+                send_message(chat_id, "📦 *Auto-compacting* session context...")
+                try:
+                    summary_response, _, _, _, _ = run_claude_streaming(
+                        "Summarize this session for context continuity (max 500 words). Focus on files changed, issues found and fixed, and current state.",
+                        chat_id, cwd=cwd, continue_session=True,
+                        session_id=session_id, session=session
+                    )
+                    summary = summary_response.split("———")[0].strip() if summary_response else ""
+                except Exception:
+                    summary = ""
+                if summary and len(summary) > 50:
+                    save_session_summary(chat_id, session, summary)
+                update_claude_session_id(chat_id, session, None)
+                reset_message_count(chat_id, session)
+                if summary and len(summary) > 50:
+                    prompt = f"[Session compacted - Previous context summary:]\n{summary}\n\n[Continuing task:]\n{prompt}"
+                send_message(chat_id, "🔄 Context preserved. Continuing...")
+
+            response, questions, _, claude_sid, context_overflow = run_claude_streaming(
+                prompt, chat_id, cwd=cwd, continue_session=True,
+                session_id=session_id, session=session
+            )
+
+            if claude_sid:
+                update_claude_session_id(chat_id, session, claude_sid)
+                session = get_session_by_id(chat_id, session_id) or session
+
+            if context_overflow:
+                send_message(chat_id, "⚠️ Context overflow — compacting...")
+                update_claude_session_id(chat_id, session, None)
+                reset_message_count(chat_id, session)
+                response, questions, _, claude_sid, _ = run_claude_streaming(
+                    prompt, chat_id, cwd=cwd, continue_session=True,
+                    session_id=session_id, session=session
+                )
+                if claude_sid:
+                    update_claude_session_id(chat_id, session, claude_sid)
+                    session = get_session_by_id(chat_id, session_id) or session
+
+            if questions:
+                auto_answer = handle_justdoit_questions(questions)
+                send_message(chat_id, f"🤖 *Auto-answering:* _{auto_answer[:100]}_")
+                response2, _, _, claude_sid2, _ = run_claude_streaming(
+                    auto_answer, chat_id, cwd=cwd, continue_session=True,
+                    session_id=session_id, session=session
+                )
+                if claude_sid2:
+                    update_claude_session_id(chat_id, session, claude_sid2)
+                    session = get_session_by_id(chat_id, session_id) or session
+                if response2:
+                    response = (response or "") + "\n\n[After auto-answer:]\n" + response2
+
+            clean_response = response.split("———")[0].strip() if response else "No output"
+            review_history += f"\n\nClaude review+fix (iteration {iteration_12}):\n{clean_response[:2000]}"
+            all_review_history += f"\n\n=== Claude review+fix (iteration {iteration_12}) ===\n{clean_response[:2000]}"
+
+            print(f"{log_prefix} Step {step}: Claude review+fix iteration {iteration_12}, response length: {len(clean_response)}", flush=True)
+
+            time.sleep(2)
+
+            # Check cancellation before phase 2
+            if not deepreview_active.get(chat_key, {}).get("active", False):
+                if not notified_exit:
+                    send_message(chat_id, f"⚠️ *Deep review cancelled* at step {step}.")
+                    notified_exit = True
+                break
+
+            # --- PHASE 2: Codex cross-reviews Claude's work ---
+            phase = "codex_reviews_claude"
+            deepreview_active[chat_key]["phase"] = phase
+            step += 1
+            deepreview_active[chat_key]["step"] = step
+
+            send_message(chat_id, f"🧠 *Step {step}* — Phase 2 (iteration {iteration_12}): Codex cross-reviewing...")
+
+            # Retry loop for Codex (handles timeouts/errors without re-running Claude)
+            codex_retry = 0
+            next_prompt = None
+            is_clean = False
+            reasoning = ""
+            codex_abort = False
+            while codex_retry < 3:
+                next_prompt, is_clean, reasoning = run_codex_deepreview(
+                    clean_response, review_history, step, cwd, phase="codex_reviews_claude"
+                )
+                print(f"{log_prefix} Step {step}: Codex cross-review iteration {iteration_12} (try {codex_retry + 1}) — clean: {is_clean}, reasoning: {reasoning[:200]}", flush=True)
+
+                # Handle quota
+                if reasoning and reasoning.startswith("QUOTA:"):
+                    parts = reasoning[6:].strip().split(" ", 1)
+                    try:
+                        wait_min = max(1, int(parts[0]))
+                    except (ValueError, IndexError):
+                        wait_min = 60
+                    details = parts[1] if len(parts) > 1 else ""
+                    wait_secs = wait_min * 60
+                    resume_time = (datetime.now() + timedelta(seconds=wait_secs)).strftime('%H:%M')
+                    send_message(chat_id, f"⏳ *Rate limited.* _{details[:200]}_\n_Waiting ~{wait_min}min... (resume ~{resume_time})_")
+                    if not _deepreview_wait(chat_key, wait_secs):
+                        send_message(chat_id, f"⚠️ *Deep review cancelled* during wait.")
+                        notified_exit = True
+                        codex_abort = True
+                        break
+                    send_message(chat_id, "🔄 *Resuming...*")
+                    continue  # Retry Codex directly after quota wait
+
+                if is_clean or next_prompt is not None:
+                    break  # Got a real result
+
+                # Codex failed (timeout, error, no output)
+                codex_retry += 1
+                send_message(chat_id, f"⚠️ Codex failed ({reasoning[:100]}). Retry {codex_retry}/3...")
+                time.sleep(5)
+
+            if codex_abort:
+                break
+
+            if is_clean:
+                send_message(chat_id, f"✅ Codex is satisfied with Claude's work after {iteration_12} iterations.")
+                codex_satisfied = True
+                break
+
+            if next_prompt is None:
+                send_message(chat_id, "⚠️ Codex failed 3 times. Moving to Codex's turn.")
+                break
+
+            all_review_history += f"\n\n=== Codex cross-review (iteration {iteration_12}) ===\n{next_prompt[:3000]}"
+            review_history += f"\n\n=== Codex cross-review (iteration {iteration_12}) ===\n{next_prompt[:3000]}"
+
+            send_message(chat_id, f"📋 *Codex feedback for Claude:*\n\n{next_prompt[:3500]}")
+            send_message(chat_id, "🔄 Sending Claude back to fix...")
+
+            time.sleep(2)
+
+        if not codex_satisfied and not notified_exit:
+            send_message(chat_id, f"⚠️ Hit max Phase 1↔2 iterations ({max_iterations_12}). Moving to Codex's turn.")
+
+        # Check cancellation before mega-loop 2
+        if not deepreview_active.get(chat_key, {}).get("active", False):
+            if not notified_exit:
+                send_message(chat_id, f"⚠️ *Deep review cancelled* at step {step}.")
+            return
+
+        # ============================================================
+        # MEGA-LOOP 2: Phases 3+4 (up to 20 bounces)
+        # Phase 3: Codex reviews+fixes (single pass)
+        # Phase 4: Claude cross-reviews → if issues, back to Phase 3
+        # ============================================================
+        max_iterations_34 = 20
+        iteration_34 = 0
+        claude_satisfied = False
+        codex_fail_streak = 0
+
+        while iteration_34 < max_iterations_34 and not claude_satisfied:
+            iteration_34 += 1
+
+            # Check cancellation
+            if not deepreview_active.get(chat_key, {}).get("active", False):
+                if not notified_exit:
+                    send_message(chat_id, f"⚠️ *Deep review cancelled* at step {step}.")
+                    notified_exit = True
+                break
+
+            # --- PHASE 3: Codex reviews and fixes (single pass) ---
+            phase = "codex_self_review"
+            deepreview_active[chat_key]["phase"] = phase
+            step += 1
+            deepreview_active[chat_key]["step"] = step
+
+            # On iteration > 1, pass Claude's feedback from Phase 4
+            is_followup = iteration_34 > 1
+            claude_feedback_for_codex = None
+            if is_followup and "=== Claude cross-review of Codex" in all_review_history:
+                claude_feedback_for_codex = all_review_history.split("=== Claude cross-review of Codex")[-1][:3000]
+
+            if iteration_34 == 1:
+                send_message(chat_id, f"🔨 *Step {step}* — Phase 3: Codex reviewing & fixing...")
+            else:
+                send_message(chat_id, f"🔨 *Step {step}* — Phase 3 (iteration {iteration_34}): Codex fixing Claude's findings...")
+
+            codex_output, is_clean, reasoning = run_codex_deepreview_fix(
+                all_review_history, step, cwd,
+                is_followup=is_followup,
+                claude_feedback=claude_feedback_for_codex
+            )
+
+            print(f"{log_prefix} Step {step}: Codex review+fix iteration {iteration_34} — clean: {is_clean}, reasoning: {reasoning[:200]}", flush=True)
+
+            # Handle quota
+            if reasoning and reasoning.startswith("QUOTA:"):
+                parts = reasoning[6:].strip().split(" ", 1)
+                try:
+                    wait_min = max(1, int(parts[0]))
+                except (ValueError, IndexError):
+                    wait_min = 60
+                details = parts[1] if len(parts) > 1 else ""
+                wait_secs = wait_min * 60
+                resume_time = (datetime.now() + timedelta(seconds=wait_secs)).strftime('%H:%M')
+                send_message(chat_id, f"⏳ *Rate limited.* _{details[:200]}_\n_Waiting ~{wait_min}min... (resume ~{resume_time})_")
+                if not _deepreview_wait(chat_key, wait_secs):
+                    send_message(chat_id, f"⚠️ *Deep review cancelled* during wait.")
+                    notified_exit = True
+                    break
+                send_message(chat_id, "🔄 *Resuming...*")
+                iteration_34 -= 1  # Retry
+                continue
+
+            if is_clean:
+                send_message(chat_id, f"✅ Codex found no issues (iteration {iteration_34}).")
+
+            if codex_output is None:
+                codex_fail_streak += 1
+                send_message(chat_id, f"⚠️ Codex failed ({reasoning[:100]}). Retry {codex_fail_streak}/3...")
+                if codex_fail_streak >= 3:
+                    send_message(chat_id, "⚠️ Codex failed 3 times. Moving to Claude cross-review.")
+                else:
+                    time.sleep(5)
+                    iteration_34 -= 1  # Retry Phase 3 directly
+                    continue
+            else:
+                codex_fail_streak = 0
+                if not is_clean:
+                    all_review_history += f"\n\n=== Codex review+fix (iteration {iteration_34}) ===\n{codex_output[:2000]}"
+                    send_message(chat_id, f"🔨 *Codex review & fixes:*\n\n{codex_output[:3500]}")
+
+            time.sleep(2)
+
+            # Check cancellation before phase 4
+            if not deepreview_active.get(chat_key, {}).get("active", False):
+                if not notified_exit:
+                    send_message(chat_id, f"⚠️ *Deep review cancelled* at step {step}.")
+                    notified_exit = True
+                break
+
+            # --- PHASE 4: Claude cross-reviews Codex's work ---
+            phase = "claude_reviews_codex"
+            deepreview_active[chat_key]["phase"] = phase
+            step += 1
+            deepreview_active[chat_key]["step"] = step
+
+            send_message(chat_id, f"⚔️ *Step {step}* — Phase 4 (iteration {iteration_34}): Claude cross-reviewing Codex's work...")
+
+            critique_prompt = f"""Another AI (Codex) just did a deep code review and made direct fixes to the codebase.
+
+REVIEW HISTORY:
+{all_review_history[-4000:]}
+
+Your job is to cross-review Codex's work with fresh eyes:
+
+1. Read the actual code files — did Codex's fixes actually improve things?
+2. Did Codex introduce any regressions or new bugs?
+3. Did Codex use bandaids/hacks instead of proper fixes?
+4. Did Codex miss important issues that are still in the code?
+5. Did Codex over-engineer or add unnecessary complexity?
+6. Are there design/architecture concerns Codex overlooked?
+
+If you find problems, fix them immediately and report what you changed.
+If Codex's work is solid and the code is clean, say exactly: ALL_CLEAN"""
+
+            # Handle compaction
+            needs_compaction = increment_message_count(chat_id, session)
+            if needs_compaction:
+                send_message(chat_id, "📦 *Auto-compacting* session context...")
+                try:
+                    summary_response, _, _, _, _ = run_claude_streaming(
+                        "Summarize this session for context continuity (max 500 words). Focus on files changed, issues found and fixed, and current state.",
+                        chat_id, cwd=cwd, continue_session=True,
+                        session_id=session_id, session=session
+                    )
+                    summary = summary_response.split("———")[0].strip() if summary_response else ""
+                except Exception:
+                    summary = ""
+                if summary and len(summary) > 50:
+                    save_session_summary(chat_id, session, summary)
+                update_claude_session_id(chat_id, session, None)
+                reset_message_count(chat_id, session)
+                if summary and len(summary) > 50:
+                    critique_prompt = f"[Session compacted - Previous context summary:]\n{summary}\n\n[Continuing task:]\n{critique_prompt}"
+                send_message(chat_id, "🔄 Context preserved. Continuing...")
+
+            response, questions, _, claude_sid, context_overflow = run_claude_streaming(
+                critique_prompt, chat_id, cwd=cwd, continue_session=True,
+                session_id=session_id, session=session
+            )
+            if claude_sid:
+                update_claude_session_id(chat_id, session, claude_sid)
+                session = get_session_by_id(chat_id, session_id) or session
+            if context_overflow:
+                update_claude_session_id(chat_id, session, None)
+                reset_message_count(chat_id, session)
+                response, _, _, claude_sid, _ = run_claude_streaming(
+                    critique_prompt, chat_id, cwd=cwd, continue_session=True,
+                    session_id=session_id, session=session
+                )
+                if claude_sid:
+                    update_claude_session_id(chat_id, session, claude_sid)
+                    session = get_session_by_id(chat_id, session_id) or session
+            if questions:
+                auto_answer = handle_justdoit_questions(questions)
+                response2, _, _, sid2, _ = run_claude_streaming(
+                    auto_answer, chat_id, cwd=cwd, continue_session=True,
+                    session_id=session_id, session=session
+                )
+                if sid2:
+                    update_claude_session_id(chat_id, session, sid2)
+                    session = get_session_by_id(chat_id, session_id) or session
+                if response2:
+                    response = (response or "") + "\n\n[After auto-answer:]\n" + response2
+
+            clean_response = response.split("———")[0].strip() if response else "No output"
+            all_review_history += f"\n\n=== Claude cross-review of Codex (iteration {iteration_34}) ===\n{clean_response[:2000]}"
+
+            print(f"{log_prefix} Step {step}: Claude critique iteration {iteration_34}, response length: {len(clean_response)}", flush=True)
+
+            if "ALL_CLEAN" in clean_response.upper():
+                print(f"{log_prefix} Claude reports ALL_CLEAN on Codex's work after iteration {iteration_34}", flush=True)
+                send_message(chat_id, f"✅ Claude is satisfied with Codex's work after {iteration_34} iterations.")
+                claude_satisfied = True
+                break
+
+            # Claude found issues — loop back to Phase 3
+            send_message(chat_id, f"📋 *Claude feedback for Codex:*\n\n{clean_response[:3500]}")
+            send_message(chat_id, "🔄 Sending Codex back to fix...")
+
+            time.sleep(2)
+
+        if not claude_satisfied and not notified_exit:
+            send_message(chat_id, f"⚠️ Hit max Phase 3↔4 iterations ({max_iterations_34}). Ending review.")
+
+        if not notified_exit:
+            if codex_satisfied and claude_satisfied:
+                send_message(chat_id, f"""🔬 *Deep Review Complete!*
+
+Finished in *{step}* steps across all phases.
+Both Claude and Codex agree the code is clean.
+
+_Session preserved. You can continue chatting._""")
+            else:
+                send_message(chat_id, f"""🔬 *Deep Review Finished*
+
+Completed in *{step}* steps.
+_Session preserved. You can continue chatting._""")
+
+    except Exception as e:
+        import traceback
+        print(f"{log_prefix} EXCEPTION: {e}", flush=True)
+        print(f"{log_prefix} Traceback:\n{traceback.format_exc()}", flush=True)
+        try:
+            send_message(chat_id, f"❌ *Deep review error:* {str(e)[:300]}")
+        except Exception:
+            pass
+
+    finally:
+        print(f"{log_prefix} Loop ended. Total steps: {step}", flush=True)
+        try:
+            state = deepreview_active.get(chat_key, {})
+            if state.get("active", False) and not notified_exit:
+                send_message(chat_id, f"⚠️ *Deep review stopped* at step {step}.\n_Session preserved._")
+        except Exception:
+            pass
+        deepreview_active.pop(chat_key, None)
+
+
 def handle_command(chat_id, text):
     """Handle bot commands. Returns True if handled."""
     parts = text.split(maxsplit=1)
@@ -2204,6 +3920,7 @@ def handle_command(chat_id, text):
 • `/sessions` - List your sessions
 • `/plan` - Enter plan mode
 • `/justdoit [task]` - Autonomous implementation mode
+• `/deepreview` - Deep multi-phase code review
 • `/status` - Show current session
 • `/help` - Show this help
 
@@ -2232,13 +3949,23 @@ Send any message to chat with Claude!""")
 • `/approve` - Approve current plan
 • `/reject` - Reject current plan
 • `/cancel` - Cancel current session's task
+• `/claude [task]` - Run Claude task (session persists per project)
 • `/codex [task]` - Run Codex task (session persists per project)
-  Uses `gpt-5.2-codex` (reasoning: xhigh), auto-resumes previous session
+• `/gemini [task]` - Run Gemini task (session persists per project)
+  Uses `gpt-5.3-codex` (reasoning: xhigh), auto-resumes previous session
 
 *Autonomous Mode:*
 • `/justdoit [task]` - Start autonomous implementation
   Claude implements, Codex reviews, loops until done.
   Use without args to continue current plan.
+  _Use /cancel to stop._
+• `/deepreview` - Deep multi-phase code review
+  Phases 1↔2: Claude fixes ↔ Codex reviews (loop until Codex satisfied)
+  Phases 3↔4: Codex fixes ↔ Claude reviews (loop until Claude satisfied)
+  _Use /cancel to stop._
+• `/omni [task]` - Unified Engineering Team Task
+  Architect (Claude) -> Execute (Gemini) -> Audit (Codex).
+  Loops until the task is complete and signed off by Codex.
   _Use /cancel to stop._
 
 *Files:*
@@ -2378,7 +4105,7 @@ Send a message to start working!""")
                 session_locks.pop(sid, None)
                 message_queue.pop(sid, None)
             user_sessions[chat_key] = {"sessions": [], "active": None}
-            save_sessions()
+            save_sessions(force=True)
             send_message(chat_id, "🗑️ All sessions deleted.")
             return True
 
@@ -2394,7 +4121,7 @@ Send a message to start working!""")
                         user_data["active"] = None
                     session_locks.pop(sid, None)
                     message_queue.pop(sid, None)
-                    save_sessions()
+                    save_sessions(force=True)
                     send_message(chat_id, f"🗑️ Deleted session `{deleted_name}`")
                     return True
             send_message(chat_id, f"❌ Session `{target}` not found. Use `/sessions` to list.")
@@ -2440,7 +4167,7 @@ Send a message to start working!""")
         chat_key = str(chat_id)
         if chat_key in user_sessions:
             user_sessions[chat_key]["active"] = None
-            save_sessions()
+            save_sessions(force=True)
         send_message(chat_id, "Session ended. Use `/new <project>` to start a new one.")
         return True
 
@@ -2457,17 +4184,27 @@ Send a message to start working!""")
     if cmd == "/cancel":
         session = get_active_session(chat_id)
 
-        # Cancel justdoit mode if active on the current session
+        # Cancel justdoit or deepreview mode if active on the current session
         justdoit_was_active = False
+        deepreview_was_active = False
+        omni_was_active = False
         if session:
             session_id = get_session_id(session)
             jdi_key = f"{chat_id}:{session_id}"
             if justdoit_active.get(jdi_key, {}).get("active"):
                 justdoit_active[jdi_key]["active"] = False
                 justdoit_was_active = True
+            if deepreview_active.get(jdi_key, {}).get("active"):
+                deepreview_active[jdi_key]["active"] = False
+                deepreview_was_active = True
+            if omni_active.get(jdi_key, {}).get("active"):
+                omni_active[jdi_key]["active"] = False
+                omni_was_active = True
 
         if session:
             session_id = get_session_id(session)
+            # Mark as explicitly cancelled so streaming threads detect it reliably
+            cancelled_sessions.add(session_id)
             process = active_processes.get(session_id)
             if process:
                 try:
@@ -2483,6 +4220,10 @@ Send a message to start working!""")
                     active_processes.pop(session_id, None)
                     if justdoit_was_active:
                         send_message(chat_id, f"⚠️ *JustDoIt cancelled* for `{session['name']}`.\n_Session preserved. You can continue manually._")
+                    elif deepreview_was_active:
+                        send_message(chat_id, f"⚠️ *Deep review cancelled* for `{session['name']}`.\n_Session preserved._")
+                    elif omni_was_active:
+                        send_message(chat_id, f"⚠️ *Omni cancelled* for `{session['name']}`.\n_Session preserved._")
                     else:
                         send_message(chat_id, f"⚠️ Cancelled operation for `{session['name']}`.")
                 except ProcessLookupError:
@@ -2495,17 +4236,25 @@ Send a message to start working!""")
                     try:
                         process.kill()
                         active_processes.pop(session_id, None)
-                    except:
+                    except Exception:
                         pass
                     send_message(chat_id, f"⚠️ Cancelled operation for `{session['name']}`.")
             else:
                 if justdoit_was_active:
                     send_message(chat_id, f"⚠️ *JustDoIt cancelled* for `{session['name']}`.\n_No active subprocess was running._")
+                elif deepreview_was_active:
+                    send_message(chat_id, f"⚠️ *Deep review cancelled* for `{session['name']}`.\n_No active subprocess was running._")
+                elif omni_was_active:
+                    send_message(chat_id, f"⚠️ *Omni cancelled* for `{session['name']}`.\n_No active subprocess was running._")
                 else:
                     send_message(chat_id, f"No active task for session `{session['name']}`.")
         else:
             if justdoit_was_active:
                 send_message(chat_id, "⚠️ JustDoIt cancelled.")
+            elif deepreview_was_active:
+                send_message(chat_id, "⚠️ Deep review cancelled.")
+            elif omni_was_active:
+                send_message(chat_id, "⚠️ Omni cancelled.")
             else:
                 send_message(chat_id, "No active session. Nothing to cancel.")
         return True
@@ -2548,6 +4297,33 @@ Send a message to start working!""")
         send_message(chat_id, response or "❌ Rejected")
         return True
 
+    if cmd in ("/omni", "/o"):
+        session = get_active_session(chat_id)
+        if not session:
+            send_message(chat_id, "No active session. Use `/new <project>` first.")
+            return True
+
+        task = args.strip() if args else "Review the project and identify improvements"
+        
+        # Run Omni in a background thread
+        thread = threading.Thread(
+            target=run_omni_loop,
+            args=(chat_id, task, session),
+            daemon=True
+        )
+        thread.start()
+        return True
+
+    if cmd in ("/claude", "/c", "/cl"):
+        session = get_active_session(chat_id)
+        if not session:
+            send_message(chat_id, "No active session. Use `/new <project>` first.")
+            return True
+
+        task = args.strip() if args else "Review the code and identify any issues, bugs, or improvements"
+        run_claude_in_thread(chat_id, task, session=session)
+        return True
+
     if cmd == "/codex":
         session = get_active_session(chat_id)
         if not session:
@@ -2556,6 +4332,16 @@ Send a message to start working!""")
 
         task = args.strip() if args else "Review the code and identify any issues, bugs, or improvements"
         run_codex_task(chat_id, task, session["cwd"], session=session)
+        return True
+
+    if cmd in ("/gemini", "/gem", "/g"):
+        session = get_active_session(chat_id)
+        if not session:
+            send_message(chat_id, "No active session. Use `/new <project>` first.")
+            return True
+
+        task = args.strip() if args else "Review the code and identify any issues, bugs, or improvements"
+        run_gemini_task(chat_id, task, session["cwd"], session=session)
         return True
 
     if cmd == "/init":
@@ -2666,6 +4452,36 @@ Send a message to start working!""")
             send_message(chat_id, f"❌ Failed to send file: `{os.path.basename(file_path)}`")
         return True
 
+    if cmd == "/deepreview":
+        session = get_active_session(chat_id)
+        if not session:
+            send_message(chat_id, "No active session. Use `/new <project>` first.")
+            return True
+
+        session_id = get_session_id(session)
+        dr_key = f"{chat_id}:{session_id}"
+
+        if deepreview_active.get(dr_key, {}).get("active"):
+            send_message(chat_id, "⚠️ Deep review is already running on this session. Use `/cancel` to stop it first.")
+            return True
+
+        jdi_key = dr_key
+        if justdoit_active.get(jdi_key, {}).get("active"):
+            send_message(chat_id, "⚠️ JustDoIt is running on this session. Use `/cancel` to stop it first.")
+            return True
+
+        if session_id in active_processes:
+            send_message(chat_id, "⚠️ Session is busy. Wait for it to finish or `/cancel` first.")
+            return True
+
+        thread = threading.Thread(
+            target=run_deepreview_loop,
+            args=(chat_id, session),
+            daemon=True
+        )
+        thread.start()
+        return True
+
     if cmd == "/justdoit":
         session = get_active_session(chat_id)
         if not session:
@@ -2744,7 +4560,7 @@ def handle_callback_query(callback_query):
                     session_locks.pop(sid, None)
                     message_queue.pop(sid, None)
                 user_sessions[chat_key] = {"sessions": [], "active": None}
-                save_sessions()
+                save_sessions(force=True)
                 send_message(chat_id, "🗑️ All sessions deleted.")
                 return
 
@@ -2761,7 +4577,7 @@ def handle_callback_query(callback_query):
                 sessions.pop(idx)
                 session_locks.pop(sid, None)
                 message_queue.pop(sid, None)
-                save_sessions()
+                save_sessions(force=True)
                 send_message(chat_id, f"🗑️ Deleted session `{deleted_name}`")
                 return
 
@@ -2842,7 +4658,7 @@ def run_claude_in_thread(chat_id, text, session=None):
 
     # Save last prompt for context
     if session:
-        update_session_last_prompt(chat_id, session, text)
+        update_session_state(chat_id, session, text, "Claude")
 
     def claude_task():
         try:
@@ -2851,57 +4667,12 @@ def run_claude_in_thread(chat_id, text, session=None):
                 needs_compaction = increment_message_count(chat_id, session)
 
                 if needs_compaction:
-                    send_message(chat_id, "📦 *Proactive compaction* - summarizing context...")
+                    perform_proactive_compaction(chat_id, session, "Claude")
 
-                    # Get summary before context gets too long
-                    summary_prompt = """Summarize this session for context continuity (max 500 words). Focus on ACTIONABLE STATE:
-1. Files being edited — exact paths and what changed
-2. Current task — what's in progress, what's done, what's left
-3. Key decisions — architectural choices, approaches chosen and WHY
-4. Bugs/issues — any errors encountered and their status (fixed/open)
-5. Code snippets — any critical code patterns or values needed to continue
-
-Omit: greetings, abandoned approaches, resolved debugging back-and-forth.
-Format as a compact bullet list."""
-
-                    try:
-                        summary_response, _, _, _, _ = run_claude_streaming(
-                            summary_prompt, chat_id, cwd=session["cwd"], continue_session=True,
-                            session_id=session_id, session=session
-                        )
-                        summary = summary_response.split("———")[0].strip() if summary_response else ""
-                    except:
-                        summary = ""
-
-                    # Persist summary before clearing session (survives crashes)
-                    if summary and len(summary) > 50:
-                        save_session_summary(chat_id, session, summary)
-
-                    # Reset the session
-                    update_claude_session_id(chat_id, session, None)
-                    reset_message_count(chat_id, session)
-
-                    # Continue with fresh session + context
-                    if summary and len(summary) > 50:
-                        text_with_context = f"""[Session compacted - Previous context summary:]
-{summary}
-
-[New request:]
-{text}"""
-                        send_message(chat_id, "🔄 Context preserved. Continuing...")
-                    else:
-                        text_with_context = text
-                        send_message(chat_id, "🔄 Session refreshed. Continuing...")
-
-                    response, questions, _, claude_sid, context_overflow = run_claude_streaming(
-                        text_with_context, chat_id, cwd=session["cwd"], continue_session=True,
-                        session_id=session_id, session=session
-                    )
-                else:
-                    response, questions, _, claude_sid, context_overflow = run_claude_streaming(
-                        text, chat_id, cwd=session["cwd"], continue_session=True,
-                        session_id=session_id, session=session
-                    )
+                response, questions, _, claude_sid, context_overflow = run_claude_streaming(
+                    text, chat_id, cwd=session["cwd"], continue_session=True,
+                    session_id=session_id, session=session
+                )
 
                 # Fallback: Smart compaction on context overflow (if proactive didn't catch it)
                 if context_overflow:
@@ -2926,7 +4697,7 @@ Format as a compact bullet list. This will be used to restore context after rese
                         )
                         # Extract just the summary text (remove completion indicators)
                         summary = summary_response.split("———")[0].strip() if summary_response else ""
-                    except:
+                    except Exception:
                         summary = ""
 
                     # Persist summary before clearing session (survives crashes)
@@ -3078,8 +4849,16 @@ def handle_message(chat_id, text):
         # Mark as active immediately under the lock to prevent races
         active_processes[session_id] = None  # placeholder until real process starts
 
-    # Regular message - send to Claude with streaming in background
-    run_claude_in_thread(chat_id, text, session)
+    # Dispatch to the appropriate CLI runner based on session state
+    last_cli = session.get("last_cli", "Claude") if session else "Claude"
+    
+    if last_cli == "Codex":
+        run_codex_task(chat_id, text, session["cwd"], session=session)
+    elif last_cli == "Gemini":
+        run_gemini_task(chat_id, text, session["cwd"], session=session)
+    else:
+        # Default to Claude
+        run_claude_in_thread(chat_id, text, session)
 
 
 def main():
@@ -3101,7 +4880,10 @@ def main():
             {"command": "reject", "description": "Reject current plan"},
             {"command": "cancel", "description": "Cancel current task"},
             {"command": "justdoit", "description": "Autonomous implementation mode"},
+            {"command": "omni", "description": "Unified Engineering Task"},
+            {"command": "claude", "description": "Run Claude task"},
             {"command": "codex", "description": "Run Codex task"},
+            {"command": "gemini", "description": "Run Gemini task"},
             {"command": "file", "description": "Download a file - /file <path>"},
             {"command": "reset", "description": "Clear conversation history"},
             {"command": "delete", "description": "Delete a session"},
@@ -3150,6 +4932,11 @@ def main():
                     print(f"[MEMORY] After GC+trim: {rss_after:.0f} MB", flush=True)
             except Exception as e:
                 print(f"[MEMORY] Monitor error: {e}", flush=True)
+            # Flush any debounced session saves
+            try:
+                _flush_sessions_if_dirty()
+            except Exception:
+                pass
             time.sleep(30)
 
     threading.Thread(target=memory_monitor, daemon=True).start()
