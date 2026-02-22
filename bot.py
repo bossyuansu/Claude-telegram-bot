@@ -4278,9 +4278,11 @@ Send a message to start working!""")
             else:
                 status = "✅ Idle"
 
+            default_cli = session.get("last_cli", "Claude")
             send_message(chat_id, f"""*Current Session:*
 • Project: `{session['name']}`
 • Directory: `{session['cwd']}`
+• Default CLI: `{default_cli}`
 • Status: {status}
 • Created: {session['created_at'][:16]}""")
         else:
