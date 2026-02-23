@@ -2213,6 +2213,16 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                             last_update = now
 
                     elif etype == "tool_result":
+                        # Show tool output for shell commands (truncated)
+                        tool_output = event.get("output", "")
+                        if tool_output and isinstance(tool_output, str) and len(tool_output.strip()) > 0:
+                            # Truncate long outputs but show enough to be useful
+                            display_output = tool_output.strip()[:800]
+                            if len(tool_output.strip()) > 800:
+                                display_output += "\n... (truncated)"
+                            output_block = f"\n```\n{display_output}\n```\n"
+                            accumulated_text += output_block
+                            current_chunk_text += output_block
                         current_tool = None
 
                     elif etype == "error":
