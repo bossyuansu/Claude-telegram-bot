@@ -4908,10 +4908,6 @@ def run_claude_in_thread(chat_id, text, session=None):
     chat_key = str(chat_id)
     session_id = get_session_id(session) if session else None
 
-    # Save last prompt for context
-    if session:
-        update_session_state(chat_id, session, text, "Claude")
-
     def claude_task():
         try:
             if session:
