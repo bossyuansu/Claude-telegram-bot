@@ -6,6 +6,7 @@ Supports interactive prompts, plan mode, and multiple working directories.
 
 import os
 import re
+import signal
 import subprocess
 import requests
 import time
@@ -1607,23 +1608,33 @@ def run_codex(prompt, cwd=None, session=None, timeout=180):
     try:
         process = subprocess.Popen(
             cmd, cwd=cwd or os.getcwd(),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True
         )
-        stdout, _ = process.communicate(timeout=timeout)
-        
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"run_codex: timed out after {timeout}s, killing and reading partial output", flush=True)
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except Exception:
+                process.kill()
+            stdout, _ = process.communicate(timeout=10)
+
         # Parse JSONL output to extract agent messages
         accumulated = []
-        for line in stdout.strip().split("\n"):
-            if not line: continue
-            try:
-                event = json.loads(line)
-                if event.get("type") == "item.completed":
-                    item = event.get("item", {})
-                    if item.get("type") == "agent_message":
-                        accumulated.append(item.get("text", ""))
-            except json.JSONDecodeError:
-                pass
-        
+        if stdout:
+            for line in stdout.strip().split("\n"):
+                if not line: continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") == "item.completed":
+                        item = event.get("item", {})
+                        if item.get("type") == "agent_message":
+                            accumulated.append(item.get("text", ""))
+                except json.JSONDecodeError:
+                    pass
+
         return "\n".join(accumulated).strip()
     except Exception as e:
         print(f"run_codex error: {e}")
@@ -2836,14 +2847,14 @@ _Use /cancel to stop at any time._""")
                 # Update session state
                 update_session_state(chat_id, session, original_task, "Codex")
 
-                # Run Codex with 600s timeout (audits can be thorough)
-                audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=600)
+                # Run Codex with 900s timeout (audits can be thorough on large projects)
+                audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=900)
 
                 if not audit_result:
                     print(f"{log_prefix} Step {step}: Codex returned empty result", flush=True)
                     send_message(chat_id, f"⚠️ *Step {step}:* Codex returned no output. Retrying...")
                     time.sleep(5)
-                    audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=600)
+                    audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=900)
 
                 if audit_result:
                     print(f"{log_prefix} Step {step}: Codex audit result: {audit_result[:500]}...", flush=True)
