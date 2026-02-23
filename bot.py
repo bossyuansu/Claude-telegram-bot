@@ -1850,7 +1850,8 @@ def run_codex_task(chat_id, task, cwd, session=None):
             update_interval = 1.0
             message_id = send_message(chat_id, "⏳ _Codex working..._")
             message_ids.append(message_id)
-            last_update = time.time()
+            # Force the first streaming update to be visible immediately.
+            last_update = 0
             current_tool = None
 
             import io
@@ -1915,6 +1916,13 @@ def run_codex_task(chat_id, task, cwd, session=None):
                                     if item_id:
                                         processed_item_ids.add(item_id)
                                 current_tool = "Bash"
+                                # Show tool activity even before text arrives.
+                                now = time.time()
+                                if now - last_update >= update_interval:
+                                    display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
+                                    status = "\n\n———\n🔧 _Bash_"
+                                    edit_message(chat_id, message_id, display_text + status)
+                                    last_update = now
                             elif etype == "item.completed":
                                 current_tool = None
 
@@ -2113,7 +2121,8 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             message_id = send_message(chat_id, "⏳ _Gemini working..._")
             message_ids.append(message_id)
             last_output_time = time.time()
-            last_update = last_output_time
+            # Force the first streaming update to be visible immediately.
+            last_update = 0
             current_tool = None
 
             # Watchdog thread: kills Gemini if no stdout activity for gemini_stale_timeout seconds
@@ -2157,16 +2166,27 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
                     elif etype == "message":
                         if event.get("role") == "assistant":
+                            # Gemini stream-json content is typically delta chunks; some versions
+                            # may emit non-delta cumulative snapshots, so handle both safely.
                             content = event.get("content", "")
-                            if content:
+                            if not isinstance(content, str):
+                                content = str(content) if content is not None else ""
+                            is_delta = bool(event.get("delta"))
+                            append_text = content
+                            if content and not is_delta:
+                                if content.startswith(accumulated_text):
+                                    append_text = content[len(accumulated_text):]
+                                elif accumulated_text.startswith(content):
+                                    append_text = ""
+                            if append_text:
                                 spacing = ""
-                                if accumulated_text and not accumulated_text.endswith('\n') and not content.startswith('\n'):
+                                if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
                                     if accumulated_text.endswith(('.', '!', '?', ':')):
                                         spacing = "\n\n"
                                     elif not accumulated_text.endswith(' '):
                                         spacing = " "
-                                accumulated_text += spacing + content
-                                current_chunk_text += spacing + content
+                                accumulated_text += spacing + append_text
+                                current_chunk_text += spacing + append_text
                                 current_tool = None
 
                     elif etype == "tool_use":
@@ -2176,11 +2196,21 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                         if tool_id:
                             processed_tool_ids.add(tool_id)
 
-                        tool_name = event.get("tool_name")
+                        tool_name = event.get("tool_name") or "tool"
                         params = event.get("parameters", {})
                         path = params.get("file_path") or params.get("command") or params.get("pattern") or params.get("dir_path") or ""
                         file_changes.append({"type": tool_name.lower(), "path": path[:100]})
                         current_tool = tool_name
+                        # Mirror Claude-style visibility: show tool activity even before text arrives.
+                        now = time.time()
+                        if now - last_update >= update_interval:
+                            display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
+                            status = f"\n\n———\n🔧 _{tool_name}_"
+                            edit_message(chat_id, message_id, display_text + status)
+                            last_update = now
+
+                    elif etype == "tool_result":
+                        current_tool = None
 
                     elif etype == "error":
                         error_msg = event.get("message") or event.get("error") or str(event)
@@ -2814,7 +2844,37 @@ _Use /cancel to stop at any time._""")
                 if response:
                     print(f"{log_prefix} Step {step}: Claude architect response: {response[:300]}...", flush=True)
 
-                phase = "executing"
+                # Codex reviews the plan before execution
+                send_message(chat_id, f"📋 *Step {step}: Plan Review* (Codex)\nReviewing PLAN.md...")
+                plan_review_prompt = (
+                    f"Review PLAN.md against the original task:\n\n{original_task}\n\n"
+                    f"Check that the plan is complete, feasible, well-structured, and covers testing.\n"
+                    f"If the plan is solid and ready for execution, respond with exactly 'SIGN-OFF'.\n"
+                    f"Otherwise, provide specific feedback on what needs to change."
+                )
+                if session:
+                    bridge = get_context_bridge(session, "Codex")
+                    if bridge:
+                        plan_review_prompt = bridge + "[NEW TASK]\n" + plan_review_prompt
+
+                update_session_state(chat_id, session, original_task, "Codex")
+                plan_review = run_codex(plan_review_prompt, cwd=cwd, session=session, stale_timeout=300)
+
+                if plan_review:
+                    print(f"{log_prefix} Step {step}: Codex plan review: {plan_review[:500]}...", flush=True)
+                    send_message(chat_id, f"📋 *Plan Review:*\n_{plan_review[:1000]}_")
+
+                first_line = plan_review.strip().split("\n")[0].strip().upper() if plan_review else ""
+                if first_line.startswith("SIGN-OFF"):
+                    print(f"{log_prefix} Step {step}: Plan approved by Codex", flush=True)
+                    send_message(chat_id, "✅ Plan approved by Codex. Proceeding to execution.")
+                    phase = "executing"
+                else:
+                    # Codex rejected the plan — feed back to Claude
+                    audit_feedback = plan_review[:6000] if plan_review else "Plan review returned no feedback."
+                    print(f"{log_prefix} Step {step}: Plan rejected by Codex, looping back", flush=True)
+                    phase = "architecting"
+
                 time.sleep(2)
                 continue
 
@@ -4714,6 +4774,7 @@ def handle_callback_query(callback_query):
 
     answer_callback_query(query_id)
     edit_message_reply_markup(chat_id, message_id, None)  # Remove buttons
+
 
     # Handle session resume
     if data.startswith("resume_"):
