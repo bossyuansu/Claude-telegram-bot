@@ -1597,10 +1597,11 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300):
 
     if codex_sid:
         cmd = [
-            "codex", "exec", "resume", codex_sid,
+            "codex", "exec",
             "-m", CODEX_MODEL,
             "-c", 'model_reasoning_effort="xhigh"',
-            "--full-auto", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", "--json",
+            "resume", codex_sid,
             prompt
         ]
     else:
@@ -1608,7 +1609,7 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300):
             "codex", "exec",
             "-m", CODEX_MODEL,
             "-c", 'model_reasoning_effort="xhigh"',
-            "--full-auto", "--json",
+            "--dangerously-bypass-approvals-and-sandbox", "--json",
             prompt
         ]
 
@@ -1806,10 +1807,11 @@ def run_codex_task(chat_id, task, cwd, session=None):
             # Build command — resume existing session or start new
             if codex_sid:
                 cmd = [
-                    "codex", "exec", "resume", codex_sid,
+                    "codex", "exec",
                     "-m", CODEX_MODEL,
                     "-c", 'model_reasoning_effort="xhigh"',
-                    "--full-auto", "--json",
+                    "--dangerously-bypass-approvals-and-sandbox", "--json",
+                    "resume", codex_sid,
                     current_task
                 ]
             else:
@@ -1817,7 +1819,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                     "codex", "exec",
                     "-m", CODEX_MODEL,
                     "-c", 'model_reasoning_effort="xhigh"',
-                    "--full-auto", "--json",
+                    "--dangerously-bypass-approvals-and-sandbox", "--json",
                     current_task
                 ]
 
@@ -2168,7 +2170,8 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                         new_session_id = event.get("session_id")
 
                     elif etype == "message":
-                        if event.get("role") == "assistant":
+                        role = event.get("role")
+                        if role == "assistant":
                             content = event.get("content", "")
                             if not isinstance(content, str):
                                 content = str(content) if content is not None else ""
@@ -2180,7 +2183,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                                 elif accumulated_text.startswith(content):
                                     append_text = ""
                             if append_text:
-                                print(f"[Gemini] message delta: {len(append_text)} chars, accumulated: {len(accumulated_text)}, chunk: {len(current_chunk_text)}", flush=True)
+                                print(f"[Gemini] text: +{len(append_text)} chars (total: {len(accumulated_text)}): {append_text[:80]}", flush=True)
                                 spacing = ""
                                 if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
                                     if accumulated_text.endswith(('.', '!', '?', ':')):
@@ -2203,6 +2206,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                         path = params.get("file_path") or params.get("command") or params.get("pattern") or params.get("dir_path") or ""
                         file_changes.append({"type": tool_name.lower(), "path": path[:100]})
                         current_tool = tool_name
+                        print(f"[Gemini] tool_use: {tool_name}", flush=True)
                         # Mirror Claude-style visibility: show tool activity even before text arrives.
                         now = time.time()
                         if now - last_update >= update_interval:
@@ -2212,12 +2216,20 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                             last_update = now
 
                     elif etype == "tool_result":
+                        print(f"[Gemini] tool_result", flush=True)
                         current_tool = None
+
+                    elif etype == "result":
+                        stats = event.get("stats", {})
+                        print(f"[Gemini] result: status={event.get('status')}, tokens={stats.get('total_tokens')}, tool_calls={stats.get('tool_calls')}, accumulated_text={len(accumulated_text)}", flush=True)
 
                     elif etype == "error":
                         error_msg = event.get("message") or event.get("error") or str(event)
                         gemini_errors.append(error_msg[:300])
                         print(f"[Gemini] Error event: {error_msg[:300]}", flush=True)
+
+                    else:
+                        print(f"[Gemini] Unknown event type: {etype} (keys: {list(event.keys())[:8]})", flush=True)
 
                     # Stream update: chunk overflow
                     while len(current_chunk_text) > max_chunk_len:
@@ -2233,6 +2245,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                     now = time.time()
                     if now - last_update >= update_interval and current_chunk_text.strip():
                         suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else "\n\n———\n⏳ _generating..._"
+                        print(f"[Gemini] Streaming edit: {len(current_chunk_text)} chars, msg_id={message_id}", flush=True)
                         edit_message(chat_id, message_id, current_chunk_text + suffix)
                         last_update = now
 
@@ -2635,7 +2648,7 @@ RESPOND WITH ONE OF:
                 "codex", "exec",
                 "-m", CODEX_MODEL,
                 "-c", 'model_reasoning_effort="xhigh"',
-                "--full-auto",
+                "--dangerously-bypass-approvals-and-sandbox",
                 codex_prompt
             ],
             cwd=cwd,
@@ -2750,7 +2763,7 @@ def _justdoit_wait(chat_key, seconds):
 
 
 def run_omni_loop(chat_id, task, session):
-    """Main autonomous execution loop for /omni: Claude (Architect) -> Gemini (Execute) -> Codex (Audit)."""
+    """Main autonomous execution loop for /omni: Claude (Architect) -> Claude (Execute) -> Codex (Audit)."""
     session_id = get_session_id(session)
     chat_key = f"{chat_id}:{session_id}"
     cwd = session["cwd"]
@@ -2780,7 +2793,7 @@ def run_omni_loop(chat_id, task, session):
 
 Task: _{task[:200]}_
 
-_Claude (Architect) → Gemini (Execute) → Codex (Audit)_
+_Claude (Architect) → Claude (Execute) → Codex (Audit)_
 _Use /cancel to stop at any time._""")
 
         while omni_active.get(chat_key, {}).get("active"):
@@ -2880,7 +2893,7 @@ _Use /cancel to stop at any time._""")
                 time.sleep(2)
                 continue
 
-            # --- Phase 2: Execute (Gemini) ---
+            # --- Phase 2: Execute (Claude) ---
             if phase == "executing":
                 # Check cancellation
                 if not omni_active.get(chat_key, {}).get("active"):
@@ -2890,44 +2903,38 @@ _Use /cancel to stop at any time._""")
                 if audit_feedback:
                     exec_prompt = f"Fix the issues identified in the recent audit:\n{audit_feedback}\n\nThen proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
 
-                send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
+                send_message(chat_id, f"⚒️ *Step {step}: Executing* (Claude)\n_{exec_prompt[:150]}_")
 
-                # Update session state for context bridge (Gemini handles bridge injection internally)
-                t, gemini_result = run_gemini_task(chat_id, exec_prompt, cwd, session=session)
-                if t:
-                    t.join()
-
-                # Check if Gemini failed — fall back to Claude
-                # Note: stderr often has benign lines like "YOLO mode is enabled",
-                # so only count stderr as failure if exit code is also non-zero
-                exit_code = gemini_result.get("exit_code") or 0
-                gemini_failed = (
-                    gemini_result.get("error")
-                    or exit_code != 0
-                    or not gemini_result.get("output", "").strip()
+                update_session_state(chat_id, session, original_task, "Claude")
+                exec_response, exec_questions, _, claude_sid, context_overflow = run_claude_streaming(
+                    exec_prompt, chat_id, cwd=cwd, continue_session=True,
+                    session_id=session_id, session=session
                 )
-                if gemini_failed:
-                    reason = gemini_result.get("error") or ""
-                    if gemini_result.get("stderr"):
-                        reason = reason or gemini_result["stderr"][-1]
-                    if not reason and not gemini_result.get("output", "").strip():
-                        reason = "no output produced"
-                    print(f"{log_prefix} Step {step}: Gemini failed ({reason[:200]}), falling back to Claude", flush=True)
-                    send_message(chat_id, f"⚠️ Gemini failed: _{reason[:150]}_\nFalling back to Claude...")
 
-                    update_session_state(chat_id, session, original_task, "Claude")
-                    fallback_response, _, _, claude_sid, _ = run_claude_streaming(
-                        exec_prompt, chat_id, cwd=cwd, continue_session=True,
+                if claude_sid:
+                    update_claude_session_id(chat_id, session, claude_sid)
+                    session = get_session_by_id(chat_id, session_id) or session
+
+                if context_overflow:
+                    print(f"{log_prefix} Step {step}: Context overflow during execution, resetting Claude session", flush=True)
+                    send_message(chat_id, "⚠️ Context overflow — resetting Claude session...")
+                    update_claude_session_id(chat_id, session, None)
+                    reset_message_count(chat_id, session, "Claude")
+
+                if exec_questions:
+                    auto_answer = handle_justdoit_questions(exec_questions)
+                    print(f"{log_prefix} Step {step}: Auto-answering {len(exec_questions)} questions", flush=True)
+                    send_message(chat_id, f"🤖 *Auto-answering:* _{auto_answer[:100]}_")
+                    _, _, _, claude_sid2, _ = run_claude_streaming(
+                        auto_answer, chat_id, cwd=cwd, continue_session=True,
                         session_id=session_id, session=session
                     )
-                    if claude_sid:
-                        update_claude_session_id(chat_id, session, claude_sid)
+                    if claude_sid2:
+                        update_claude_session_id(chat_id, session, claude_sid2)
                         session = get_session_by_id(chat_id, session_id) or session
-                    if fallback_response:
-                        print(f"{log_prefix} Step {step}: Claude fallback response: {fallback_response[:300]}...", flush=True)
 
-                # Refresh session in case Gemini updated session IDs
-                session = get_session_by_id(chat_id, session_id) or session
+                if exec_response:
+                    print(f"{log_prefix} Step {step}: Claude execute response: {exec_response[:300]}...", flush=True)
 
                 phase = "auditing"
                 time.sleep(2)
@@ -3497,7 +3504,7 @@ This is the final gate. Be thorough but fair."""
                 "codex", "exec",
                 "-m", CODEX_MODEL,
                 "-c", 'model_reasoning_effort="xhigh"',
-                "--full-auto",
+                "--dangerously-bypass-approvals-and-sandbox",
                 codex_prompt
             ],
             cwd=cwd,
@@ -3626,7 +3633,7 @@ Focus on correctness, design, and architecture — not cosmetics."""
                 "codex", "exec",
                 "-m", CODEX_MODEL,
                 "-c", 'model_reasoning_effort="xhigh"',
-                "--full-auto",
+                "--dangerously-bypass-approvals-and-sandbox",
                 codex_prompt
             ],
             cwd=cwd,
@@ -5010,8 +5017,14 @@ def process_message_queue(chat_id, session=None):
         else:
             return
 
-    # Run next queued message in thread (outside lock)
-    run_claude_in_thread(chat_id, queued_text, session)
+    # Dispatch to the appropriate CLI based on session's last_cli (sticky routing)
+    last_cli = session.get("last_cli", "Claude")
+    if last_cli == "Codex":
+        run_codex_task(chat_id, queued_text, session["cwd"], session=session)
+    elif last_cli == "Gemini":
+        run_gemini_task(chat_id, queued_text, session["cwd"], session=session)
+    else:
+        run_claude_in_thread(chat_id, queued_text, session)
 
 
 def handle_message(chat_id, text):
