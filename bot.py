@@ -2867,8 +2867,8 @@ _Use /cancel to stop at any time._""")
                     print(f"{log_prefix} Step {step}: Codex plan review: {plan_review[:500]}...", flush=True)
                     send_message(chat_id, f"📋 *Plan Review:*\n_{plan_review[:1000]}_")
 
-                first_line = plan_review.strip().split("\n")[0].strip().upper() if plan_review else ""
-                if first_line.startswith("SIGN-OFF"):
+                has_signoff = any(line.strip().upper().startswith("SIGN-OFF") for line in plan_review.strip().split("\n")) if plan_review else False
+                if has_signoff:
                     print(f"{log_prefix} Step {step}: Plan approved by Codex", flush=True)
                     send_message(chat_id, "✅ Plan approved by Codex. Proceeding to execution.")
                     phase = "executing"
@@ -2972,10 +2972,10 @@ _Use /cancel to stop at any time._""")
                     # Show audit result to user
                     send_message(chat_id, f"🔍 *Audit Result (Step {step}):*\n_{audit_result[:1000]}_")
 
-                # Check for sign-off: first line must start with SIGN-OFF to avoid
-                # false positives from Codex quoting instructions like "respond with 'SIGN-OFF'"
-                first_line = audit_result.strip().split("\n")[0].strip().upper() if audit_result else ""
-                if first_line.startswith("SIGN-OFF"):
+                # Check for sign-off: any line starting with SIGN-OFF counts
+                # (Codex often adds preamble text before the SIGN-OFF verdict)
+                has_signoff = any(line.strip().upper().startswith("SIGN-OFF") for line in audit_result.strip().split("\n")) if audit_result else False
+                if has_signoff:
                     send_message(chat_id, f"""✅ *Omni Task Complete!* (Step {step})
 
 Codex provided final sign-off.
