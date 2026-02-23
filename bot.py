@@ -869,6 +869,9 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         bridge = get_context_bridge(session, "Claude")
         if bridge:
             prompt = bridge + "[NEW REQUEST]\n" + prompt
+            print(f"[Claude] Context bridge injected ({len(bridge)} chars)", flush=True)
+        else:
+            print(f"[Claude] No context bridge (no other CLI activity since last Claude use)", flush=True)
 
     # Resume with Claude's session ID if available
     claude_session_id = session.get("claude_session_id") if session else None
