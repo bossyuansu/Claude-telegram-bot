@@ -1584,8 +1584,12 @@ def is_allowed(chat_id):
     return str(chat_id) in ALLOWED_CHAT_IDS
 
 
-def run_codex(prompt, cwd=None, session=None, timeout=180):
-    """Run Codex synchronously and return the output text."""
+def run_codex(prompt, cwd=None, session=None, stale_timeout=300):
+    """Run Codex synchronously and return the output text.
+
+    Uses a stale-output watchdog instead of a hard wall-clock timeout:
+    the process is only killed if no stdout is produced for stale_timeout seconds.
+    """
     codex_sid = session.get("codex_session_id") if session else None
 
     if codex_sid:
@@ -1611,31 +1615,73 @@ def run_codex(prompt, cwd=None, session=None, timeout=180):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True
         )
-        try:
-            stdout, _ = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            print(f"run_codex: timed out after {timeout}s, killing and reading partial output", flush=True)
+
+        # Drain stderr in background to prevent pipe deadlock
+        stderr_lines = []
+        def _drain_stderr():
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                for line in process.stderr:
+                    line = line.strip()
+                    if line:
+                        stderr_lines.append(line[:500])
             except Exception:
-                process.kill()
-            stdout, _ = process.communicate(timeout=10)
+                pass
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
+        # Read stdout line by line with stale-output watchdog
+        last_output_time = time.time()
+        timed_out = False
+        watchdog_stop = threading.Event()
+
+        def _watchdog():
+            nonlocal timed_out
+            while not watchdog_stop.is_set():
+                watchdog_stop.wait(30)
+                if watchdog_stop.is_set():
+                    break
+                elapsed = time.time() - last_output_time
+                if elapsed > stale_timeout:
+                    print(f"run_codex: no output for {elapsed:.0f}s, killing stale process", flush=True)
+                    timed_out = True
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except Exception:
+                        process.kill()
+                    break
+
+        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+        watchdog_thread.start()
+
+        stdout_lines = []
+        try:
+            for line in process.stdout:
+                last_output_time = time.time()
+                stdout_lines.append(line)
+        except Exception:
+            pass
+
+        watchdog_stop.set()
+        process.wait(timeout=10)
 
         # Parse JSONL output to extract agent messages
         accumulated = []
-        if stdout:
-            for line in stdout.strip().split("\n"):
-                if not line: continue
-                try:
-                    event = json.loads(line)
-                    if event.get("type") == "item.completed":
-                        item = event.get("item", {})
-                        if item.get("type") == "agent_message":
-                            accumulated.append(item.get("text", ""))
-                except json.JSONDecodeError:
-                    pass
+        for line in stdout_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                if event.get("type") == "item.completed":
+                    item = event.get("item", {})
+                    if item.get("type") == "agent_message":
+                        accumulated.append(item.get("text", ""))
+            except json.JSONDecodeError:
+                pass
 
-        return "\n".join(accumulated).strip()
+        result = "\n".join(accumulated).strip()
+        if timed_out and not result and stderr_lines:
+            print(f"run_codex: stale timeout, stderr: {stderr_lines[-1][:300]}", flush=True)
+        return result
     except Exception as e:
         print(f"run_codex error: {e}")
         return ""
@@ -2847,14 +2893,14 @@ _Use /cancel to stop at any time._""")
                 # Update session state
                 update_session_state(chat_id, session, original_task, "Codex")
 
-                # Run Codex with 900s timeout (audits can be thorough on large projects)
-                audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=900)
+                # Run Codex with stale-output watchdog (kills only if no output for 5 min)
+                audit_result = run_codex(codex_prompt, cwd=cwd, session=session, stale_timeout=300)
 
                 if not audit_result:
                     print(f"{log_prefix} Step {step}: Codex returned empty result", flush=True)
                     send_message(chat_id, f"⚠️ *Step {step}:* Codex returned no output. Retrying...")
                     time.sleep(5)
-                    audit_result = run_codex(codex_prompt, cwd=cwd, session=session, timeout=900)
+                    audit_result = run_codex(codex_prompt, cwd=cwd, session=session, stale_timeout=300)
 
                 if audit_result:
                     print(f"{log_prefix} Step {step}: Codex audit result: {audit_result[:500]}...", flush=True)
