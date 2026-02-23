@@ -2862,7 +2862,7 @@ _Session preserved. You can continue chatting in this session._""")
                     notified_exit = True
                     break
                 else:
-                    audit_feedback = audit_result[:2000] if audit_result else "Previous audit returned no feedback."
+                    audit_feedback = audit_result[:6000] if audit_result else "Previous audit returned no feedback."
                     # Loop back: architect incorporates feedback, then execute fixes
                     phase = "architecting"
 
