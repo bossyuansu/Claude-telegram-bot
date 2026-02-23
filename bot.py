@@ -4453,10 +4453,11 @@ Send a message to start working!""")
 
         if session:
             session_id = get_session_id(session)
-            # Mark as explicitly cancelled so streaming threads detect it reliably
-            cancelled_sessions.add(session_id)
             process = active_processes.get(session_id)
             if process:
+                # Only mark as cancelled if there's an active process — otherwise the flag
+                # lingers and falsely marks the NEXT run as cancelled
+                cancelled_sessions.add(session_id)
                 try:
                     import signal
                     # Kill entire process group (Claude CLI + child processes) for immediate abort
