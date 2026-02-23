@@ -2836,10 +2836,12 @@ _Use /cancel to stop at any time._""")
                     t.join()
 
                 # Check if Gemini failed — fall back to Claude
+                # Note: stderr often has benign lines like "YOLO mode is enabled",
+                # so only count stderr as failure if exit code is also non-zero
+                exit_code = gemini_result.get("exit_code") or 0
                 gemini_failed = (
                     gemini_result.get("error")
-                    or gemini_result.get("stderr")
-                    or (gemini_result.get("exit_code") or 0) != 0
+                    or exit_code != 0
                     or not gemini_result.get("output", "").strip()
                 )
                 if gemini_failed:
