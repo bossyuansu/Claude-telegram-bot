@@ -2850,7 +2850,10 @@ _Use /cancel to stop at any time._""")
                     # Show audit result to user
                     send_message(chat_id, f"🔍 *Audit Result (Step {step}):*\n_{audit_result[:1000]}_")
 
-                if audit_result and "SIGN-OFF" in audit_result.upper():
+                # Check for sign-off: first line must start with SIGN-OFF to avoid
+                # false positives from Codex quoting instructions like "respond with 'SIGN-OFF'"
+                first_line = audit_result.strip().split("\n")[0].strip().upper() if audit_result else ""
+                if first_line.startswith("SIGN-OFF"):
                     send_message(chat_id, f"""✅ *Omni Task Complete!* (Step {step})
 
 Codex provided final sign-off.
