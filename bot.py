@@ -2169,8 +2169,6 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
                     elif etype == "message":
                         if event.get("role") == "assistant":
-                            # Gemini stream-json content is typically delta chunks; some versions
-                            # may emit non-delta cumulative snapshots, so handle both safely.
                             content = event.get("content", "")
                             if not isinstance(content, str):
                                 content = str(content) if content is not None else ""
@@ -2182,6 +2180,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                                 elif accumulated_text.startswith(content):
                                     append_text = ""
                             if append_text:
+                                print(f"[Gemini] message delta: {len(append_text)} chars, accumulated: {len(accumulated_text)}, chunk: {len(current_chunk_text)}", flush=True)
                                 spacing = ""
                                 if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
                                     if accumulated_text.endswith(('.', '!', '?', ':')):
@@ -2213,16 +2212,6 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                             last_update = now
 
                     elif etype == "tool_result":
-                        # Show tool output for shell commands (truncated)
-                        tool_output = event.get("output", "")
-                        if tool_output and isinstance(tool_output, str) and len(tool_output.strip()) > 0:
-                            # Truncate long outputs but show enough to be useful
-                            display_output = tool_output.strip()[:800]
-                            if len(tool_output.strip()) > 800:
-                                display_output += "\n... (truncated)"
-                            output_block = f"\n```\n{display_output}\n```\n"
-                            accumulated_text += output_block
-                            current_chunk_text += output_block
                         current_tool = None
 
                     elif etype == "error":
