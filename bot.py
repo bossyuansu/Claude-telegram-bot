@@ -1725,14 +1725,15 @@ def run_gemini(prompt, cwd=None, session=None):
         return ""
 
 
-def run_gemini_streaming(prompt, chat_id, cwd=None, session=None):
+def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=None):
     """Run Gemini CLI with streaming output to Telegram. For use in omni loop.
 
     Returns (accumulated_text, new_gemini_session_id, error_bool).
-    Does NOT manage active_processes or message queues — caller handles that.
+    Registers in active_processes for /cancel support.
     """
     import io
 
+    process_key = session_id or (get_session_id(session) if session else str(chat_id))
     gemini_sid = session.get("gemini_session_id") if session else None
 
     # Inject context bridge
@@ -1769,6 +1770,9 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True
         )
+
+        # Register for /cancel support
+        active_processes[process_key] = process
 
         # Drain stderr in background
         stderr_lines = []
@@ -1909,13 +1913,14 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None):
 
         watchdog_stop.set()
         process.wait()
+        active_processes.pop(process_key, None)
 
         # Save gemini session ID for resume
         if new_session_id and session:
-            session_id = get_session_id(session)
+            sid = get_session_id(session)
             chat_key_s = str(chat_id)
             for s in user_sessions.get(chat_key_s, {}).get("sessions", []):
-                if get_session_id(s) == session_id:
+                if get_session_id(s) == sid:
                     s["gemini_session_id"] = new_session_id
                     save_sessions(force=True)
                     break
@@ -1987,6 +1992,17 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None):
             watchdog_stop.set()
         except UnboundLocalError:
             pass
+        active_processes.pop(process_key, None)
+        # Ensure subprocess is cleaned up
+        if process is not None:
+            try:
+                if process.stdout:
+                    process.stdout.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            except Exception:
+                pass
 
 
 def perform_proactive_compaction(chat_id, session, cli_name):
@@ -3192,7 +3208,8 @@ _Use /cancel to stop at any time._""")
 
                 # Try Gemini first
                 exec_response, gemini_sid, gemini_error = run_gemini_streaming(
-                    exec_prompt, chat_id, cwd=cwd, session=session
+                    exec_prompt, chat_id, cwd=cwd, session=session,
+                    session_id=session_id
                 )
                 session = get_session_by_id(chat_id, session_id) or session
 
