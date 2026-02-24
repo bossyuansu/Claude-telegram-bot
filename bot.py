@@ -1695,20 +1695,20 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300):
 def run_gemini(prompt, cwd=None, session=None):
     """Run Gemini synchronously and return the output text."""
     gemini_sid = session.get("gemini_session_id") if session else None
-    
+
     cmd = ["gemini", "--prompt", prompt, "--output-format", "stream-json", "--yolo"]
     if gemini_sid:
         cmd.extend(["--resume", gemini_sid])
     if GEMINI_MODEL:
         cmd.extend(["-m", GEMINI_MODEL])
-        
+
     try:
         process = subprocess.Popen(
             cmd, cwd=cwd or os.getcwd(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         stdout, _ = process.communicate(timeout=180)
-        
+
         accumulated = []
         for line in stdout.strip().split("\n"):
             if not line: continue
@@ -1718,11 +1718,275 @@ def run_gemini(prompt, cwd=None, session=None):
                     accumulated.append(event.get("content", ""))
             except json.JSONDecodeError:
                 pass
-        
+
         return "".join(accumulated).strip()
     except Exception as e:
         print(f"run_gemini error: {e}")
         return ""
+
+
+def run_gemini_streaming(prompt, chat_id, cwd=None, session=None):
+    """Run Gemini CLI with streaming output to Telegram. For use in omni loop.
+
+    Returns (accumulated_text, new_gemini_session_id, error_bool).
+    Does NOT manage active_processes or message queues — caller handles that.
+    """
+    import io
+
+    gemini_sid = session.get("gemini_session_id") if session else None
+
+    # Inject context bridge
+    if session:
+        bridge = get_context_bridge(session, "Gemini")
+        if bridge:
+            prompt = bridge + "[NEW REQUEST]\n" + prompt
+            print(f"[Gemini-stream] Context bridge injected ({len(bridge)} chars)", flush=True)
+
+    if session:
+        update_session_state(chat_id, session, prompt, "Gemini")
+
+    cmd = ["gemini", "--prompt", prompt, "--output-format", "stream-json", "--yolo"]
+    if gemini_sid:
+        cmd.extend(["--resume", gemini_sid])
+    if GEMINI_MODEL:
+        cmd.extend(["-m", GEMINI_MODEL])
+
+    accumulated_text = ""
+    current_chunk_text = ""
+    new_session_id = None
+    message_id = None
+    message_ids = []
+    file_changes = []
+    processed_tool_ids = set()
+    max_chunk_len = 3500
+    update_interval = 1.0
+    stale_timeout = 300
+    process = None
+
+    try:
+        process = subprocess.Popen(
+            cmd, cwd=cwd or os.getcwd(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True
+        )
+
+        # Drain stderr in background
+        stderr_lines = []
+        def _drain_stderr():
+            try:
+                for raw_line in process.stderr:
+                    line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+                    if line:
+                        stderr_lines.append(line[:500])
+                        print(f"[Gemini-stream stderr] {line[:300]}", flush=True)
+            except Exception:
+                pass
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        # Watchdog: kill if no output for stale_timeout
+        last_output_time = time.time()
+        watchdog_stop = threading.Event()
+        def _watchdog():
+            while not watchdog_stop.is_set():
+                watchdog_stop.wait(30)
+                if watchdog_stop.is_set():
+                    break
+                elapsed = time.time() - last_output_time
+                if elapsed > stale_timeout:
+                    print(f"[Gemini-stream] Watchdog: no output for {elapsed:.0f}s, killing", flush=True)
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                        time.sleep(5)
+                        if process.poll() is None:
+                            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    break
+        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+        watchdog_thread.start()
+
+        message_id = send_message(chat_id, "⏳ _Gemini working..._")
+        message_ids.append(message_id)
+        last_update = 0
+        current_tool = None
+        gemini_errors = []
+
+        stdout_reader = io.TextIOWrapper(process.stdout, encoding='utf-8', errors='replace')
+
+        for line in stdout_reader:
+            line = line.strip()
+            if not line:
+                continue
+
+            last_output_time = time.time()
+            line_len = len(line)
+            try:
+                event = json.loads(line)
+                etype = event.get("type", "")
+
+                if etype == "init":
+                    new_session_id = event.get("session_id")
+
+                elif etype == "message":
+                    role = event.get("role")
+                    if role == "assistant":
+                        content = event.get("content", "")
+                        if not isinstance(content, str):
+                            content = str(content) if content is not None else ""
+                        is_delta = bool(event.get("delta"))
+                        append_text = content
+                        if content and not is_delta:
+                            if content.startswith(accumulated_text):
+                                append_text = content[len(accumulated_text):]
+                            elif accumulated_text.startswith(content):
+                                append_text = ""
+                        if append_text:
+                            spacing = ""
+                            if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
+                                if accumulated_text.endswith(('.', '!', '?', ':')):
+                                    spacing = "\n\n"
+                                elif not accumulated_text.endswith(' '):
+                                    spacing = " "
+                            accumulated_text += spacing + append_text
+                            current_chunk_text += spacing + append_text
+                            current_tool = None
+
+                elif etype == "tool_use":
+                    tool_id = event.get("tool_id")
+                    if tool_id and tool_id in processed_tool_ids:
+                        continue
+                    if tool_id:
+                        processed_tool_ids.add(tool_id)
+                    tool_name = event.get("tool_name") or "tool"
+                    params = event.get("parameters", {})
+                    path = params.get("file_path") or params.get("command") or params.get("pattern") or params.get("dir_path") or ""
+                    file_changes.append({"type": tool_name.lower(), "path": path[:100]})
+                    current_tool = tool_name
+                    now = time.time()
+                    if now - last_update >= update_interval:
+                        display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
+                        status = f"\n\n———\n🔧 _{tool_name}_"
+                        edit_message(chat_id, message_id, display_text + status)
+                        last_update = now
+
+                elif etype == "tool_result":
+                    current_tool = None
+
+                elif etype == "result":
+                    stats = event.get("stats", {})
+                    print(f"[Gemini-stream] result: status={event.get('status')}, tokens={stats.get('total_tokens')}, tool_calls={stats.get('tool_calls')}", flush=True)
+
+                elif etype == "error":
+                    error_msg = event.get("message") or event.get("error") or str(event)
+                    gemini_errors.append(error_msg[:300])
+                    print(f"[Gemini-stream] Error event: {error_msg[:300]}", flush=True)
+
+                # Chunk overflow
+                while len(current_chunk_text) > max_chunk_len:
+                    send_part = current_chunk_text[:max_chunk_len]
+                    carry_over = current_chunk_text[max_chunk_len:]
+                    edit_message(chat_id, message_id, send_part.strip() + "\n\n———\n_continued..._", force=True)
+                    message_id = send_message(chat_id, "⏳ _continuing..._")
+                    message_ids.append(message_id)
+                    current_chunk_text = carry_over
+                    last_update = time.time()
+
+                # Periodic update
+                now = time.time()
+                if now - last_update >= update_interval and current_chunk_text.strip():
+                    suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else "\n\n———\n⏳ _generating..._"
+                    edit_message(chat_id, message_id, current_chunk_text + suffix)
+                    last_update = now
+
+                if line_len > 50_000:
+                    event = None
+                    line = None
+                    _malloc_trim()
+
+            except json.JSONDecodeError:
+                pass
+
+        watchdog_stop.set()
+        process.wait()
+
+        # Save gemini session ID for resume
+        if new_session_id and session:
+            session_id = get_session_id(session)
+            chat_key_s = str(chat_id)
+            for s in user_sessions.get(chat_key_s, {}).get("sessions", []):
+                if get_session_id(s) == session_id:
+                    s["gemini_session_id"] = new_session_id
+                    save_sessions(force=True)
+                    break
+
+        # Final message update
+        final_chunk = current_chunk_text.strip()
+        if not final_chunk and accumulated_text.strip():
+            final_chunk = accumulated_text.strip()[-max_chunk_len:]
+
+        timed_out = (time.time() - last_output_time) > stale_timeout - 10
+
+        if file_changes:
+            final_chunk += "\n\n📁 *File Operations:*"
+            for change in file_changes:
+                ctype = change["type"]
+                path = change["path"]
+                if ctype in ["write", "write_file"]:
+                    final_chunk += f"\n  ✅ Created: `{shorten_path(path)}`"
+                elif ctype in ["edit", "replace"]:
+                    final_chunk += f"\n  ✅ Edited: `{shorten_path(path)}`"
+                elif ctype in ["bash", "run_shell_command"]:
+                    final_chunk += f"\n  ✅ Ran: `{path[:80]}{'...' if len(path) > 80 else ''}`"
+                elif ctype in ["read", "read_file"]:
+                    final_chunk += f"\n  📖 Read: `{shorten_path(path)}`"
+                elif ctype in ["glob", "grep", "grep_search"]:
+                    final_chunk += f"\n  🔍 Search: `{path[:60]}{'...' if len(path) > 60 else ''}`"
+                else:
+                    final_chunk += f"\n  🔧 {ctype}: `{shorten_path(path)}`"
+
+        error_occurred = False
+        if timed_out:
+            final_chunk += "\n\n———\n⏱️ _timed out (no output for 5 min)_"
+            error_occurred = True
+        elif process.returncode and process.returncode != 0:
+            stderr_hint = f": {stderr_lines[-1][:150]}" if stderr_lines else ""
+            final_chunk += f"\n\n———\n⚠️ _exited with code {process.returncode}{stderr_hint}_"
+            error_occurred = True
+        elif not accumulated_text.strip() and stderr_lines:
+            final_chunk += f"\n\n———\n❌ _Gemini produced no output:_ {stderr_lines[-1][:200]}"
+            error_occurred = True
+        elif gemini_errors:
+            final_chunk += f"\n\n———\n⚠️ _complete with errors:_ {gemini_errors[-1][:150]}"
+        else:
+            final_chunk += "\n\n———\n✓ _complete_"
+
+        if final_chunk and len(final_chunk) <= 4000:
+            edit_message(chat_id, message_id, final_chunk, force=True)
+        elif final_chunk:
+            edit_message(chat_id, message_id, final_chunk[:3950] + "\n\n_(...truncated)_", force=True)
+
+        return accumulated_text, new_session_id, error_occurred
+
+    except FileNotFoundError:
+        if message_id:
+            edit_message(chat_id, message_id, "❌ Gemini CLI not found.", force=True)
+        else:
+            send_message(chat_id, "❌ Gemini CLI not found.")
+        return "", None, True
+    except Exception as e:
+        print(f"[Gemini-stream] Exception: {e}", flush=True)
+        error_text = accumulated_text + f"\n\n———\n❌ Gemini error: {str(e)[:200]}"
+        if message_id:
+            edit_message(chat_id, message_id, error_text[:4000], force=True)
+        else:
+            send_message(chat_id, error_text[:4000])
+        return accumulated_text, new_session_id, True
+    finally:
+        try:
+            watchdog_stop.set()
+        except UnboundLocalError:
+            pass
 
 
 def perform_proactive_compaction(chat_id, session, cli_name):
@@ -2776,7 +3040,7 @@ def _justdoit_wait(chat_key, seconds):
 
 
 def run_omni_loop(chat_id, task, session):
-    """Main autonomous execution loop for /omni: Claude (Architect) -> Claude (Execute) -> Codex (Audit)."""
+    """Main autonomous execution loop for /omni: Claude (Architect) -> Gemini (Execute, Claude fallback) -> Codex (Audit)."""
     session_id = get_session_id(session)
     chat_key = f"{chat_id}:{session_id}"
     cwd = session["cwd"]
@@ -2806,7 +3070,8 @@ def run_omni_loop(chat_id, task, session):
 
 Task: _{task[:200]}_
 
-_Claude (Architect) → Claude (Execute) → Codex (Audit)_
+_Claude (Architect) → Gemini (Execute) → Codex (Audit)_
+_Claude as fallback if Gemini fails._
 _Use /cancel to stop at any time._""")
 
         while omni_active.get(chat_key, {}).get("active"):
@@ -2816,8 +3081,8 @@ _Use /cancel to stop at any time._""")
             save_active_tasks()
 
             # Stop if we hit a runaway limit
-            if step > 20:
-                send_message(chat_id, "⚠️ *Omni limit reached* (20 steps). Stopping to prevent loop.")
+            if step > 100:
+                send_message(chat_id, "⚠️ *Omni limit reached* (100 steps). Stopping to prevent loop.")
                 break
 
             print(f"{log_prefix} === Step {step} === Phase: {phase}", flush=True)
@@ -2913,7 +3178,7 @@ _Use /cancel to stop at any time._""")
                 time.sleep(2)
                 continue
 
-            # --- Phase 2: Execute (Claude) ---
+            # --- Phase 2: Execute (Gemini, with Claude fallback) ---
             if phase == "executing":
                 # Check cancellation
                 if not omni_active.get(chat_key, {}).get("active"):
@@ -2923,38 +3188,49 @@ _Use /cancel to stop at any time._""")
                 if audit_feedback:
                     exec_prompt = f"Fix the issues identified in the recent audit:\n{audit_feedback}\n\nThen proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
 
-                send_message(chat_id, f"⚒️ *Step {step}: Executing* (Claude)\n_{exec_prompt[:150]}_")
+                send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
 
-                update_session_state(chat_id, session, original_task, "Claude")
-                exec_response, exec_questions, _, claude_sid, context_overflow = run_claude_streaming(
-                    exec_prompt, chat_id, cwd=cwd, continue_session=True,
-                    session_id=session_id, session=session
+                # Try Gemini first
+                exec_response, gemini_sid, gemini_error = run_gemini_streaming(
+                    exec_prompt, chat_id, cwd=cwd, session=session
                 )
+                session = get_session_by_id(chat_id, session_id) or session
 
-                if claude_sid:
-                    update_claude_session_id(chat_id, session, claude_sid)
-                    session = get_session_by_id(chat_id, session_id) or session
+                # Fallback to Claude if Gemini failed or returned empty
+                if gemini_error or not exec_response.strip():
+                    print(f"{log_prefix} Step {step}: Gemini {'errored' if gemini_error else 'returned empty'}, falling back to Claude", flush=True)
+                    send_message(chat_id, f"🔄 *Gemini {'failed' if gemini_error else 'returned empty'}* — falling back to Claude...")
 
-                if context_overflow:
-                    print(f"{log_prefix} Step {step}: Context overflow during execution, resetting Claude session", flush=True)
-                    send_message(chat_id, "⚠️ Context overflow — resetting Claude session...")
-                    update_claude_session_id(chat_id, session, None)
-                    reset_message_count(chat_id, session, "Claude")
-
-                if exec_questions:
-                    auto_answer = handle_justdoit_questions(exec_questions)
-                    print(f"{log_prefix} Step {step}: Auto-answering {len(exec_questions)} questions", flush=True)
-                    send_message(chat_id, f"🤖 *Auto-answering:* _{auto_answer[:100]}_")
-                    _, _, _, claude_sid2, _ = run_claude_streaming(
-                        auto_answer, chat_id, cwd=cwd, continue_session=True,
+                    update_session_state(chat_id, session, original_task, "Claude")
+                    exec_response, exec_questions, _, claude_sid, context_overflow = run_claude_streaming(
+                        exec_prompt, chat_id, cwd=cwd, continue_session=True,
                         session_id=session_id, session=session
                     )
-                    if claude_sid2:
-                        update_claude_session_id(chat_id, session, claude_sid2)
+
+                    if claude_sid:
+                        update_claude_session_id(chat_id, session, claude_sid)
                         session = get_session_by_id(chat_id, session_id) or session
 
+                    if context_overflow:
+                        print(f"{log_prefix} Step {step}: Context overflow during Claude fallback, resetting", flush=True)
+                        send_message(chat_id, "⚠️ Context overflow — resetting Claude session...")
+                        update_claude_session_id(chat_id, session, None)
+                        reset_message_count(chat_id, session, "Claude")
+
+                    if exec_questions:
+                        auto_answer = handle_justdoit_questions(exec_questions)
+                        print(f"{log_prefix} Step {step}: Auto-answering {len(exec_questions)} questions", flush=True)
+                        send_message(chat_id, f"🤖 *Auto-answering:* _{auto_answer[:100]}_")
+                        _, _, _, claude_sid2, _ = run_claude_streaming(
+                            auto_answer, chat_id, cwd=cwd, continue_session=True,
+                            session_id=session_id, session=session
+                        )
+                        if claude_sid2:
+                            update_claude_session_id(chat_id, session, claude_sid2)
+                            session = get_session_by_id(chat_id, session_id) or session
+
                 if exec_response:
-                    print(f"{log_prefix} Step {step}: Claude execute response: {exec_response[:300]}...", flush=True)
+                    print(f"{log_prefix} Step {step}: Execute response: {exec_response[:300]}...", flush=True)
 
                 phase = "auditing"
                 time.sleep(2)
