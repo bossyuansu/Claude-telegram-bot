@@ -1763,6 +1763,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
     update_interval = 1.0
     stale_timeout = 300
     process = None
+    cancelled = False
 
     try:
         process = subprocess.Popen(
@@ -1913,6 +1914,10 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
 
         watchdog_stop.set()
         process.wait()
+        # Check if explicitly cancelled via /cancel (explicit flag, no race condition)
+        cancelled = process_key in cancelled_sessions
+        if cancelled:
+            cancelled_sessions.discard(process_key)
         active_processes.pop(process_key, None)
 
         # Save gemini session ID for resume
@@ -1951,7 +1956,10 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                     final_chunk += f"\n  🔧 {ctype}: `{shorten_path(path)}`"
 
         error_occurred = False
-        if timed_out:
+        if cancelled:
+            final_chunk += "\n\n———\n⚠️ _cancelled_"
+            error_occurred = True
+        elif timed_out:
             final_chunk += "\n\n———\n⏱️ _timed out (no output for 5 min)_"
             error_occurred = True
         elif process.returncode and process.returncode != 0:
@@ -3124,6 +3132,8 @@ _Use /cancel to stop at any time._""")
                     arch_prompt, chat_id, cwd=cwd, continue_session=True,
                     session_id=session_id, session=session
                 )
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
 
                 # Persist Claude session ID
                 if claude_sid:
@@ -3146,6 +3156,8 @@ _Use /cancel to stop at any time._""")
                         auto_answer, chat_id, cwd=cwd, continue_session=True,
                         session_id=session_id, session=session
                     )
+                    if not omni_active.get(chat_key, {}).get("active"):
+                        break
                     if claude_sid2:
                         update_claude_session_id(chat_id, session, claude_sid2)
                         session = get_session_by_id(chat_id, session_id) or session
@@ -3173,8 +3185,12 @@ _Use /cancel to stop at any time._""")
                     if bridge:
                         plan_review_prompt = bridge + "[NEW TASK]\n" + plan_review_prompt
 
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
                 update_session_state(chat_id, session, original_task, "Codex")
                 plan_review = run_codex(plan_review_prompt, cwd=cwd, session=session, stale_timeout=300)
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
 
                 if plan_review:
                     print(f"{log_prefix} Step {step}: Codex plan review: {plan_review[:500]}...", flush=True)
@@ -3212,6 +3228,8 @@ _Use /cancel to stop at any time._""")
                     session_id=session_id
                 )
                 session = get_session_by_id(chat_id, session_id) or session
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
 
                 # Fallback to Claude if Gemini failed or returned empty
                 if gemini_error or not exec_response.strip():
@@ -3223,6 +3241,8 @@ _Use /cancel to stop at any time._""")
                         exec_prompt, chat_id, cwd=cwd, continue_session=True,
                         session_id=session_id, session=session
                     )
+                    if not omni_active.get(chat_key, {}).get("active"):
+                        break
 
                     if claude_sid:
                         update_claude_session_id(chat_id, session, claude_sid)
@@ -3242,6 +3262,8 @@ _Use /cancel to stop at any time._""")
                             auto_answer, chat_id, cwd=cwd, continue_session=True,
                             session_id=session_id, session=session
                         )
+                        if not omni_active.get(chat_key, {}).get("active"):
+                            break
                         if claude_sid2:
                             update_claude_session_id(chat_id, session, claude_sid2)
                             session = get_session_by_id(chat_id, session_id) or session
@@ -3286,12 +3308,18 @@ _Use /cancel to stop at any time._""")
 
                 # Run Codex with stale-output watchdog (kills only if no output for 5 min)
                 audit_result = run_codex(codex_prompt, cwd=cwd, session=session, stale_timeout=300)
+                if not omni_active.get(chat_key, {}).get("active"):
+                    break
 
                 if not audit_result:
                     print(f"{log_prefix} Step {step}: Codex returned empty result", flush=True)
                     send_message(chat_id, f"⚠️ *Step {step}:* Codex returned no output. Retrying...")
                     time.sleep(5)
+                    if not omni_active.get(chat_key, {}).get("active"):
+                        break
                     audit_result = run_codex(codex_prompt, cwd=cwd, session=session, stale_timeout=300)
+                    if not omni_active.get(chat_key, {}).get("active"):
+                        break
 
                 if audit_result:
                     print(f"{log_prefix} Step {step}: Codex audit result: {audit_result[:500]}...", flush=True)
@@ -3318,6 +3346,7 @@ _Session preserved. You can continue chatting in this session._""")
 
         # Cleanup
         omni_active[chat_key]["active"] = False
+        user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
         if not notified_exit:
             send_message(chat_id, f"🏁 *Omni process finished* for `{session.get('name', 'unknown')}`.")
@@ -3331,6 +3360,7 @@ _Session preserved. You can continue chatting in this session._""")
         except Exception:
             pass
         omni_active[chat_key]["active"] = False
+        user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
 
 
@@ -4532,7 +4562,7 @@ Send any message to chat with Claude!""")
 • `/claude [task]` - Run Claude task (session persists per project)
 • `/codex [task]` - Run Codex task (session persists per project)
 • `/gemini [task]` - Run Gemini task (session persists per project)
-  Uses `gpt-5.3-codex` (reasoning: xhigh), auto-resumes previous session
+  Uses configured Gemini model (default `gemini-3.1-pro-preview`), auto-resumes previous session
 
 *Autonomous Mode:*
 • `/justdoit [task]` - Start autonomous implementation
@@ -4886,6 +4916,20 @@ Send a message to start working!""")
         session = get_active_session(chat_id)
         if not session:
             send_message(chat_id, "No active session. Use `/new <project>` first.")
+            return True
+        session_id = get_session_id(session)
+        omni_key = f"{chat_id}:{session_id}"
+        if omni_active.get(omni_key, {}).get("active"):
+            send_message(chat_id, "⚠️ Omni is already running on this session. Use `/cancel` to stop it first.")
+            return True
+        if justdoit_active.get(omni_key, {}).get("active"):
+            send_message(chat_id, "⚠️ JustDoIt is running on this session. Use `/cancel` to stop it first.")
+            return True
+        if deepreview_active.get(omni_key, {}).get("active"):
+            send_message(chat_id, "⚠️ Deep review is running on this session. Use `/cancel` to stop it first.")
+            return True
+        if session_id in active_processes:
+            send_message(chat_id, "⚠️ Session is busy. Wait for it to finish or `/cancel` first.")
             return True
 
         task = args.strip() if args else "Review the project and identify improvements"
