@@ -63,6 +63,7 @@ _sessions_file_lock = threading.Lock()  # protects user_sessions dict and sessio
 
 omni_active = {}  # "chat_id:session_id" -> state
 cancelled_sessions = set()  # session_ids explicitly cancelled via /cancel
+user_feedback_queue = {}  # "chat_id:session_id" -> [messages] — user messages during justdoit/omni
 
 
 def save_active_tasks():
@@ -2463,7 +2464,16 @@ def _parse_reset_wait(error_msg):
 
 
 
-def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None, claude_plan=None):
+def drain_user_feedback(chat_key):
+    """Drain and format any queued user feedback for a justdoit/omni session."""
+    messages = user_feedback_queue.pop(chat_key, [])
+    if not messages:
+        return ""
+    feedback = "\n".join(f"- {m[:500]}" for m in messages[-10:])  # Last 10, truncated
+    return f"\n\n⚠️ USER FEEDBACK (sent during execution — address these):\n{feedback}"
+
+
+def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None, claude_plan=None, user_feedback=""):
     """Call Codex to review Claude's output and determine next action.
 
     Returns: (next_prompt: str or None, is_done: bool, reasoning: str)
@@ -2638,6 +2648,9 @@ RESPOND WITH ONE OF:
 
     if stale_warning:
         codex_prompt += f"\n\n⚠️ STALE PROGRESS WARNING:\n{stale_warning}"
+
+    if user_feedback:
+        codex_prompt += user_feedback
 
     print(f"[Codex] Calling Codex. Step: {step}, phase: {phase}, pending_transition: {pending_transition}", flush=True)
     print(f"[Codex] Prompt length: {len(codex_prompt)}, Claude output length: {len(claude_output)}", flush=True)
@@ -2859,6 +2872,11 @@ _Use /cancel to stop at any time._""")
                 if response:
                     print(f"{log_prefix} Step {step}: Claude architect response: {response[:300]}...", flush=True)
 
+                # Drain any user feedback sent during architecting
+                feedback = drain_user_feedback(chat_key)
+                if feedback:
+                    print(f"{log_prefix} Step {step}: Including user feedback in plan review", flush=True)
+
                 # Codex reviews the plan before execution
                 send_message(chat_id, f"📋 *Step {step}: Plan Review* (Codex)\nReviewing PLAN.md...")
                 plan_review_prompt = (
@@ -2867,6 +2885,8 @@ _Use /cancel to stop at any time._""")
                     f"If the plan is solid and ready for execution, respond with exactly 'SIGN-OFF'.\n"
                     f"Otherwise, provide specific feedback on what needs to change."
                 )
+                if feedback:
+                    plan_review_prompt += feedback
                 if session:
                     bridge = get_context_bridge(session, "Codex")
                     if bridge:
@@ -2948,6 +2968,11 @@ _Use /cancel to stop at any time._""")
 
                 send_message(chat_id, f"🕵️ *Step {step}: Auditing* (Codex)\nReviewing implementation...")
 
+                # Drain any user feedback sent during execution
+                feedback = drain_user_feedback(chat_key)
+                if feedback:
+                    print(f"{log_prefix} Step {step}: Including user feedback in audit", flush=True)
+
                 # Inject context bridge for Codex
                 codex_prompt = (
                     f"Review the recent changes and current project state against PLAN.md and the original task:\n\n"
@@ -2956,6 +2981,8 @@ _Use /cancel to stop at any time._""")
                     f"If everything looks correct and all plan items are complete, respond with exactly 'SIGN-OFF'.\n"
                     f"Otherwise, provide precise, actionable feedback on what needs fixing."
                 )
+                if feedback:
+                    codex_prompt += feedback
                 if session:
                     bridge = get_context_bridge(session, "Codex")
                     if bridge:
@@ -3258,11 +3285,16 @@ Format as a compact bullet list."""
                     )
                     print(f"{log_prefix} Step {step}: STALE PROGRESS detected — same action '{last_3_reasons[0]}' repeated {len(last_3_reasons)} times", flush=True)
 
+            # Drain any user feedback sent during execution
+            feedback = drain_user_feedback(chat_key)
+            if feedback:
+                print(f"{log_prefix} Step {step}: Including user feedback in Codex review", flush=True)
+
             print(f"{log_prefix} Step {step}: Calling Codex review. Phase: {phase}, pending_transition: {pending_transition}", flush=True)
             next_prompt, is_done, reasoning = run_codex_review(
                 task, clean_response, step, history_summary, cwd, phase=phase,
                 pending_transition=pending_transition, stale_warning=stale_warning,
-                claude_plan=claude_plan
+                claude_plan=claude_plan, user_feedback=feedback
             )
             # Clear pending_transition after it's been used
             pending_transition = None
@@ -4457,6 +4489,8 @@ Send a message to start working!""")
             if omni_active.get(jdi_key, {}).get("active"):
                 omni_active[jdi_key]["active"] = False
                 omni_was_active = True
+            # Clear any queued user feedback
+            user_feedback_queue.pop(jdi_key, None)
 
         if session:
             session_id = get_session_id(session)
@@ -5031,17 +5065,21 @@ def handle_message(chat_id, text):
     """Handle a regular message."""
     chat_key = str(chat_id)
 
-    # Block non-command input during justdoit mode on the active session
+    # Collect user feedback during justdoit/omni — queued for next audit/review step
     session = get_active_session(chat_id)
     if session:
         jdi_key = f"{chat_id}:{get_session_id(session)}"
         jdi_state = justdoit_active.get(jdi_key, {})
-        if jdi_state.get("active"):
+        omni_state = omni_active.get(jdi_key, {})
+        if jdi_state.get("active") or omni_state.get("active"):
+            mode = "JustDoIt" if jdi_state.get("active") else "Omni"
+            if jdi_key not in user_feedback_queue:
+                user_feedback_queue[jdi_key] = []
+            user_feedback_queue[jdi_key].append(text)
+            n = len(user_feedback_queue[jdi_key])
             send_message(chat_id,
-                f"🤖 *JustDoIt is running* on `{session.get('name', '?')}` "
-                f"(step {jdi_state.get('step', '?')} — {jdi_state.get('phase', 'implementing')})\n\n"
-                f"_Switch to another session with /switch, use /cancel to stop, or wait for completion._\n"
-                f"_Commands like /status and /sessions still work._")
+                f"📝 *Noted* (feedback #{n}) — will include in next {mode} review step.\n"
+                f"_Use /cancel to stop {mode}._")
             return
 
     # Check if awaiting text response for "Other" option
