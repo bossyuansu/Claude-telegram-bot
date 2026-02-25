@@ -1852,7 +1852,6 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                             elif accumulated_text.startswith(content):
                                 append_text = ""
                         if append_text:
-                            print(f"[Gemini-stream] text: +{len(append_text)} chars (total: {len(accumulated_text)}): {append_text[:80]}", flush=True)
                             spacing = ""
                             if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
                                 if accumulated_text.endswith(('.', '!', '?', ':')):
@@ -1905,9 +1904,10 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
 
                 # Periodic update
                 now = time.time()
-                if now - last_update >= update_interval and current_chunk_text.strip():
-                    suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else "\n\n———\n⏳ _generating..._"
-                    edit_message(chat_id, message_id, current_chunk_text + suffix)
+                if now - last_update >= update_interval:
+                    display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
+                    suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else ("" if not current_chunk_text.strip() else "\n\n———\n⏳ _generating..._")
+                    edit_message(chat_id, message_id, display_text + suffix)
                     last_update = now
 
                 if line_len > 50_000:
@@ -1984,9 +1984,6 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         elif process.returncode and process.returncode != 0:
             stderr_hint = f": {stderr_lines[-1][:150]}" if stderr_lines else ""
             final_chunk += f"\n\n———\n⚠️ _exited with code {process.returncode}{stderr_hint}_"
-            error_occurred = True
-        elif not accumulated_text.strip() and stderr_lines:
-            final_chunk += f"\n\n———\n❌ _Gemini produced no output:_ {stderr_lines[-1][:200]}"
             error_occurred = True
         elif gemini_errors:
             final_chunk += f"\n\n———\n⚠️ _complete with errors:_ {gemini_errors[-1][:150]}"
@@ -2551,10 +2548,11 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
                     # Stream update: periodic edit
                     now = time.time()
-                    if now - last_update >= update_interval and current_chunk_text.strip():
-                        suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else "\n\n———\n⏳ _generating..._"
+                    if now - last_update >= update_interval:
+                        display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
+                        suffix = f"\n\n———\n🔧 _{current_tool}_" if current_tool else ("" if not current_chunk_text.strip() else "\n\n———\n⏳ _generating..._")
                         print(f"[Gemini] Streaming edit: {len(current_chunk_text)} chars, msg_id={message_id}", flush=True)
-                        edit_message(chat_id, message_id, current_chunk_text + suffix)
+                        edit_message(chat_id, message_id, display_text + suffix)
                         last_update = now
 
                     # Memory management
@@ -2632,9 +2630,6 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             elif exit_code and exit_code != 0:
                 stderr_hint = f": {gemini_stderr_lines[-1][:150]}" if gemini_stderr_lines else ""
                 final_chunk += f"\n\n———\n⚠️ _exited with code {exit_code}{stderr_hint}_"
-            elif not accumulated_text.strip() and gemini_stderr_lines:
-                # No output at all + stderr = Gemini failed silently
-                final_chunk += f"\n\n———\n❌ _Gemini produced no output:_ {gemini_stderr_lines[-1][:200]}"
             elif gemini_errors:
                 final_chunk += f"\n\n———\n⚠️ _complete with errors:_ {gemini_errors[-1][:150]}"
             else:
