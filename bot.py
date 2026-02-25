@@ -1852,6 +1852,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                             elif accumulated_text.startswith(content):
                                 append_text = ""
                         if append_text:
+                            print(f"[Gemini-stream] text: +{len(append_text)} chars (total: {len(accumulated_text)}): {append_text[:80]}", flush=True)
                             spacing = ""
                             if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
                                 if accumulated_text.endswith(('.', '!', '?', ':')):
