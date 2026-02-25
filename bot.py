@@ -3120,6 +3120,7 @@ def run_omni_loop(chat_id, task, session):
     phase = "architecting"  # architecting -> executing -> auditing
     audit_feedback = ""  # Carries Codex feedback into next execute cycle
     notified_exit = False
+    preferred_executor = "gemini"  # Default; Codex can override with EXECUTOR: CLAUDE/GEMINI
 
     try:
         send_message(chat_id, f"""🚀 *Omni Task Started* on `{session.get('name', 'unknown')}`
@@ -3207,7 +3208,10 @@ _Use /cancel to stop at any time._""")
                 plan_review_prompt = (
                     f"Review PLAN.md against the original task:\n\n{original_task}\n\n"
                     f"Check that the plan is complete, feasible, well-structured, and covers testing.\n"
-                    f"If the plan is solid and ready for execution, respond with exactly 'SIGN-OFF'.\n"
+                    f"If the plan is solid and ready for execution, respond with exactly 'SIGN-OFF' on its own line.\n"
+                    f"Then on the next line, recommend the executor: 'EXECUTOR: GEMINI' or 'EXECUTOR: CLAUDE'.\n"
+                    f"Choose CLAUDE for complex multi-file refactors, subtle bug fixes, or tasks requiring deep reasoning.\n"
+                    f"Choose GEMINI for straightforward implementation, file creation, running tests, or mechanical changes.\n"
                     f"Otherwise, provide specific feedback on what needs to change."
                 )
                 if feedback:
@@ -3229,9 +3233,21 @@ _Use /cancel to stop at any time._""")
                     send_message(chat_id, f"📋 *Plan Review:*\n_{plan_review[:1000]}_")
 
                 has_signoff = any(line.strip().upper().startswith("SIGN-OFF") for line in plan_review.strip().split("\n")) if plan_review else False
+                # Parse executor recommendation from Codex (e.g. "EXECUTOR: CLAUDE")
+                if plan_review:
+                    for line in plan_review.strip().split("\n"):
+                        stripped = line.strip().upper()
+                        if stripped.startswith("EXECUTOR:"):
+                            rec = stripped.split(":", 1)[1].strip()
+                            if "CLAUDE" in rec:
+                                preferred_executor = "claude"
+                            elif "GEMINI" in rec:
+                                preferred_executor = "gemini"
+                            break
+
                 if has_signoff:
-                    print(f"{log_prefix} Step {step}: Plan approved by Codex", flush=True)
-                    send_message(chat_id, "✅ Plan approved by Codex. Proceeding to execution.")
+                    print(f"{log_prefix} Step {step}: Plan approved by Codex, executor={preferred_executor}", flush=True)
+                    send_message(chat_id, f"✅ Plan approved by Codex. Executing with *{preferred_executor.capitalize()}*.")
                     audit_feedback = ""  # Clear so execution doesn't inherit stale plan-review feedback
                     phase = "executing"
                 else:
@@ -3243,7 +3259,7 @@ _Use /cancel to stop at any time._""")
                 time.sleep(2)
                 continue
 
-            # --- Phase 2: Execute (Gemini, with Claude fallback) ---
+            # --- Phase 2: Execute (Codex picks executor, with fallback) ---
             if phase == "executing":
                 # Check cancellation
                 if not omni_active.get(chat_key, {}).get("active"):
@@ -3253,23 +3269,27 @@ _Use /cancel to stop at any time._""")
                 if audit_feedback:
                     exec_prompt = f"Fix the issues identified in the recent audit:\n{audit_feedback}\n\nThen proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
 
-                send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
+                # Use Codex's recommended executor
+                use_executor = preferred_executor
 
-                # Try Gemini first
-                exec_response, gemini_sid, gemini_error, gemini_did_work = run_gemini_streaming(
-                    exec_prompt, chat_id, cwd=cwd, session=session,
-                    session_id=session_id
-                )
-                session = get_session_by_id(chat_id, session_id) or session
-                if not omni_active.get(chat_key, {}).get("active"):
-                    break
+                if use_executor == "gemini":
+                    send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
+                    exec_response, gemini_sid, gemini_error, gemini_did_work = run_gemini_streaming(
+                        exec_prompt, chat_id, cwd=cwd, session=session,
+                        session_id=session_id
+                    )
+                    session = get_session_by_id(chat_id, session_id) or session
+                    if not omni_active.get(chat_key, {}).get("active"):
+                        break
 
-                # Fallback to Claude if Gemini actually failed — but NOT if it
-                # just produced no text while doing tool work (file edits, etc.)
-                if gemini_error or (not exec_response.strip() and not gemini_did_work):
-                    print(f"{log_prefix} Step {step}: Gemini {'errored' if gemini_error else 'returned empty'}, falling back to Claude", flush=True)
-                    send_message(chat_id, f"🔄 *Gemini {'failed' if gemini_error else 'returned empty'}* — falling back to Claude...")
+                    # Fallback to Claude if Gemini actually failed
+                    if gemini_error or (not exec_response.strip() and not gemini_did_work):
+                        print(f"{log_prefix} Step {step}: Gemini {'errored' if gemini_error else 'returned empty'}, falling back to Claude", flush=True)
+                        send_message(chat_id, f"🔄 *Gemini {'failed' if gemini_error else 'returned empty'}* — falling back to Claude...")
+                        use_executor = "claude"  # Fall through to Claude below
 
+                if use_executor == "claude":
+                    send_message(chat_id, f"⚒️ *Step {step}: Executing* (Claude)\n_{exec_prompt[:150]}_")
                     update_session_state(chat_id, session, original_task, "Claude")
                     exec_response, exec_questions, _, claude_sid, context_overflow = run_claude_streaming(
                         exec_prompt, chat_id, cwd=cwd, continue_session=True,
@@ -3283,7 +3303,7 @@ _Use /cancel to stop at any time._""")
                         session = get_session_by_id(chat_id, session_id) or session
 
                     if context_overflow:
-                        print(f"{log_prefix} Step {step}: Context overflow during Claude fallback, resetting", flush=True)
+                        print(f"{log_prefix} Step {step}: Context overflow, resetting Claude session", flush=True)
                         send_message(chat_id, "⚠️ Context overflow — resetting Claude session...")
                         update_claude_session_id(chat_id, session, None)
                         reset_message_count(chat_id, session, "Claude")
@@ -3301,6 +3321,7 @@ _Use /cancel to stop at any time._""")
                         if claude_sid2:
                             update_claude_session_id(chat_id, session, claude_sid2)
                             session = get_session_by_id(chat_id, session_id) or session
+
 
                 if exec_response:
                     print(f"{log_prefix} Step {step}: Execute response: {exec_response[:300]}...", flush=True)
@@ -3328,7 +3349,9 @@ _Use /cancel to stop at any time._""")
                     f"{original_task}\n\n"
                     f"Check for bugs, security issues, or deviations from the plan.\n"
                     f"If everything looks correct and all plan items are complete, respond with exactly 'SIGN-OFF'.\n"
-                    f"Otherwise, provide precise, actionable feedback on what needs fixing."
+                    f"Otherwise, provide precise, actionable feedback on what needs fixing.\n"
+                    f"Also recommend who should fix it: 'EXECUTOR: GEMINI' or 'EXECUTOR: CLAUDE'.\n"
+                    f"Prefer CLAUDE for issues requiring careful reasoning, complex edits, or when repeated attempts have failed."
                 )
                 if feedback:
                     codex_prompt += feedback
@@ -3373,6 +3396,17 @@ _Session preserved. You can continue chatting in this session._""")
                     break
                 else:
                     audit_feedback = audit_result[:6000] if audit_result else "Previous audit returned no feedback."
+                    # Parse executor recommendation for next cycle
+                    if audit_result:
+                        for line in audit_result.strip().split("\n"):
+                            stripped = line.strip().upper()
+                            if stripped.startswith("EXECUTOR:"):
+                                rec = stripped.split(":", 1)[1].strip()
+                                if "CLAUDE" in rec:
+                                    preferred_executor = "claude"
+                                elif "GEMINI" in rec:
+                                    preferred_executor = "gemini"
+                                break
                     # Loop back: architect incorporates feedback, then execute fixes
                     phase = "architecting"
 
