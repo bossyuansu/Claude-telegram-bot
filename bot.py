@@ -2788,7 +2788,9 @@ def drain_user_feedback(chat_key):
     if not messages:
         return ""
     feedback = "\n".join(f"- {m[:500]}" for m in messages[-10:])  # Last 10, truncated
-    return f"\n\n⚠️ USER FEEDBACK (sent during execution — address these):\n{feedback}"
+    formatted = f"\n\n⚠️ USER FEEDBACK (sent during execution — address these):\n{feedback}"
+    print(f"[Feedback] Drained {len(messages)} message(s) for {chat_key}: {feedback[:200]}", flush=True)
+    return formatted
 
 
 def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None, claude_plan=None, user_feedback=""):
