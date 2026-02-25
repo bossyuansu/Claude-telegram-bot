@@ -766,6 +766,27 @@ def shorten_path(path):
     return f".../{'/'.join(parts[-2:])}"
 
 
+def format_tool_status(tool_name, path=""):
+    """Format a tool-use status line matching Claude-level detail."""
+    name = tool_name.lower()
+    if name in ("bash", "run_shell_command", "shell", "command_execution") and path:
+        preview = path[:60] + "..." if len(path) > 60 else path
+        return f"\n\n🔧 _Running:_ `{preview}`"
+    elif name in ("write", "write_file", "create_file") and path:
+        return f"\n\n🔧 _Writing:_ `{shorten_path(path)}`"
+    elif name in ("edit", "replace", "edit_file") and path:
+        return f"\n\n🔧 _Editing:_ `{shorten_path(path)}`"
+    elif name in ("read", "read_file") and path:
+        return f"\n\n🔧 _Reading:_ `{shorten_path(path)}`"
+    elif name in ("glob", "grep", "grep_search", "find_files") and path:
+        preview = path[:50] + "..." if len(path) > 50 else path
+        return f"\n\n🔧 _Searching:_ `{preview}`"
+    elif path:
+        return f"\n\n🔧 _{tool_name}:_ `{shorten_path(path)}`"
+    else:
+        return f"\n\n🔧 _{tool_name}_"
+
+
 # Permission detection patterns (Option B: detect and prompt user)
 PERMISSION_PATTERNS = [
     "need permission",
@@ -977,11 +998,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 now = time.time()
                 if now - last_update >= update_interval:
                     display_text = current_chunk_text or ""
-                    if tool_name == "Bash" and path:
-                        cmd_preview = path[:60] + "..." if len(path) > 60 else path
-                        status = f"\n\n🔧 _Running:_ `{cmd_preview}`"
-                    else:
-                        status = f"\n\n🔧 _Running {tool_name}..._"
+                    status = format_tool_status(tool_name, path)
                     edit_message(chat_id, message_id, display_text + status)
                     last_update = now
 
@@ -1876,7 +1893,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                     now = time.time()
                     if now - last_update >= update_interval:
                         display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
-                        status = f"\n\n———\n🔧 _{tool_name}_"
+                        status = format_tool_status(tool_name, path)
                         edit_message(chat_id, message_id, display_text + status)
                         last_update = now
 
@@ -2226,11 +2243,10 @@ def run_codex_task(chat_id, task, cwd, session=None):
                                     if item_id:
                                         processed_item_ids.add(item_id)
                                 current_tool = "Bash"
-                                # Show tool activity even before text arrives.
                                 now = time.time()
                                 if now - last_update >= update_interval:
                                     display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
-                                    status = "\n\n———\n🔧 _Bash_"
+                                    status = format_tool_status("bash", cmd_str)
                                     edit_message(chat_id, message_id, display_text + status)
                                     last_update = now
                             elif etype == "item.completed":
@@ -2516,7 +2532,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                         now = time.time()
                         if now - last_update >= update_interval:
                             display_text = current_chunk_text if current_chunk_text.strip() else "⏳"
-                            status = f"\n\n———\n🔧 _{tool_name}_"
+                            status = format_tool_status(tool_name, path)
                             edit_message(chat_id, message_id, display_text + status)
                             last_update = now
 
