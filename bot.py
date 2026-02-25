@@ -1728,7 +1728,7 @@ def run_gemini(prompt, cwd=None, session=None):
 def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=None):
     """Run Gemini CLI with streaming output to Telegram. For use in omni loop.
 
-    Returns (accumulated_text, new_gemini_session_id, error_bool).
+    Returns (accumulated_text, new_gemini_session_id, error_bool, did_tool_work).
     Registers in active_processes for /cancel support.
     """
     import io
@@ -1761,7 +1761,9 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
     processed_tool_ids = set()
     max_chunk_len = 3500
     update_interval = 1.0
-    stale_timeout = 300
+    startup_timeout = 90   # Kill if zero stdout within 90s (Gemini should emit init immediately)
+    stale_timeout = 300    # Kill if no new output for 5 min after first output
+    got_any_output = False
     process = None
     cancelled = False
 
@@ -1789,17 +1791,19 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
         stderr_thread.start()
 
-        # Watchdog: kill if no output for stale_timeout
+        # Watchdog: shorter timeout if no output received yet, longer after first output
         last_output_time = time.time()
         watchdog_stop = threading.Event()
         def _watchdog():
             while not watchdog_stop.is_set():
-                watchdog_stop.wait(30)
+                watchdog_stop.wait(15)  # Check every 15s
                 if watchdog_stop.is_set():
                     break
                 elapsed = time.time() - last_output_time
-                if elapsed > stale_timeout:
-                    print(f"[Gemini-stream] Watchdog: no output for {elapsed:.0f}s, killing", flush=True)
+                timeout = stale_timeout if got_any_output else startup_timeout
+                if elapsed > timeout:
+                    label = "stale" if got_any_output else "startup"
+                    print(f"[Gemini-stream] Watchdog ({label}): no output for {elapsed:.0f}s, killing", flush=True)
                     try:
                         os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                         time.sleep(5)
@@ -1825,6 +1829,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                 continue
 
             last_output_time = time.time()
+            got_any_output = True
             line_len = len(line)
             try:
                 event = json.loads(line)
@@ -1935,7 +1940,13 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         if not final_chunk and accumulated_text.strip():
             final_chunk = accumulated_text.strip()[-max_chunk_len:]
 
-        timed_out = (time.time() - last_output_time) > stale_timeout - 10
+        elapsed_since_last = time.time() - last_output_time
+        timed_out = elapsed_since_last > (stale_timeout - 10 if got_any_output else startup_timeout - 10)
+
+        # If startup timeout with --resume, clear stale Gemini session so next attempt starts fresh
+        if timed_out and not got_any_output and gemini_sid and session:
+            print(f"[Gemini-stream] Startup timeout with --resume, clearing stale Gemini session ID", flush=True)
+            update_cli_session_id(chat_id, session, "Gemini", None)
 
         if file_changes:
             final_chunk += "\n\n📁 *File Operations:*"
@@ -1960,8 +1971,15 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
             final_chunk += "\n\n———\n⚠️ _cancelled_"
             error_occurred = True
         elif timed_out:
-            final_chunk += "\n\n———\n⏱️ _timed out (no output for 5 min)_"
-            error_occurred = True
+            if not got_any_output:
+                final_chunk += "\n\n———\n⏱️ _timed out (no output at all — Gemini may be stuck)_"
+                error_occurred = True
+            elif file_changes:
+                # Gemini did tool work then went quiet — not a real error, work was done
+                final_chunk += "\n\n———\n✓ _complete (stale timeout after tool work)_"
+            else:
+                final_chunk += "\n\n———\n⏱️ _timed out (no output for 5 min)_"
+                error_occurred = True
         elif process.returncode and process.returncode != 0:
             stderr_hint = f": {stderr_lines[-1][:150]}" if stderr_lines else ""
             final_chunk += f"\n\n———\n⚠️ _exited with code {process.returncode}{stderr_hint}_"
@@ -1979,14 +1997,14 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         elif final_chunk:
             edit_message(chat_id, message_id, final_chunk[:3950] + "\n\n_(...truncated)_", force=True)
 
-        return accumulated_text, new_session_id, error_occurred
+        return accumulated_text, new_session_id, error_occurred, bool(file_changes)
 
     except FileNotFoundError:
         if message_id:
             edit_message(chat_id, message_id, "❌ Gemini CLI not found.", force=True)
         else:
             send_message(chat_id, "❌ Gemini CLI not found.")
-        return "", None, True
+        return "", None, True, False
     except Exception as e:
         print(f"[Gemini-stream] Exception: {e}", flush=True)
         error_text = accumulated_text + f"\n\n———\n❌ Gemini error: {str(e)[:200]}"
@@ -1994,7 +2012,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
             edit_message(chat_id, message_id, error_text[:4000], force=True)
         else:
             send_message(chat_id, error_text[:4000])
-        return accumulated_text, new_session_id, True
+        return accumulated_text, new_session_id, True, bool(file_changes)
     finally:
         try:
             watchdog_stop.set()
@@ -3200,6 +3218,7 @@ _Use /cancel to stop at any time._""")
                 if has_signoff:
                     print(f"{log_prefix} Step {step}: Plan approved by Codex", flush=True)
                     send_message(chat_id, "✅ Plan approved by Codex. Proceeding to execution.")
+                    audit_feedback = ""  # Clear so execution doesn't inherit stale plan-review feedback
                     phase = "executing"
                 else:
                     # Codex rejected the plan — feed back to Claude
@@ -3223,7 +3242,7 @@ _Use /cancel to stop at any time._""")
                 send_message(chat_id, f"⚒️ *Step {step}: Executing* (Gemini)\n_{exec_prompt[:150]}_")
 
                 # Try Gemini first
-                exec_response, gemini_sid, gemini_error = run_gemini_streaming(
+                exec_response, gemini_sid, gemini_error, gemini_did_work = run_gemini_streaming(
                     exec_prompt, chat_id, cwd=cwd, session=session,
                     session_id=session_id
                 )
@@ -3231,8 +3250,9 @@ _Use /cancel to stop at any time._""")
                 if not omni_active.get(chat_key, {}).get("active"):
                     break
 
-                # Fallback to Claude if Gemini failed or returned empty
-                if gemini_error or not exec_response.strip():
+                # Fallback to Claude if Gemini actually failed — but NOT if it
+                # just produced no text while doing tool work (file edits, etc.)
+                if gemini_error or (not exec_response.strip() and not gemini_did_work):
                     print(f"{log_prefix} Step {step}: Gemini {'errored' if gemini_error else 'returned empty'}, falling back to Claude", flush=True)
                     send_message(chat_id, f"🔄 *Gemini {'failed' if gemini_error else 'returned empty'}* — falling back to Claude...")
 
