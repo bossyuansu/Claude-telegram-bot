@@ -410,9 +410,22 @@ def get_updates(offset=0):
         return []
 
 
+_api_module = None  # Set in main() after api.py is loaded
+
+
+def _ws_broadcast(chat_id, event_type, data):
+    """Broadcast to WebSocket clients. No-op if API server not loaded."""
+    if _api_module:
+        try:
+            _api_module.broadcast_ws(chat_id, event_type, data)
+        except Exception:
+            pass  # WS is independent — never affect TG delivery
+
+
 def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3):
     """Send a message back to the user. Returns message_id.
     Retries on network/timeout errors with exponential backoff.
+    Also broadcasts via WebSocket (independent channel).
     """
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
@@ -426,6 +439,7 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
         if reply_markup and i == len(chunks) - 1:
             payload["reply_markup"] = reply_markup
 
+        chunk_msg_id = None
         for attempt in range(retries):
             try:
                 resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
@@ -435,8 +449,10 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
                     payload.pop("parse_mode", None)
                     resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
                     result = resp.json()
-                if result.get("ok") and i == 0:
-                    message_id = result.get("result", {}).get("message_id")
+                if result.get("ok"):
+                    chunk_msg_id = result.get("result", {}).get("message_id")
+                    if i == 0:
+                        message_id = chunk_msg_id
                 break  # Success or non-retryable API error
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                 if attempt < retries - 1:
@@ -449,6 +465,9 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
                 print(f"Error sending message: {e}", flush=True)
                 break  # Non-network error, don't retry
 
+        # Broadcast via WebSocket (independent of TG success/failure)
+        _ws_broadcast(chat_id, "message", {"text": chunk, "message_id": chunk_msg_id})
+
     return message_id
 
 
@@ -458,7 +477,9 @@ EDIT_MIN_INTERVAL = 1.0  # Minimum seconds between edits to the same message
 
 
 def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
-    """Edit an existing message. Rate-limited to 1 edit/sec per message."""
+    """Edit an existing message. Rate-limited to 1 edit/sec per message.
+    Also broadcasts via WebSocket (independent channel, same rate-limiting).
+    """
     global _last_edit_cleanup
 
     if not message_id:
@@ -486,6 +507,9 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
     # Truncate if too long
     if len(text) > 4000:
         text = text[:3997] + "..."
+
+    # Broadcast edit via WebSocket (independent of TG, same rate-limiting)
+    _ws_broadcast(chat_id, "edit", {"message_id": message_id, "text": text})
 
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if parse_mode:
@@ -5693,7 +5717,8 @@ def main():
 
     threading.Thread(target=memory_monitor, daemon=True).start()
 
-    # Start HTTP API server on Tailscale interface
+    # Start HTTP API + WebSocket server on Tailscale interface
+    global _api_module
     try:
         import api as api_server
         api_server.init_refs(
@@ -5712,6 +5737,7 @@ def main():
         api_host = os.environ.get("API_HOST", "100.118.238.103")
         api_port = int(os.environ.get("API_PORT", "8642"))
         api_server.start(api_host, api_port)
+        _api_module = api_server  # Enable WS broadcast from send_message/edit_message
     except Exception as e:
         print(f"API server failed to start: {e}", flush=True)
         import traceback

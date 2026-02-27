@@ -2,11 +2,16 @@
 HTTP API server for Claude Telegram Bot.
 Runs alongside the Telegram polling loop in the same process,
 sharing all in-memory state. Listens on the Tailscale IP.
+
+WebSocket endpoint at /ws/{chat_id} streams all bot messages in real time.
 """
+import asyncio
+import json
 import os
 import threading
+import time
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel
 from typing import Optional
 
@@ -26,6 +31,11 @@ _omni_active = None
 _deepreview_active = None
 
 API_SECRET = ""
+
+# --- WebSocket client registry ---
+# chat_id (str) -> set of WebSocket connections
+_ws_clients: dict[str, set[WebSocket]] = {}
+_ws_lock = threading.Lock()
 
 
 def init_refs(**kwargs):
@@ -69,6 +79,35 @@ class CallbackRequest(BaseModel):
     chat_id: int
     data: str
     message_id: int
+
+
+# --- WebSocket broadcast (called from bot.py threads) ---
+
+def broadcast_ws(chat_id, event_type, data):
+    """Send a message to all WebSocket clients subscribed to this chat_id.
+    Called from bot.py's send_message/edit_message (sync threads).
+    Failures on individual clients are silently ignored — WS and TG are independent.
+    """
+    key = str(chat_id)
+    with _ws_lock:
+        clients = list(_ws_clients.get(key, set()))
+    if not clients:
+        return
+
+    payload = json.dumps({"type": event_type, "chat_id": int(chat_id), **data})
+
+    for ws in clients:
+        try:
+            # Send from sync context into the async WS — use the event loop
+            loop = _ws_event_loop
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+        except Exception:
+            pass  # Independent channel — don't let WS errors affect bot
+
+
+# Captured reference to uvicorn's event loop (set in start())
+_ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 # --- Routes ---
@@ -169,18 +208,83 @@ def health():
     return {
         "status": "ok",
         "active_processes": len(_active_processes),
+        "ws_clients": sum(len(v) for v in _ws_clients.values()),
         "threads": threading.active_count(),
     }
 
 
+# --- WebSocket endpoint ---
+
+@app.websocket("/ws/{chat_id}")
+async def ws_endpoint(websocket: WebSocket, chat_id: int, token: str = Query(default="")):
+    """WebSocket stream for a chat_id. Receives all bot messages in real time.
+    Connect: ws://host:port/ws/{chat_id}?token=YOUR_SECRET
+    """
+    # Auth check
+    if API_SECRET and token != API_SECRET:
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
+    if not _is_allowed(chat_id):
+        await websocket.close(code=4003, reason="Chat ID not allowed")
+        return
+
+    await websocket.accept()
+    key = str(chat_id)
+
+    # Register
+    with _ws_lock:
+        if key not in _ws_clients:
+            _ws_clients[key] = set()
+        _ws_clients[key].add(websocket)
+    print(f"[WS] Client connected for chat_id={chat_id}", flush=True)
+
+    try:
+        # Keep alive — read incoming messages (allows client to send commands too)
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                text = msg.get("text", "").strip()
+                if text:
+                    print(f"[WS] message from {chat_id}: {text[:80]}...", flush=True)
+                    if text.startswith("/"):
+                        _handle_command(chat_id, text)
+                    else:
+                        _handle_message(chat_id, text)
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid JSON"}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS] Error for chat_id={chat_id}: {e}", flush=True)
+    finally:
+        with _ws_lock:
+            clients = _ws_clients.get(key, set())
+            clients.discard(websocket)
+            if not clients:
+                _ws_clients.pop(key, None)
+        print(f"[WS] Client disconnected for chat_id={chat_id}", flush=True)
+
+
 def start(host: str, port: int):
     """Start the API server in a background daemon thread."""
+    global _ws_event_loop
     import uvicorn
 
     def _run():
-        uvicorn.run(app, host=host, port=port, log_level="warning")
+        global _ws_event_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _ws_event_loop = loop
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning", loop="asyncio")
+        server = uvicorn.Server(config)
+        loop.run_until_complete(server.serve())
 
     t = threading.Thread(target=_run, daemon=True, name="api-server")
     t.start()
+    # Give uvicorn a moment to create the event loop
+    time.sleep(0.5)
     print(f"API server listening on http://{host}:{port}", flush=True)
-    print(f"API docs: http://{host}:{port}/docs", flush=True)
+    print(f"  WebSocket: ws://{host}:{port}/ws/{{chat_id}}", flush=True)
+    print(f"  API docs:  http://{host}:{port}/docs", flush=True)
