@@ -410,8 +410,10 @@ def get_updates(offset=0):
         return []
 
 
-def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
-    """Send a message back to the user. Returns message_id."""
+def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3):
+    """Send a message back to the user. Returns message_id.
+    Retries on network/timeout errors with exponential backoff.
+    """
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
     message_id = None
@@ -424,18 +426,28 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
         if reply_markup and i == len(chunks) - 1:
             payload["reply_markup"] = reply_markup
 
-        try:
-            resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
-            result = resp.json()
-            if not result.get("ok") and parse_mode:
-                # Retry without markdown
-                payload.pop("parse_mode", None)
+        for attempt in range(retries):
+            try:
                 resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
                 result = resp.json()
-            if result.get("ok") and i == 0:
-                message_id = result.get("result", {}).get("message_id")
-        except Exception as e:
-            print(f"Error sending message: {e}")
+                if not result.get("ok") and parse_mode:
+                    # Retry without markdown
+                    payload.pop("parse_mode", None)
+                    resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
+                    result = resp.json()
+                if result.get("ok") and i == 0:
+                    message_id = result.get("result", {}).get("message_id")
+                break  # Success or non-retryable API error
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    print(f"send_message retry {attempt+1}/{retries} after {wait}s: {e}", flush=True)
+                    time.sleep(wait)
+                else:
+                    print(f"send_message failed after {retries} attempts: {e}", flush=True)
+            except Exception as e:
+                print(f"Error sending message: {e}", flush=True)
+                break  # Non-network error, don't retry
 
     return message_id
 
