@@ -5693,6 +5693,30 @@ def main():
 
     threading.Thread(target=memory_monitor, daemon=True).start()
 
+    # Start HTTP API server on Tailscale interface
+    try:
+        import api as api_server
+        api_server.init_refs(
+            handle_command=handle_command,
+            handle_message=handle_message,
+            handle_callback_query=handle_callback_query,
+            is_allowed=is_allowed,
+            get_active_session=get_active_session,
+            get_session_id=get_session_id,
+            user_sessions=user_sessions,
+            active_processes=active_processes,
+            justdoit_active=justdoit_active,
+            omni_active=omni_active,
+            deepreview_active=deepreview_active,
+        )
+        api_host = os.environ.get("API_HOST", "100.118.238.103")
+        api_port = int(os.environ.get("API_PORT", "8642"))
+        api_server.start(api_host, api_port)
+    except Exception as e:
+        print(f"API server failed to start: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+
     while True:
         updates = get_updates(last_update_id + 1)
 
