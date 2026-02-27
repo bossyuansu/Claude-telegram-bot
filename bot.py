@@ -466,7 +466,9 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
                 break  # Non-network error, don't retry
 
         # Broadcast via WebSocket (independent of TG success/failure)
-        _ws_broadcast(chat_id, "message", {"text": chunk, "message_id": chunk_msg_id})
+        _session = get_active_session(chat_id)
+        _sess_name = _session.get("name", "") if _session else ""
+        _ws_broadcast(chat_id, "message", {"text": chunk, "message_id": chunk_msg_id, "session": _sess_name})
 
     return message_id
 
@@ -509,7 +511,9 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
         text = text[:3997] + "..."
 
     # Broadcast edit via WebSocket (independent of TG, same rate-limiting)
-    _ws_broadcast(chat_id, "edit", {"message_id": message_id, "text": text})
+    _session = get_active_session(chat_id)
+    _sess_name = _session.get("name", "") if _session else ""
+    _ws_broadcast(chat_id, "edit", {"message_id": message_id, "text": text, "session": _sess_name})
 
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if parse_mode:

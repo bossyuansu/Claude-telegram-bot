@@ -16,7 +16,7 @@ __pycache__/
 *.so
 
 # Runtime data (sessions, uploads, conversation state)
-data/
+/data/
 
 # Telegram session files (contains auth tokens)
 *.session
