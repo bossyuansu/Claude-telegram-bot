@@ -5018,6 +5018,18 @@ Send a message to start working!""")
             return True
 
         task = args.strip() if args else "Review the code and identify any issues, bugs, or improvements"
+        sid = get_session_id(session)
+        lock = get_session_lock(sid)
+        with lock:
+            if sid in active_processes:
+                if sid not in message_queue:
+                    message_queue[sid] = []
+                message_queue[sid].append(task)
+                queue_pos = len(message_queue[sid])
+                send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
+                return True
+            active_processes[sid] = None
+        session["last_cli"] = "Claude"
         run_claude_in_thread(chat_id, task, session=session)
         return True
 
@@ -5028,6 +5040,18 @@ Send a message to start working!""")
             return True
 
         task = args.strip() if args else "Review the code and identify any issues, bugs, or improvements"
+        sid = get_session_id(session)
+        lock = get_session_lock(sid)
+        with lock:
+            if sid in active_processes:
+                if sid not in message_queue:
+                    message_queue[sid] = []
+                message_queue[sid].append(task)
+                queue_pos = len(message_queue[sid])
+                send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
+                return True
+            active_processes[sid] = None
+        session["last_cli"] = "Codex"
         run_codex_task(chat_id, task, session["cwd"], session=session)
         return True
 
@@ -5038,6 +5062,18 @@ Send a message to start working!""")
             return True
 
         task = args.strip() if args else "Review the code and identify any issues, bugs, or improvements"
+        sid = get_session_id(session)
+        lock = get_session_lock(sid)
+        with lock:
+            if sid in active_processes:
+                if sid not in message_queue:
+                    message_queue[sid] = []
+                message_queue[sid].append(task)
+                queue_pos = len(message_queue[sid])
+                send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
+                return True
+            active_processes[sid] = None
+        session["last_cli"] = "Gemini"
         run_gemini_task(chat_id, task, session["cwd"], session=session)
         return True
 
