@@ -3,7 +3,7 @@ HTTP API server for Claude Telegram Bot.
 Runs alongside the Telegram polling loop in the same process,
 sharing all in-memory state. Listens on the Tailscale IP.
 
-WebSocket endpoint at /ws/{chat_id} streams all bot messages in real time.
+WebSocket endpoint at /ws streams all bot messages in real time.
 """
 import asyncio
 import json
@@ -29,13 +29,20 @@ _active_processes = None
 _justdoit_active = None
 _omni_active = None
 _deepreview_active = None
+_send_message = None
+_send_message_no_ws = None
 
 API_SECRET = ""
+_default_chat_id = None
 
 # --- WebSocket client registry ---
-# chat_id (str) -> set of WebSocket connections
-_ws_clients: dict[str, set[WebSocket]] = {}
+_ws_clients: set[WebSocket] = set()
 _ws_lock = threading.Lock()
+
+# --- WS message buffer with sequence numbers ---
+_ws_seq = 0  # Monotonic sequence counter
+_ws_buffer: list[tuple[int, str]] = []  # (seq, JSON payload)
+_WS_BUFFER_MAX = 500
 
 
 def init_refs(**kwargs):
@@ -44,7 +51,8 @@ def init_refs(**kwargs):
     global _is_allowed, _get_active_session, _get_session_id
     global _user_sessions, _active_processes
     global _justdoit_active, _omni_active, _deepreview_active
-    global API_SECRET
+    global _send_message, _send_message_no_ws
+    global API_SECRET, _default_chat_id
 
     _handle_command = kwargs["handle_command"]
     _handle_message = kwargs["handle_message"]
@@ -57,7 +65,10 @@ def init_refs(**kwargs):
     _justdoit_active = kwargs["justdoit_active"]
     _omni_active = kwargs["omni_active"]
     _deepreview_active = kwargs["deepreview_active"]
+    _send_message = kwargs.get("send_message")
+    _send_message_no_ws = kwargs.get("send_message_no_ws")
     API_SECRET = os.environ.get("API_SECRET", "")
+    _default_chat_id = kwargs.get("default_chat_id")
 
 
 # --- Auth ---
@@ -72,11 +83,11 @@ def verify_auth(authorization: str = Header(None)):
 # --- Models ---
 
 class MessageRequest(BaseModel):
-    chat_id: int
+    chat_id: Optional[int] = None
     text: str
 
 class CallbackRequest(BaseModel):
-    chat_id: int
+    chat_id: Optional[int] = None
     data: str
     message_id: int
 
@@ -84,26 +95,36 @@ class CallbackRequest(BaseModel):
 # --- WebSocket broadcast (called from bot.py threads) ---
 
 def broadcast_ws(chat_id, event_type, data):
-    """Send a message to all WebSocket clients subscribed to this chat_id.
-    Called from bot.py's send_message/edit_message (sync threads).
-    Failures on individual clients are silently ignored — WS and TG are independent.
+    """Send a message to all connected WebSocket clients.
+    Every broadcast gets a monotonic seq number for ordering guarantees.
+    If no clients are connected, buffer for delivery on reconnect.
     """
-    key = str(chat_id)
+    global _ws_seq
+
     with _ws_lock:
-        clients = list(_ws_clients.get(key, set()))
+        _ws_seq += 1
+        seq = _ws_seq
+        payload = json.dumps({"seq": seq, "type": event_type, "chat_id": int(chat_id), **data})
+
+        # Always buffer (for replay on reconnect)
+        _ws_buffer.append((seq, payload))
+        if len(_ws_buffer) > _WS_BUFFER_MAX:
+            _ws_buffer.pop(0)
+
+        clients = list(_ws_clients)
+
     if not clients:
+        print(f"[WS] No clients — buffered seq={seq} ({len(_ws_buffer)} queued)", flush=True)
         return
 
-    payload = json.dumps({"type": event_type, "chat_id": int(chat_id), **data})
-
+    print(f"[WS] Broadcasting {event_type} seq={seq} to {len(clients)} client(s)", flush=True)
     for ws in clients:
         try:
-            # Send from sync context into the async WS — use the event loop
             loop = _ws_event_loop
             if loop and loop.is_running():
                 asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
         except Exception:
-            pass  # Independent channel — don't let WS errors affect bot
+            pass
 
 
 # Captured reference to uvicorn's event loop (set in start())
@@ -119,31 +140,45 @@ def post_message(req: MessageRequest, _=Depends(verify_auth)):
     if not text:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    if not _is_allowed(req.chat_id):
+    chat_id = req.chat_id or _default_chat_id
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="No chat_id provided and no default configured")
+    if not _is_allowed(chat_id):
         raise HTTPException(status_code=403, detail="Chat ID not allowed")
 
-    print(f"[API] message from {req.chat_id}: {text[:80]}...", flush=True)
+    print(f"[API] message from {chat_id}: {text[:80]}...", flush=True)
+
+    # Echo user message to TG chat so it appears in the conversation
+    # Skip echo for slash commands — the command handler sends its own response
+    # Use _send_message_no_ws to avoid WS echo back to the app (app already shows it locally)
+    if not text.startswith("/"):
+        echo_fn = _send_message_no_ws or _send_message
+        if echo_fn:
+            echo_fn(chat_id, f"\U0001F4F1 {text}", parse_mode=None)
 
     if text.startswith("/"):
-        handled = _handle_command(req.chat_id, text)
+        handled = _handle_command(chat_id, text)
         if not handled:
             raise HTTPException(status_code=400, detail=f"Unknown command: {text.split()[0]}")
         return {"ok": True, "type": "command", "command": text.split()[0]}
     else:
-        _handle_message(req.chat_id, text)
+        _handle_message(chat_id, text)
         return {"ok": True, "type": "message"}
 
 
 @app.post("/api/callback")
 def post_callback(req: CallbackRequest, _=Depends(verify_auth)):
     """Simulate a button press (callback query)."""
-    if not _is_allowed(req.chat_id):
+    chat_id = req.chat_id or _default_chat_id
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="No chat_id provided and no default configured")
+    if not _is_allowed(chat_id):
         raise HTTPException(status_code=403, detail="Chat ID not allowed")
 
     fake_query = {
         "id": "api_0",
         "message": {
-            "chat": {"id": req.chat_id},
+            "chat": {"id": chat_id},
             "message_id": req.message_id,
         },
         "data": req.data,
@@ -177,9 +212,10 @@ def get_status(chat_id: int, _=Depends(verify_auth)):
 
 
 @app.get("/api/sessions/{chat_id}")
-def get_sessions(chat_id: int, _=Depends(verify_auth)):
+def get_sessions(chat_id: int = 0, _=Depends(verify_auth)):
     """List all sessions for a chat ID."""
-    if not _is_allowed(chat_id):
+    chat_id = chat_id or _default_chat_id
+    if not chat_id or not _is_allowed(chat_id):
         raise HTTPException(status_code=403, detail="Chat ID not allowed")
 
     user_data = _user_sessions.get(str(chat_id), {})
@@ -208,63 +244,86 @@ def health():
     return {
         "status": "ok",
         "active_processes": len(_active_processes),
-        "ws_clients": sum(len(v) for v in _ws_clients.values()),
+        "ws_clients": len(_ws_clients),
         "threads": threading.active_count(),
     }
 
 
 # --- WebSocket endpoint ---
 
-@app.websocket("/ws/{chat_id}")
-async def ws_endpoint(websocket: WebSocket, chat_id: int, token: str = Query(default="")):
-    """WebSocket stream for a chat_id. Receives all bot messages in real time.
-    Connect: ws://host:port/ws/{chat_id}?token=YOUR_SECRET
+@app.websocket("/ws")
+async def ws_endpoint(
+    websocket: WebSocket,
+    token: str = Query(default=""),
+    last_seq: int = Query(default=0),
+):
+    """WebSocket stream for all bot messages in real time.
+    Connect: ws://host:port/ws?token=YOUR_SECRET&last_seq=N
+    Messages after last_seq are replayed on connect.
     """
     # Auth check
     if API_SECRET and token != API_SECRET:
         await websocket.close(code=4001, reason="Unauthorized")
         return
 
-    if not _is_allowed(chat_id):
-        await websocket.close(code=4003, reason="Chat ID not allowed")
-        return
-
     await websocket.accept()
-    key = str(chat_id)
 
-    # Register
+    # Register and find messages to replay
     with _ws_lock:
-        if key not in _ws_clients:
-            _ws_clients[key] = set()
-        _ws_clients[key].add(websocket)
-    print(f"[WS] Client connected for chat_id={chat_id}", flush=True)
+        _ws_clients.add(websocket)
+        if last_seq > 0:
+            # Replay everything after last_seq from the buffer
+            replay = [(s, p) for s, p in _ws_buffer if s > last_seq]
+        else:
+            # No last_seq — flush entire buffer (legacy behavior)
+            replay = list(_ws_buffer)
+    print(f"[WS] Client connected (last_seq={last_seq}, replaying {len(replay)})", flush=True)
+
+    # Replay missed messages
+    for _, payload in replay:
+        try:
+            await websocket.send_text(payload)
+        except Exception:
+            break
 
     try:
-        # Keep alive — read incoming messages (allows client to send commands too)
         while True:
-            data = await websocket.receive_text()
-            try:
-                msg = json.loads(data)
-                text = msg.get("text", "").strip()
-                if text:
-                    print(f"[WS] message from {chat_id}: {text[:80]}...", flush=True)
-                    if text.startswith("/"):
-                        _handle_command(chat_id, text)
-                    else:
-                        _handle_message(chat_id, text)
-            except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid JSON"}))
+            # Use receive() to handle all frame types (text, bytes, ping, pong, close)
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            if msg["type"] == "websocket.receive":
+                data = msg.get("text", "")
+                if data:
+                    try:
+                        parsed = json.loads(data)
+                        msg_type = parsed.get("type", "")
+
+                        # Handle resend request: client detected a seq gap
+                        if msg_type == "resend":
+                            from_seq = parsed.get("from_seq", 0)
+                            with _ws_lock:
+                                resend = [(s, p) for s, p in _ws_buffer if s >= from_seq]
+                            print(f"[WS] Resend request from_seq={from_seq}, sending {len(resend)} messages", flush=True)
+                            for _, payload in resend:
+                                try:
+                                    await websocket.send_text(payload)
+                                except Exception:
+                                    break
+                        else:
+                            text = parsed.get("text", "").strip()
+                            if text:
+                                print(f"[WS] incoming: {text[:80]}...", flush=True)
+                    except json.JSONDecodeError:
+                        await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid JSON"}))
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"[WS] Error for chat_id={chat_id}: {e}", flush=True)
+        print(f"[WS] Error: {e}", flush=True)
     finally:
         with _ws_lock:
-            clients = _ws_clients.get(key, set())
-            clients.discard(websocket)
-            if not clients:
-                _ws_clients.pop(key, None)
-        print(f"[WS] Client disconnected for chat_id={chat_id}", flush=True)
+            _ws_clients.discard(websocket)
+        print("[WS] Client disconnected", flush=True)
 
 
 def start(host: str, port: int):
@@ -286,5 +345,5 @@ def start(host: str, port: int):
     # Give uvicorn a moment to create the event loop
     time.sleep(0.5)
     print(f"API server listening on http://{host}:{port}", flush=True)
-    print(f"  WebSocket: ws://{host}:{port}/ws/{{chat_id}}", flush=True)
+    print(f"  WebSocket: ws://{host}:{port}/ws", flush=True)
     print(f"  API docs:  http://{host}:{port}/docs", flush=True)

@@ -31,6 +31,17 @@ __pycache__/
 *.swp
 *.swo
 
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+
+# Backup files
+*.bak*
+
 # OS
 .DS_Store
 Thumbs.db

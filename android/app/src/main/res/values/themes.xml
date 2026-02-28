@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.ClaudeBotApp" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.ClaudeBotApp" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF0F0F14</item>
+        <item name="android:statusBarColor">#FF13131C</item>
+        <item name="android:navigationBarColor">#FF161622</item>
+    </style>
 </resources>

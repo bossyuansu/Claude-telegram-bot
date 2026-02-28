@@ -16,19 +16,15 @@ class SettingsRepository(context: Context) {
         get() = prefs.getInt("port", 8642)
         set(value) = prefs.edit().putInt("port", value).apply()
 
-    var chatId: String
-        get() = prefs.getString("chat_id", "") ?: ""
-        set(value) = prefs.edit().putString("chat_id", value).apply()
-
     var token: String
         get() = prefs.getString("token", "") ?: ""
         set(value) = prefs.edit().putString("token", value).apply()
 
     val isConfigured: Boolean
-        get() = host.isNotBlank() && chatId.isNotBlank()
+        get() = host.isNotBlank()
 
     fun wsUrl(): String {
-        val base = "ws://$host:$port/ws/$chatId"
+        val base = "ws://$host:$port/ws"
         return if (token.isNotBlank()) "$base?token=$token" else base
     }
 }

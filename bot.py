@@ -422,6 +422,16 @@ def _ws_broadcast(chat_id, event_type, data):
             pass  # WS is independent — never affect TG delivery
 
 
+def _ws_broadcast_status(chat_id, mode, phase, step, active=True):
+    """Broadcast task status update to WS clients."""
+    _ws_broadcast(chat_id, "status", {
+        "mode": mode,
+        "phase": phase,
+        "step": step,
+        "active": active,
+    })
+
+
 def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3):
     """Send a message back to the user. Returns message_id.
     Retries on network/timeout errors with exponential backoff.
@@ -468,9 +478,32 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
         # Broadcast via WebSocket (independent of TG success/failure)
         _session = get_active_session(chat_id)
         _sess_name = _session.get("name", "") if _session else ""
-        _ws_broadcast(chat_id, "message", {"text": chunk, "message_id": chunk_msg_id, "session": _sess_name})
+        ws_data = {"text": chunk, "message_id": chunk_msg_id, "session": _sess_name}
+        # Include inline keyboard buttons in WS payload (last chunk only)
+        if reply_markup and i == len(chunks) - 1:
+            ws_data["reply_markup"] = reply_markup
+        _ws_broadcast(chat_id, "message", ws_data)
 
     return message_id
+
+
+def send_message_no_ws(chat_id, text, reply_markup=None, parse_mode="Markdown"):
+    """Send a message to TG only, without broadcasting via WebSocket.
+    Used for echo messages from the app (app already shows them locally).
+    """
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
+        result = resp.json()
+        if not result.get("ok") and parse_mode:
+            payload.pop("parse_mode", None)
+            resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
+    except Exception as e:
+        print(f"send_message_no_ws error: {e}", flush=True)
 
 
 _last_edit_time = {}  # message_id -> timestamp
@@ -980,6 +1013,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
 
         # Track active process for cancellation (by session_id for parallel support)
         active_processes[process_key] = process
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
 
         # Drain stderr in background so errors are logged instead of silently lost
         claude_stderr_lines = []
@@ -1241,6 +1275,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
 
         # Clean up process tracking
         active_processes.pop(process_key, None)
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
         mark_session_done(process_key)
 
         # Final update - no cursor, indicates completion
@@ -1319,11 +1354,13 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
 
     except FileNotFoundError:
         active_processes.pop(process_key, None)
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
         mark_session_done(process_key)
         edit_message(chat_id, message_id, "❌ _Error: Claude CLI not found_", force=True)
         return "Error: Claude CLI not found", [], message_id, None, False
     except Exception as e:
         active_processes.pop(process_key, None)
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
         mark_session_done(process_key)
         # Ensure subprocess pipes are cleaned up
         try:
@@ -1833,6 +1870,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
 
         # Register for /cancel support
         active_processes[process_key] = process
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
 
         # Drain stderr in background
         stderr_lines = []
@@ -1982,6 +2020,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         if cancelled:
             cancelled_sessions.discard(process_key)
         active_processes.pop(process_key, None)
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
 
         # Save gemini session ID for resume
         if new_session_id and session:
@@ -2074,6 +2113,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         except UnboundLocalError:
             pass
         active_processes.pop(process_key, None)
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
         # Ensure subprocess is cleaned up
         if process is not None:
             try:
@@ -2193,6 +2233,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
 
             # Track as active so messages get queued
             active_processes[session_id] = process
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
 
             # Drain stderr in background so errors are logged instead of silently lost
             codex_stderr_lines = []
@@ -2324,6 +2365,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
             if cancelled:
                 cancelled_sessions.discard(session_id)
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             mark_session_done(session_id)
 
             # Save codex session ID for resume
@@ -2376,6 +2418,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
 
         except FileNotFoundError:
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             mark_session_done(session_id)
             if message_id:
                 edit_message(chat_id, message_id, "❌ Codex CLI not found.", force=True)
@@ -2383,6 +2426,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 send_message(chat_id, "❌ Codex CLI not found.")
         except Exception as e:
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             mark_session_done(session_id)
             error_text = accumulated_text + f"\n\n———\n❌ Codex error: {str(e)[:200]}"
             if message_id:
@@ -2391,12 +2435,14 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 send_message(chat_id, error_text[:4000])
         finally:
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             process_message_queue(chat_id, session)
 
     # Mark active under lock to prevent race with incoming messages
     lock = get_session_lock(session_id)
     with lock:
         active_processes[session_id] = None
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
     thread = threading.Thread(target=codex_thread, daemon=True)
     thread.start()
     return thread
@@ -2460,6 +2506,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
             # Track as active so messages get queued
             active_processes[session_id] = process
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
 
             # Drain stderr in background so errors are logged instead of silently lost
             gemini_stderr_lines = []
@@ -2627,6 +2674,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             if cancelled:
                 cancelled_sessions.discard(session_id)
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             mark_session_done(session_id)
 
             # Populate result for callers that join the thread
@@ -2706,6 +2754,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
         except FileNotFoundError:
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             mark_session_done(session_id)
             result["error"] = "Gemini CLI not found"
             if message_id:
@@ -2714,6 +2763,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                 send_message(chat_id, "❌ Gemini CLI not found.")
         except Exception as e:
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             mark_session_done(session_id)
             result["error"] = str(e)[:300]
             error_text = accumulated_text + f"\n\n———\n❌ Gemini error: {str(e)[:200]}"
@@ -2728,12 +2778,14 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             except UnboundLocalError:
                 pass
             active_processes.pop(session_id, None)
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             process_message_queue(chat_id, session)
 
     # Mark active under lock to prevent race with incoming messages
     lock = get_session_lock(session_id)
     with lock:
         active_processes[session_id] = None
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
     thread = threading.Thread(target=gemini_thread, daemon=True)
     thread.start()
     return thread, result
@@ -3155,6 +3207,7 @@ def run_omni_loop(chat_id, task, session):
         "session_name": session.get("name", "unknown"),
     }
     save_active_tasks()
+    _ws_broadcast_status(chat_id, "omni", "starting", 0, active=True)
 
     step = 0
     phase = "architecting"  # architecting -> executing -> auditing
@@ -3176,6 +3229,7 @@ _Use /cancel to stop at any time._""")
             omni_active[chat_key]["step"] = step
             omni_active[chat_key]["phase"] = phase
             save_active_tasks()
+            _ws_broadcast_status(chat_id, "omni", phase, step)
 
             # Stop if we hit a runaway limit
             if step > 100:
@@ -3290,11 +3344,13 @@ _Use /cancel to stop at any time._""")
                     send_message(chat_id, f"✅ Plan approved by Codex. Executing with *{preferred_executor.capitalize()}*.")
                     audit_feedback = ""  # Clear so execution doesn't inherit stale plan-review feedback
                     phase = "executing"
+                    _ws_broadcast_status(chat_id, "omni", phase, step)
                 else:
                     # Codex rejected the plan — feed back to Claude
                     audit_feedback = plan_review[:6000] if plan_review else "Plan review returned no feedback."
                     print(f"{log_prefix} Step {step}: Plan rejected by Codex, looping back", flush=True)
                     phase = "architecting"
+                    _ws_broadcast_status(chat_id, "omni", phase, step)
 
                 time.sleep(2)
                 continue
@@ -3367,6 +3423,7 @@ _Use /cancel to stop at any time._""")
                     print(f"{log_prefix} Step {step}: Execute response: {exec_response[:300]}...", flush=True)
 
                 phase = "auditing"
+                _ws_broadcast_status(chat_id, "omni", phase, step)
                 time.sleep(2)
                 continue
 
@@ -3449,6 +3506,7 @@ _Session preserved. You can continue chatting in this session._""")
                                 break
                     # Loop back: architect incorporates feedback, then execute fixes
                     phase = "architecting"
+                    _ws_broadcast_status(chat_id, "omni", phase, step)
 
                 time.sleep(2)
 
@@ -3456,6 +3514,7 @@ _Session preserved. You can continue chatting in this session._""")
         omni_active[chat_key]["active"] = False
         user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
+        _ws_broadcast_status(chat_id, "omni", "", 0, active=False)
         if not notified_exit:
             send_message(chat_id, f"🏁 *Omni process finished* for `{session.get('name', 'unknown')}`.")
 
@@ -3470,6 +3529,7 @@ _Session preserved. You can continue chatting in this session._""")
         omni_active[chat_key]["active"] = False
         user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
+        _ws_broadcast_status(chat_id, "omni", "", 0, active=False)
 
 
 def run_justdoit_loop(chat_id, task, session):
@@ -3491,6 +3551,7 @@ def run_justdoit_loop(chat_id, task, session):
         "session_name": session.get("name", "unknown"),
     }
     save_active_tasks()
+    _ws_broadcast_status(chat_id, "justdoit", "starting", 0, active=True)
 
     step = 0
     phase = "implementing"
@@ -3560,6 +3621,7 @@ _Use /cancel to stop at any time._""")
             justdoit_active[chat_key]["step"] = step
             justdoit_active[chat_key]["phase"] = phase
             save_active_tasks()
+            _ws_broadcast_status(chat_id, "justdoit", phase, step)
 
             print(f"{log_prefix} === Step {step} === Phase: {phase}, Pending transition: {pending_transition}", flush=True)
 
@@ -3757,6 +3819,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                     print(f"{log_prefix} Step {step}: Phase transition {phase} -> {new_phase}", flush=True)
                     phase = new_phase
                     justdoit_active[chat_key]["phase"] = phase
+                    _ws_broadcast_status(chat_id, "justdoit", phase, step)
                     verify_attempts = 0  # Reset on successful transition
                     recent_codex_actions.clear()  # Reset loop detection on phase change
                     phase_emoji = {"implementing": "🔨", "reviewing": "🔍", "testing": "🧪"}.get(phase, "📋")
@@ -3773,6 +3836,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                     if target in ("implementing", "reviewing", "testing"):
                         phase = target
                         justdoit_active[chat_key]["phase"] = phase
+                        _ws_broadcast_status(chat_id, "justdoit", phase, step)
                         phase_emoji = {"implementing": "🔨", "reviewing": "🔍", "testing": "🧪"}.get(phase, "📋")
                         send_message(chat_id, f"{phase_emoji} *Phase transition: {phase.upper()}* (forced after {verify_attempts} verification attempts)")
                     elif target == "done":
@@ -3828,6 +3892,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                     if new_phase in ("implementing", "reviewing", "testing"):
                         phase = new_phase
                         justdoit_active[chat_key]["phase"] = phase
+                        _ws_broadcast_status(chat_id, "justdoit", phase, step)
                         verify_attempts = 0
                         phase_emoji = {"implementing": "🔨", "reviewing": "🔍", "testing": "🧪"}.get(phase, "📋")
                         send_message(chat_id, f"{phase_emoji} *Phase transition: {phase.upper()}*")
@@ -3840,6 +3905,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
                         if target in ("implementing", "reviewing", "testing"):
                             phase = target
                             justdoit_active[chat_key]["phase"] = phase
+                            _ws_broadcast_status(chat_id, "justdoit", phase, step)
                             phase_emoji = {"implementing": "🔨", "reviewing": "🔍", "testing": "🧪"}.get(phase, "📋")
                             send_message(chat_id, f"{phase_emoji} *Phase transition: {phase.upper()}* (forced)")
                         verify_attempts = 0
@@ -3889,6 +3955,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
             pass
         justdoit_active.pop(chat_key, None)
         save_active_tasks()
+        _ws_broadcast_status(chat_id, "justdoit", "", 0, active=False)
 
 
 def run_codex_deepreview(claude_output, review_history, step, cwd, phase):
@@ -4182,6 +4249,7 @@ def run_deepreview_loop(chat_id, session):
         "chat_id": str(chat_id),
         "session_name": session.get("name", "unknown"),
     }
+    _ws_broadcast_status(chat_id, "deepreview", "starting", 0, active=True)
 
     step = 0
     review_history = ""
@@ -4221,6 +4289,7 @@ _Use /cancel to stop at any time._""")
             deepreview_active[chat_key]["phase"] = phase
             step += 1
             deepreview_active[chat_key]["step"] = step
+            _ws_broadcast_status(chat_id, "deepreview", phase, step)
 
             if iteration_12 == 1:
                 send_message(chat_id, f"🔍 *Step {step}* — Phase 1: Claude reviewing & fixing...")
@@ -4332,6 +4401,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
             deepreview_active[chat_key]["phase"] = phase
             step += 1
             deepreview_active[chat_key]["step"] = step
+            _ws_broadcast_status(chat_id, "deepreview", phase, step)
 
             send_message(chat_id, f"🧠 *Step {step}* — Phase 2 (iteration {iteration_12}): Codex cross-reviewing...")
 
@@ -4428,6 +4498,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
             deepreview_active[chat_key]["phase"] = phase
             step += 1
             deepreview_active[chat_key]["step"] = step
+            _ws_broadcast_status(chat_id, "deepreview", phase, step)
 
             # On iteration > 1, pass Claude's feedback from Phase 4
             is_followup = iteration_34 > 1
@@ -4499,6 +4570,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
             deepreview_active[chat_key]["phase"] = phase
             step += 1
             deepreview_active[chat_key]["step"] = step
+            _ws_broadcast_status(chat_id, "deepreview", phase, step)
 
             send_message(chat_id, f"⚔️ *Step {step}* — Phase 4 (iteration {iteration_34}): Claude cross-reviewing Codex's work...")
 
@@ -4621,6 +4693,7 @@ _Session preserved. You can continue chatting._""")
         except Exception:
             pass
         deepreview_active.pop(chat_key, None)
+        _ws_broadcast_status(chat_id, "deepreview", "", 0, active=False)
 
 
 def handle_command(chat_id, text):
@@ -4914,12 +4987,15 @@ Send a message to start working!""")
             if justdoit_active.get(jdi_key, {}).get("active"):
                 justdoit_active[jdi_key]["active"] = False
                 justdoit_was_active = True
+                _ws_broadcast_status(chat_id, "justdoit", "", 0, active=False)
             if deepreview_active.get(jdi_key, {}).get("active"):
                 deepreview_active[jdi_key]["active"] = False
                 deepreview_was_active = True
+                _ws_broadcast_status(chat_id, "deepreview", "", 0, active=False)
             if omni_active.get(jdi_key, {}).get("active"):
                 omni_active[jdi_key]["active"] = False
                 omni_was_active = True
+                _ws_broadcast_status(chat_id, "omni", "", 0, active=False)
             # Clear any queued user feedback
             user_feedback_queue.pop(jdi_key, None)
 
@@ -4941,6 +5017,7 @@ Send a message to start working!""")
                     except Exception:
                         pass
                     active_processes.pop(session_id, None)
+                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
                     if justdoit_was_active:
                         send_message(chat_id, f"⚠️ *JustDoIt cancelled* for `{session['name']}`.\n_Session preserved. You can continue manually._")
                     elif deepreview_was_active:
@@ -4952,6 +5029,7 @@ Send a message to start working!""")
                 except ProcessLookupError:
                     # Process already exited
                     active_processes.pop(session_id, None)
+                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
                     send_message(chat_id, f"⚠️ Cancelled (process already finished).")
                 except Exception as e:
                     print(f"Cancel error: {e}", flush=True)
@@ -4959,6 +5037,7 @@ Send a message to start working!""")
                     try:
                         process.kill()
                         active_processes.pop(session_id, None)
+                        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
                     except Exception:
                         pass
                     send_message(chat_id, f"⚠️ Cancelled operation for `{session['name']}`.")
@@ -5069,6 +5148,7 @@ Send a message to start working!""")
                 send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
                 return True
             active_processes[sid] = None
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
         session["last_cli"] = "Claude"
         run_claude_in_thread(chat_id, task, session=session)
         return True
@@ -5091,6 +5171,7 @@ Send a message to start working!""")
                 send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
                 return True
             active_processes[sid] = None
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
         session["last_cli"] = "Codex"
         run_codex_task(chat_id, task, session["cwd"], session=session)
         return True
@@ -5113,6 +5194,7 @@ Send a message to start working!""")
                 send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
                 return True
             active_processes[sid] = None
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
         session["last_cli"] = "Gemini"
         run_gemini_task(chat_id, task, session["cwd"], session=session)
         return True
@@ -5417,6 +5499,7 @@ def handle_callback_query(callback_query):
                             s_lock = get_session_lock(s_id)
                             with s_lock:
                                 active_processes[s_id] = None
+                                _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
                             run_claude_in_thread(chat_id, answer_text, session)
                     return
         except (ValueError, IndexError):
@@ -5510,6 +5593,7 @@ Format as a compact bullet list. This will be used to restore context after rese
             print(f"Error in claude thread: {e}")
             if session_id:
                 active_processes.pop(session_id, None)
+                _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
 
     thread = threading.Thread(target=claude_task, daemon=True)
     thread.start()
@@ -5529,6 +5613,7 @@ def process_message_queue(chat_id, session=None):
             queued_text = message_queue[session_id].pop(0)
             # Mark as active under lock before launching thread
             active_processes[session_id] = None
+            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
         else:
             return
 
@@ -5597,6 +5682,7 @@ def handle_message(chat_id, text):
                 lock = get_session_lock(session_id)
                 with lock:
                     active_processes[session_id] = None
+                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
                 run_claude_in_thread(chat_id, answer_text, session)
         return
 
@@ -5628,6 +5714,7 @@ def handle_message(chat_id, text):
 
         # Mark as active immediately under the lock to prevent races
         active_processes[session_id] = None  # placeholder until real process starts
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
 
     # Dispatch to the appropriate CLI runner based on session state
     last_cli = session.get("last_cli", "Claude") if session else "Claude"
@@ -5737,6 +5824,9 @@ def main():
             justdoit_active=justdoit_active,
             omni_active=omni_active,
             deepreview_active=deepreview_active,
+            send_message=send_message,
+            send_message_no_ws=send_message_no_ws,
+            default_chat_id=int(ALLOWED_CHAT_IDS[0]) if ALLOWED_CHAT_IDS and ALLOWED_CHAT_IDS[0] else None,
         )
         api_host = os.environ.get("API_HOST", "100.118.238.103")
         api_port = int(os.environ.get("API_PORT", "8642"))
