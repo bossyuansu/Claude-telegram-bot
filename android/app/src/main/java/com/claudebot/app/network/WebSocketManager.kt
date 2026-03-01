@@ -9,7 +9,7 @@ import java.util.concurrent.TimeUnit
 enum class ConnectionState { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING }
 
 data class WsMessage(
-    val type: String,        // "message", "edit", "error", "status"
+    val type: String,        // "message", "edit", "error", "status", "stream"
     val messageId: Int?,
     val text: String,
     val session: String,
@@ -19,12 +19,20 @@ data class WsMessage(
     val mode: String = "",
     val phase: String = "",
     val step: Int = 0,
-    val active: Boolean = false
+    val active: Boolean = false,
+    // Stream fields (for type="stream")
+    val op: String = "",           // "start", "append", "tool", "done"
+    val tool: String = "",         // tool name for op="tool"
+    val path: String = "",         // tool path for op="tool"
+    val cancelled: Boolean = false,
+    val fileChanges: List<Map<String, String>> = emptyList()
 )
 
 class WebSocketManager(
     private val onMessage: (WsMessage) -> Unit,
-    private val onStateChange: (ConnectionState) -> Unit
+    private val onStateChange: (ConnectionState) -> Unit,
+    private val onServerRestart: (() -> Unit)? = null,
+    private val onSeqUpdate: ((seq: Int, serverId: String) -> Unit)? = null
 ) {
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -50,7 +58,22 @@ class WebSocketManager(
     /** Whether we've already requested a resend for the current gap. */
     private var resendRequested = false
 
+    /** Server boot ID — changes on server restart. */
+    private var knownServerId: String? = null
+
+    /** Restore persisted state from a previous app session. */
+    fun restoreState(seq: Int, serverId: String) {
+        lastSeq = seq
+        expectedSeq = seq + 1
+        knownServerId = serverId.ifEmpty { null }
+    }
+
     fun connect(wsUrl: String) {
+        // Close any existing connection before opening a new one
+        reconnectThread?.interrupt()
+        reconnectThread = null
+        ws?.close(1000, "Reconnecting")
+        ws = null
         baseUrl = wsUrl
         shouldReconnect = true
         reconnectAttempt = 0
@@ -92,14 +115,36 @@ class WebSocketManager(
                 reconnectAttempt = 0
                 pendingBuffer.clear()
                 resendRequested = false
-                // Align expectedSeq with what we've already delivered
-                expectedSeq = lastSeq + 1
+                // If lastSeq is 0 (fresh or reset), accept whatever seq comes first
+                expectedSeq = if (lastSeq == 0) 0 else lastSeq + 1
                 onStateChange(ConnectionState.CONNECTED)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
                     val json = JSONObject(text)
+
+                    // Handle server_hello — detect server restarts
+                    if (json.optString("type") == "server_hello") {
+                        val serverId = json.optString("server_id", "")
+                        val changed = knownServerId != serverId
+                        if (changed && knownServerId != null) {
+                            // Server restarted — notify app to clear stale state
+                            onServerRestart?.invoke()
+                        }
+                        // New server (restart or first connect) — accept whatever seq
+                        // the first replayed message has, since old numbering is gone.
+                        if (changed) {
+                            lastSeq = 0
+                            expectedSeq = 0  // 0 = "accept next seq as starting point"
+                            pendingBuffer.clear()
+                            resendRequested = false
+                            onSeqUpdate?.invoke(0, serverId)
+                        }
+                        knownServerId = serverId
+                        return
+                    }
+
                     val seq = json.optInt("seq", 0)
 
                     val msg = parseMessage(json, seq)
@@ -108,6 +153,21 @@ class WebSocketManager(
                         // No seq (e.g. error frames) — deliver immediately
                         onMessage(msg)
                         return
+                    }
+
+                    // First message after server change — adopt its seq as starting point
+                    if (expectedSeq == 0) {
+                        expectedSeq = seq
+                        lastSeq = seq - 1
+                    }
+
+                    // Detect server restart: seq jumped back to near 1
+                    if (seq < expectedSeq && expectedSeq - seq > 100) {
+                        // Server restarted — reset seq tracking to accept new numbering
+                        pendingBuffer.clear()
+                        resendRequested = false
+                        expectedSeq = seq
+                        lastSeq = seq - 1
                     }
 
                     when {
@@ -151,6 +211,8 @@ class WebSocketManager(
         lastSeq = msg.seq
         expectedSeq = msg.seq + 1
         onMessage(msg)
+        // Persist seq + server ID
+        onSeqUpdate?.invoke(lastSeq, knownServerId ?: "")
     }
 
     /** Flush consecutive messages from the pending buffer. */
@@ -184,6 +246,18 @@ class WebSocketManager(
                 }
             }
         }
+        // Parse stream file_changes array
+        val fileChanges = mutableListOf<Map<String, String>>()
+        val fcArr = json.optJSONArray("file_changes")
+        if (fcArr != null) {
+            for (i in 0 until fcArr.length()) {
+                val obj = fcArr.getJSONObject(i)
+                val map = mutableMapOf<String, String>()
+                obj.keys().forEach { key -> map[key] = obj.optString(key, "") }
+                fileChanges.add(map)
+            }
+        }
+
         return WsMessage(
             type = json.optString("type", ""),
             messageId = if (json.has("message_id") && !json.isNull("message_id"))
@@ -195,7 +269,12 @@ class WebSocketManager(
             mode = json.optString("mode", ""),
             phase = json.optString("phase", ""),
             step = json.optInt("step", 0),
-            active = json.optBoolean("active", false)
+            active = json.optBoolean("active", false),
+            op = json.optString("op", ""),
+            tool = json.optString("tool", ""),
+            path = json.optString("path", ""),
+            cancelled = json.optBoolean("cancelled", false),
+            fileChanges = fileChanges
         )
     }
 

@@ -1,9 +1,11 @@
 package com.claudebot.app.ui.components
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -16,7 +18,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -32,13 +36,16 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MessageBubble(
     message: ChatMessage,
     onButtonClick: ((InlineButton) -> Unit)? = null
 ) {
     val clipboard = LocalClipboardManager.current
+    val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
+    var showCopied by remember { mutableStateOf(false) }
     val isBot = message.isFromBot
     val alignment = if (isBot) Alignment.Start else Alignment.End
     val bubbleColor = if (isBot) BotBubble else UserBubble
@@ -77,6 +84,15 @@ fun MessageBubble(
                 .clip(shape)
                 .then(borderMod)
                 .background(bubbleColor)
+                .combinedClickable(
+                    onClick = {},
+                    onLongClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        clipboard.setText(AnnotatedString(message.text))
+                        showCopied = true
+                        scope.launch { delay(1500); showCopied = false }
+                    }
+                )
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             SelectionContainer {
@@ -199,12 +215,22 @@ fun MessageBubble(
             }
         }
 
-        // Timestamp
-        Text(
-            text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(message.timestamp)),
-            fontSize = 10.sp,
-            color = TimestampColor,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-        )
+        // Timestamp + copied indicator
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(message.timestamp)),
+                fontSize = 10.sp,
+                color = TimestampColor,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+            )
+            if (showCopied) {
+                Text(
+                    text = "Copied",
+                    fontSize = 10.sp,
+                    color = ConnectedGreen,
+                    modifier = Modifier.padding(start = 4.dp)
+                )
+            }
+        }
     }
 }

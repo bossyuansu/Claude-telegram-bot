@@ -7,6 +7,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -40,6 +41,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
     var showSearch by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
+    var showOutline by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     val searchQuery by viewModel.searchQuery
     val searchResults = viewModel.searchResults
     val isSearching by viewModel.isSearching
@@ -65,12 +68,25 @@ fun ChatScreen(viewModel: ChatViewModel) {
         }
     }
 
+    // Scroll to bottom on first load
+    LaunchedEffect(Unit) {
+        snapshotFlow { messages.size }
+            .distinctUntilChanged()
+            .collectLatest { size ->
+                if (size > 0) {
+                    listState.scrollToItem(size - 1)
+                    return@collectLatest
+                }
+            }
+    }
+
     val scrollTrigger by viewModel.scrollTrigger
     LaunchedEffect(scrollTrigger) {
         if (scrollTrigger == 0) return@LaunchedEffect
         if (messages.isEmpty()) return@LaunchedEffect
         if (stickToBottom) {
-            listState.animateScrollToItem(messages.size - 1)
+            listState.scrollToItem(messages.size - 1)
+            listState.scrollBy(Float.MAX_VALUE)
         } else {
             hasNewMessages = true
         }
@@ -197,6 +213,9 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                 TextButton(onClick = { viewModel.connect() }) {
                                     Text("Connect", fontSize = 12.sp, color = AccentOrange)
                                 }
+                            }
+                            IconButton(onClick = { showOutline = true }) {
+                                Text("📑", fontSize = 16.sp)
                             }
                             IconButton(onClick = { showSearch = true }) {
                                 Text("\uD83D\uDD0D", fontSize = 16.sp)
@@ -360,7 +379,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                 }
                             }
                         }
-                        items(messages, key = { "${it.messageId}_${it.timestamp}" }) { msg ->
+                        items(messages.size, key = { i -> "${messages[i].messageId}_${messages[i].timestamp}_$i" }) { i ->
+                            val msg = messages[i]
                             MessageBubble(
                                 message = msg,
                                 onButtonClick = { button ->
@@ -377,9 +397,9 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     }
                 }
 
-                // New message indicator
+                // Scroll-to-bottom button (shows when scrolled up)
                 AnimatedVisibility(
-                    visible = hasNewMessages,
+                    visible = !stickToBottom,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 8.dp),
@@ -400,18 +420,97 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         ),
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                     ) {
-                        Text("\u2193 New messages", fontSize = 12.sp)
+                        Text(
+                            if (hasNewMessages) "\u2193 New messages" else "\u2193 Bottom",
+                            fontSize = 12.sp
+                        )
                     }
                 }
+            }
+        }
+
+        if (showOutline) {
+            ModalBottomSheet(
+                onDismissRequest = { showOutline = false },
+                sheetState = sheetState,
+                containerColor = DarkSurface
+            ) {
+                val userPrompts = remember(messages) {
+                    messages.mapIndexedNotNull { index, msg ->
+                        if (!msg.isFromBot && msg.text.isNotBlank()) index to msg else null
+                    }.reversed()
+                }
+
+                Text(
+                    "Session Outline",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TopBarTitle,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+
+                if (userPrompts.isEmpty()) {
+                    Text(
+                        "No prompts yet.",
+                        color = SessionLabel,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 400.dp)
+                    ) {
+                        items(userPrompts) { (originalIndex, msg) ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        scope.launch {
+                                            showOutline = false
+                                            sheetState.hide()
+                                            listState.animateScrollToItem(originalIndex)
+                                        }
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                            ) {
+                                Text(
+                                    text = msg.text,
+                                    color = BotText,
+                                    maxLines = 2,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    fontSize = 14.sp
+                                )
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(msg.timestamp)),
+                                    color = SessionLabel,
+                                    fontSize = 10.sp
+                                )
+                            }
+                            HorizontalDivider(color = InputBorder)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()))
             }
         }
     }
 }
 
-/** Animated typing indicator — three pulsing dots in a bot-style bubble. */
+/** Animated typing indicator — three pulsing dots in a bot-style bubble.
+ *  Uses a manual coroutine loop instead of rememberInfiniteTransition
+ *  to avoid continuous recomposition that prevents screen timeout. */
 @Composable
 private fun TypingIndicator() {
-    val infiniteTransition = rememberInfiniteTransition(label = "typing")
+    // Cycle through which dot is "active" (0, 1, 2) every 200ms
+    var activeDot by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(200)
+            activeDot = (activeDot + 1) % 3
+        }
+    }
 
     Row(
         modifier = Modifier
@@ -429,22 +528,7 @@ private fun TypingIndicator() {
             verticalAlignment = Alignment.CenterVertically
         ) {
             repeat(3) { i ->
-                val alpha by infiniteTransition.animateFloat(
-                    initialValue = 0.3f,
-                    targetValue = 1f,
-                    animationSpec = infiniteRepeatable(
-                        animation = keyframes {
-                            durationMillis = 1200
-                            0.3f at 0
-                            1f at 300
-                            0.3f at 600
-                            0.3f at 1200
-                        },
-                        repeatMode = RepeatMode.Restart,
-                        initialStartOffset = StartOffset(i * 200)
-                    ),
-                    label = "dot$i"
-                )
+                val alpha = if (i == activeDot) 1f else 0.3f
                 Box(
                     modifier = Modifier
                         .size(7.dp)

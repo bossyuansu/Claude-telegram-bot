@@ -1,18 +1,24 @@
 package com.claudebot.app.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -163,29 +169,35 @@ fun InputBar(
 
                 Spacer(Modifier.width(4.dp))
 
-                OutlinedTextField(
+                // Text input with compact padding
+                var focused by remember { mutableStateOf(false) }
+                val borderColor = if (focused) InputBorderFocused else InputBorder
+                val shape = RoundedCornerShape(24.dp)
+
+                BasicTextField(
                     value = text,
                     onValueChange = {
                         text = it
                         if (it.startsWith("/")) showMenu = false
                     },
-                    modifier = Modifier.weight(1f),
-                    placeholder = {
-                        val hint = if (currentSession.isNotEmpty()) currentSession else "Message or /command..."
-                        Text(hint, color = PlaceholderText, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    },
-                    shape = RoundedCornerShape(24.dp),
-                    maxLines = 4,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(shape)
+                        .background(DarkSurfaceVariant, shape)
+                        .border(1.dp, borderColor, shape)
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                        .onFocusChanged { focused = it.isFocused },
                     enabled = enabled,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = InputBorderFocused,
-                        unfocusedBorderColor = InputBorder,
-                        focusedTextColor = BotText,
-                        unfocusedTextColor = BotText,
-                        cursorColor = AccentOrange,
-                        focusedContainerColor = DarkSurfaceVariant,
-                        unfocusedContainerColor = DarkSurfaceVariant,
-                    )
+                    textStyle = TextStyle(color = BotText, fontSize = 14.sp),
+                    cursorBrush = SolidColor(AccentOrange),
+                    maxLines = 4,
+                    decorationBox = { innerTextField ->
+                        if (text.isEmpty()) {
+                            val hint = if (currentSession.isNotEmpty()) currentSession else "Message or /command..."
+                            Text(hint, color = PlaceholderText, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
+                        }
+                        innerTextField()
+                    }
                 )
 
                 Spacer(Modifier.width(8.dp))

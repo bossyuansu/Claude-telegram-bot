@@ -10,8 +10,9 @@ import json
 import os
 import threading
 import time
+import uuid
 
-from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query, Request
 from pydantic import BaseModel
 from typing import Optional
 
@@ -43,6 +44,7 @@ _ws_lock = threading.Lock()
 _ws_seq = 0  # Monotonic sequence counter
 _ws_buffer: list[tuple[int, str]] = []  # (seq, JSON payload)
 _WS_BUFFER_MAX = 500
+_server_id = str(uuid.uuid4())[:8]  # Unique ID per server boot
 
 
 def init_refs(**kwargs):
@@ -106,7 +108,7 @@ def broadcast_ws(chat_id, event_type, data):
         seq = _ws_seq
         payload = json.dumps({"seq": seq, "type": event_type, "chat_id": int(chat_id), **data})
 
-        # Always buffer (for replay on reconnect)
+        # Always buffer for replay on reconnect (filtered at replay time)
         _ws_buffer.append((seq, payload))
         if len(_ws_buffer) > _WS_BUFFER_MAX:
             _ws_buffer.pop(0)
@@ -132,6 +134,13 @@ _ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 # --- Routes ---
+
+@app.post("/api/crash")
+async def post_crash(request: Request):
+    """Receive crash reports from the Android app."""
+    body = await request.body()
+    print(f"[CRASH] Android app crash:\n{body.decode('utf-8', errors='replace')}", flush=True)
+    return {"ok": True}
 
 @app.post("/api/message")
 def post_message(req: MessageRequest, _=Depends(verify_auth)):
@@ -268,21 +277,30 @@ async def ws_endpoint(
 
     await websocket.accept()
 
-    # Register and find messages to replay
+    # Send server identity so the app can detect restarts
+    hello = json.dumps({"type": "server_hello", "server_id": _server_id, "seq": 0})
+    await websocket.send_text(hello)
+
+    # Replay missed messages on reconnect (all event types — the app
+    # handles stream/status events gracefully even when replayed).
     with _ws_lock:
         _ws_clients.add(websocket)
-        if last_seq > 0:
-            # Replay everything after last_seq from the buffer
+        if last_seq > 0 and last_seq <= _ws_seq:
             replay = [(s, p) for s, p in _ws_buffer if s > last_seq]
+        elif last_seq > _ws_seq:
+            # Client's seq is ahead — server was restarted, replay full buffer
+            replay = list(_ws_buffer)
         else:
-            # No last_seq — flush entire buffer (legacy behavior)
+            # Fresh connect (last_seq=0) — replay full buffer
             replay = list(_ws_buffer)
     print(f"[WS] Client connected (last_seq={last_seq}, replaying {len(replay)})", flush=True)
 
-    # Replay missed messages
-    for _, payload in replay:
+    # Replay missed messages (throttled to avoid flooding)
+    for i, (_, payload) in enumerate(replay):
         try:
             await websocket.send_text(payload)
+            if (i + 1) % 10 == 0:
+                await asyncio.sleep(0.05)
         except Exception:
             break
 
@@ -299,15 +317,14 @@ async def ws_endpoint(
                         parsed = json.loads(data)
                         msg_type = parsed.get("type", "")
 
-                        # Handle resend request: client detected a seq gap
                         if msg_type == "resend":
                             from_seq = parsed.get("from_seq", 0)
                             with _ws_lock:
                                 resend = [(s, p) for s, p in _ws_buffer if s >= from_seq]
                             print(f"[WS] Resend request from_seq={from_seq}, sending {len(resend)} messages", flush=True)
-                            for _, payload in resend:
+                            for _, p in resend:
                                 try:
-                                    await websocket.send_text(payload)
+                                    await websocket.send_text(p)
                                 except Exception:
                                     break
                         else:

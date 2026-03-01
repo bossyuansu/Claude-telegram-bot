@@ -20,6 +20,14 @@ class SettingsRepository(context: Context) {
         get() = prefs.getString("token", "") ?: ""
         set(value) = prefs.edit().putString("token", value).apply()
 
+    var lastSeq: Int
+        get() = prefs.getInt("last_seq", 0)
+        set(value) = prefs.edit().putInt("last_seq", value).apply()
+
+    var knownServerId: String
+        get() = prefs.getString("known_server_id", "") ?: ""
+        set(value) = prefs.edit().putString("known_server_id", value).apply()
+
     val isConfigured: Boolean
         get() = host.isNotBlank()
 

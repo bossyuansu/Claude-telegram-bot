@@ -47,6 +47,6 @@ $SSH "$ADB install -r $PHONE_DEST" 2>&1 | tail -3
 
 echo "==> Launching app..."
 $SSH "$ADB shell am force-stop $PACKAGE" 2>/dev/null || true
-$SSH "$ADB shell monkey -p $PACKAGE -c android.intent.category.LAUNCHER 1" 2>/dev/null
+$SSH "$ADB shell am start -n $PACKAGE/.MainActivity" 2>/dev/null
 
 echo "==> Deploy complete!"

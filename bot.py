@@ -411,6 +411,7 @@ def get_updates(offset=0):
 
 
 _api_module = None  # Set in main() after api.py is loaded
+_ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadcasts
 
 
 def _ws_broadcast(chat_id, event_type, data):
@@ -432,10 +433,19 @@ def _ws_broadcast_status(chat_id, mode, phase, step, active=True):
     })
 
 
+def _ws_stream(chat_id, op, message_id, session="", **kwargs):
+    """Send a WS-native stream event for the app.
+    Unlike TG edits (full text, 1/sec), these carry lightweight deltas.
+    ops: start, append, replace_last, tool, done
+    """
+    data = {"op": op, "message_id": message_id, "session": session, **kwargs}
+    _ws_broadcast(chat_id, "stream", data)
+
+
 def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3):
     """Send a message back to the user. Returns message_id.
     Retries on network/timeout errors with exponential backoff.
-    Also broadcasts via WebSocket (independent channel).
+    Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
     """
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
@@ -452,12 +462,13 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
         chunk_msg_id = None
         for attempt in range(retries):
             try:
-                resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
+                # Use shorter timeout (3s connect, 7s read) to prevent blocking the app during network drops
+                resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=(3.0, 7.0))
                 result = resp.json()
                 if not result.get("ok") and parse_mode:
                     # Retry without markdown
                     payload.pop("parse_mode", None)
-                    resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=30)
+                    resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=(3.0, 7.0))
                     result = resp.json()
                 if result.get("ok"):
                     chunk_msg_id = result.get("result", {}).get("message_id")
@@ -475,14 +486,22 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
                 print(f"Error sending message: {e}", flush=True)
                 break  # Non-network error, don't retry
 
+        if chunk_msg_id is None:
+            # Generate pseudo-ID so WS clients can still receive and edit this message
+            chunk_msg_id = -int(time.time() * 1000) % 1000000000
+            if i == 0:
+                message_id = chunk_msg_id
+
         # Broadcast via WebSocket (independent of TG success/failure)
-        _session = get_active_session(chat_id)
-        _sess_name = _session.get("name", "") if _session else ""
-        ws_data = {"text": chunk, "message_id": chunk_msg_id, "session": _sess_name}
-        # Include inline keyboard buttons in WS payload (last chunk only)
-        if reply_markup and i == len(chunks) - 1:
-            ws_data["reply_markup"] = reply_markup
-        _ws_broadcast(chat_id, "message", ws_data)
+        # Suppressed when streaming — stream events replace legacy message/edit broadcasts
+        if not getattr(_ws_suppress, 'active', False):
+            _session = get_active_session(chat_id)
+            _sess_name = _session.get("name", "") if _session else ""
+            ws_data = {"text": chunk, "message_id": chunk_msg_id, "session": _sess_name}
+            # Include inline keyboard buttons in WS payload (last chunk only)
+            if reply_markup and i == len(chunks) - 1:
+                ws_data["reply_markup"] = reply_markup
+            _ws_broadcast(chat_id, "message", ws_data)
 
     return message_id
 
@@ -513,7 +532,7 @@ EDIT_MIN_INTERVAL = 1.0  # Minimum seconds between edits to the same message
 
 def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
     """Edit an existing message. Rate-limited to 1 edit/sec per message.
-    Also broadcasts via WebSocket (independent channel, same rate-limiting).
+    Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
     """
     global _last_edit_cleanup
 
@@ -543,10 +562,16 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
     if len(text) > 4000:
         text = text[:3997] + "..."
 
-    # Broadcast edit via WebSocket (independent of TG, same rate-limiting)
-    _session = get_active_session(chat_id)
-    _sess_name = _session.get("name", "") if _session else ""
-    _ws_broadcast(chat_id, "edit", {"message_id": message_id, "text": text, "session": _sess_name})
+    # Broadcast edit via WebSocket (suppressed during streaming — stream events replace it)
+    if not getattr(_ws_suppress, 'active', False):
+        _session = get_active_session(chat_id)
+        _sess_name = _session.get("name", "") if _session else ""
+        _ws_broadcast(chat_id, "edit", {"message_id": message_id, "text": text, "session": _sess_name})
+
+    if message_id < 0:
+        # Pseudo-ID means the original Telegram send failed. Cannot edit on TG.
+        # Don't retry send — would create duplicate if network recovers mid-retry.
+        return
 
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if parse_mode:
@@ -557,7 +582,8 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
 
     for attempt in range(max_attempts):
         try:
-            resp = requests.post(f"{API_URL}/editMessageText", json=payload, timeout=30)
+            # Shorter timeouts for edit as well to prevent blocking
+            resp = requests.post(f"{API_URL}/editMessageText", json=payload, timeout=(3.0, 7.0))
             result = resp.json()
             if not result.get("ok"):
                 error_desc = result.get("description", "")
@@ -566,7 +592,7 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
                 elif parse_mode:
                     # Retry without markdown if parsing fails
                     payload.pop("parse_mode", None)
-                    resp2 = requests.post(f"{API_URL}/editMessageText", json=payload, timeout=30)
+                    resp2 = requests.post(f"{API_URL}/editMessageText", json=payload, timeout=(3.0, 7.0))
                     result2 = resp2.json()
                     if not result2.get("ok") and force:
                         print(f"edit_message failed even without markdown (msg_id={message_id}): {result2.get('description')}", flush=True)
@@ -581,10 +607,9 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
             if attempt < max_attempts - 1:
                 time.sleep(2)  # Wait before retry
 
-    # All retries exhausted — fall back to sending a new message
+    # All retries exhausted — don't send a new message (would create duplicate on TG)
     if force:
-        print(f"edit_message: all retries failed for msg_id={message_id}, falling back to send_message", flush=True)
-        send_message(chat_id, text, parse_mode=parse_mode)
+        print(f"edit_message: all retries failed for msg_id={message_id}, giving up", flush=True)
 
 
 def send_document(chat_id, file_path, caption=None):
@@ -985,6 +1010,9 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
     # Use session_id for process tracking (allows parallel sessions)
     process_key = session_id or str(chat_id)
 
+    # Suppress legacy WS message/edit broadcasts — stream events replace them
+    _ws_suppress.active = True
+
     # Send initial message
     message_id = send_message(chat_id, "⏳ _Thinking..._")
     message_ids = [message_id]  # Track all message IDs for chunked responses
@@ -1001,6 +1029,11 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
     processed_tool_ids = set()  # Track processed tool_use IDs to avoid duplicates
     new_claude_session_id = None  # Capture Claude's session ID from init
     process = None  # Initialize before try block so exception handler can safely reference it
+
+    # WS-native streaming: the app uses stream events instead of edit events
+    _session = get_active_session(chat_id)
+    _stream_session = _session.get("name", "") if _session else ""
+    _ws_stream(chat_id, "start", message_id, session=_stream_session)
 
     try:
         process = subprocess.Popen(
@@ -1069,6 +1102,8 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 path = tool_input.get("file_path") or tool_input.get("command") or tool_input.get("pattern") or ""
                 file_changes.append({"type": tool_name.lower(), "path": path[:100]})
                 current_tool = tool_name
+                # WS stream: send tool event to app
+                _ws_stream(chat_id, "tool", message_ids[0], tool=tool_name.lower(), path=path[:100])
                 now = time.time()
                 if now - last_update >= update_interval:
                     display_text = current_chunk_text or ""
@@ -1081,6 +1116,9 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
             nonlocal accumulated_text, current_chunk_text, current_tool, message_id, last_update
             if not text:
                 return
+            # Strip leading newlines from the very first text to avoid blank lines at top
+            if not accumulated_text:
+                text = text.lstrip('\n')
             print(f"[STREAM] _process_text: {len(text)} chars, total_accumulated={len(accumulated_text)}, chunk={len(current_chunk_text)}", flush=True)
             spacing = ""
             if accumulated_text and not accumulated_text.endswith('\n') and not text.startswith('\n'):
@@ -1088,6 +1126,8 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                     spacing = "\n\n"
                 elif not accumulated_text.endswith(' '):
                     spacing = " "
+            # WS stream: send the delta to app (no rate limit, no size limit)
+            _ws_stream(chat_id, "append", message_ids[0], text=spacing + text)
             if len(accumulated_text) < max_accumulated:
                 accumulated_text += spacing + text
             current_chunk_text += spacing + text
@@ -1323,6 +1363,13 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         else:
             final_chunk += "\n\n———\n✓ _complete_"
 
+        # WS stream: send done event with full text (app doesn't need TG chunking/splitting)
+        _ws_stream(chat_id, "done", message_ids[0],
+                   session=_stream_session,
+                   text=accumulated_text.strip(),
+                   cancelled=cancelled,
+                   file_changes=file_changes)
+
         # Handle final chunk - may need further splitting if file ops made it too long
         if len(final_chunk) <= 4000:
             if message_id:
@@ -1350,15 +1397,20 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                            "context length" in accumulated_text.lower() or
                            "too much media" in accumulated_text.lower())
 
+        _ws_suppress.active = False
         return accumulated_text, questions, message_id, new_claude_session_id, context_overflow
 
     except FileNotFoundError:
+        _ws_suppress.active = False
         active_processes.pop(process_key, None)
         _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
         mark_session_done(process_key)
+        _ws_stream(chat_id, "done", message_id, session=_stream_session,
+                   text="Error: Claude CLI not found", cancelled=False, file_changes=[])
         edit_message(chat_id, message_id, "❌ _Error: Claude CLI not found_", force=True)
         return "Error: Claude CLI not found", [], message_id, None, False
     except Exception as e:
+        _ws_suppress.active = False
         active_processes.pop(process_key, None)
         _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
         mark_session_done(process_key)
@@ -1371,6 +1423,10 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 process.wait()
         except Exception:
             pass
+        _ws_stream(chat_id, "done", message_ids[0] if message_ids else message_id,
+                   session=_stream_session,
+                   text=accumulated_text.strip() + f"\n\nError: {e}",
+                   cancelled=False, file_changes=file_changes)
         error_text = accumulated_text + f"\n\n———\n❌ _Error: {e}_"
         context_overflow = ("prompt is too long" in str(e).lower() or
                            "context length" in str(e).lower() or
@@ -1947,6 +2003,11 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                             elif accumulated_text.startswith(content):
                                 append_text = ""
                         if append_text:
+                            # Strip leading newlines from very first text
+                            if not accumulated_text:
+                                append_text = append_text.lstrip('\n')
+                            if not append_text:
+                                continue
                             spacing = ""
                             if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
                                 if accumulated_text.endswith(('.', '!', '?', ':')):
@@ -2304,6 +2365,11 @@ def run_codex_task(chat_id, task, cwd, session=None):
                                     new_text = ""
 
                                 if new_text:
+                                    # Strip leading newlines from very first text
+                                    if not accumulated_text:
+                                        new_text = new_text.lstrip('\n')
+                                    if not new_text:
+                                        continue
                                     # Add spacing between separate agent messages
                                     spacing = ""
                                     if accumulated_text and not accumulated_text.endswith('\n') and not new_text.startswith('\n'):
@@ -2591,6 +2657,11 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                                 elif accumulated_text.startswith(content):
                                     append_text = ""
                             if append_text:
+                                # Strip leading newlines from very first text
+                                if not accumulated_text:
+                                    append_text = append_text.lstrip('\n')
+                                if not append_text:
+                                    continue
                                 print(f"[Gemini] text: +{len(append_text)} chars (total: {len(accumulated_text)}): {append_text[:80]}", flush=True)
                                 spacing = ""
                                 if accumulated_text and not accumulated_text.endswith('\n') and not append_text.startswith('\n'):
@@ -5689,6 +5760,7 @@ def handle_message(chat_id, text):
     # Get active session
     session = get_active_session(chat_id)
     session_id = get_session_id(session) if session else str(chat_id)
+    print(f"[handle_message] session={session.get('name') if session else None}, last_cli={session.get('last_cli') if session else None}, id={id(session) if session else None}", flush=True)
 
     # Atomically check if Claude is running and either queue or launch
     lock = get_session_lock(session_id)
@@ -5718,7 +5790,8 @@ def handle_message(chat_id, text):
 
     # Dispatch to the appropriate CLI runner based on session state
     last_cli = session.get("last_cli", "Claude") if session else "Claude"
-    
+    print(f"[DISPATCH] last_cli={last_cli}, session_name={session.get('name') if session else None}, id={id(session)}", flush=True)
+
     if last_cli == "Codex":
         run_codex_task(chat_id, text, session["cwd"], session=session)
     elif last_cli == "Gemini":
@@ -5836,6 +5909,28 @@ def main():
         print(f"API server failed to start: {e}", flush=True)
         import traceback
         traceback.print_exc()
+
+    # Graceful shutdown: terminate child processes and flush state on SIGTERM
+    def _graceful_shutdown(signum, frame):
+        print(f"[SHUTDOWN] Received signal {signum}, cleaning up...", flush=True)
+        # Terminate all active CLI subprocesses
+        for key, proc in list(active_processes.items()):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                print(f"[SHUTDOWN] Terminated process {proc.pid} ({key})", flush=True)
+            except Exception:
+                pass
+        # Flush session state to disk
+        try:
+            save_sessions(force=True)
+            print("[SHUTDOWN] Sessions saved.", flush=True)
+        except Exception:
+            pass
+        print("[SHUTDOWN] Cleanup complete, exiting.", flush=True)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
 
     while True:
         updates = get_updates(last_update_id + 1)
