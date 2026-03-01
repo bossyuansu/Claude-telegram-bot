@@ -160,10 +160,13 @@ def post_message(req: MessageRequest, _=Depends(verify_auth)):
     # Echo user message to TG chat so it appears in the conversation
     # Skip echo for slash commands — the command handler sends its own response
     # Use _send_message_no_ws to avoid WS echo back to the app (app already shows it locally)
+    # Fire-and-forget via thread to avoid blocking the API on slow TG responses
     if not text.startswith("/"):
         echo_fn = _send_message_no_ws or _send_message
         if echo_fn:
-            echo_fn(chat_id, f"\U0001F4F1 {text}", parse_mode=None)
+            import threading
+            threading.Thread(target=echo_fn, args=(chat_id, f"\U0001F4F1 {text}"),
+                           kwargs={"parse_mode": None}, daemon=True).start()
 
     if text.startswith("/"):
         handled = _handle_command(chat_id, text)

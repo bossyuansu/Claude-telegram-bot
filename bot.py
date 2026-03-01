@@ -579,11 +579,13 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
 
     # Retry logic for forced edits (final updates that must reach the user)
     max_attempts = 3 if force else 1
+    # Non-forced edits are disposable progress updates — use short timeout
+    # to avoid blocking the stream loop when TG is slow
+    timeout = (3.0, 7.0) if force else (2.0, 3.0)
 
     for attempt in range(max_attempts):
         try:
-            # Shorter timeouts for edit as well to prevent blocking
-            resp = requests.post(f"{API_URL}/editMessageText", json=payload, timeout=(3.0, 7.0))
+            resp = requests.post(f"{API_URL}/editMessageText", json=payload, timeout=timeout)
             result = resp.json()
             if not result.get("ok"):
                 error_desc = result.get("description", "")
@@ -5772,7 +5774,10 @@ def handle_message(chat_id, text):
             message_queue[session_id].append(text)
             queue_pos = len(message_queue[session_id])
             session_name = session.get("name", "default") if session else "default"
-            send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for session `{session_name}`. Will process after current task._")
+            # Send notification outside the lock to avoid blocking other threads on slow TG API
+            threading.Thread(target=send_message, args=(chat_id,
+                f"📋 _Message queued (#{queue_pos}) for session `{session_name}`. Will process after current task._"),
+                daemon=True).start()
             return
 
         # Check memory pressure before launching new Claude process
