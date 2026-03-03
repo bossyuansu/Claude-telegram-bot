@@ -69,7 +69,10 @@ class SettingsRepository(context: Context) {
         synchronized(wsStateLock) {
             val currentSeq = prefs.getInt("last_seq", 0)
             val currentServerId = prefs.getString("known_server_id", "") ?: ""
-            val nextSeq = maxOf(currentSeq, seq)
+            val serverChanged = serverId.isNotBlank() && currentServerId != serverId
+            // Seq monotonicity is per server instance. If server_id changed,
+            // reset baseline to the new server's sequence space.
+            val nextSeq = if (serverChanged) maxOf(0, seq) else maxOf(currentSeq, seq)
             val now = System.currentTimeMillis()
             if (nextSeq == currentSeq && currentServerId == serverId) {
                 prefs.edit().putLong("ws_last_sync_at", now).apply()

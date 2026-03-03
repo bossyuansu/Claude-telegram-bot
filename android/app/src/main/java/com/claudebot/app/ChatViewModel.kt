@@ -63,6 +63,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     data class SessionInfo(val name: String, val busy: Boolean, val isActive: Boolean, val lastCli: String)
     val sessionList = mutableStateListOf<SessionInfo>()
 
+    // Session filter state
+    val sessionFilter = mutableStateOf<String?>(null)
+    val availableSessions = mutableStateListOf<String>()
+    /** Incremented on every filter change; in-flight loads compare to detect staleness. */
+    private var filterGeneration = 0
+
     // Paging state
     val isLoadingMore = mutableStateOf(false)
     val allLoaded = mutableStateOf(false)
@@ -80,6 +86,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val httpClient = OkHttpClient()
     private var dbOffset = 0 // How many messages loaded from DB so far
     private val sendExecutor = Executors.newSingleThreadExecutor() // Serialize outgoing HTTP requests
+    @Volatile private var wsStateReady = false
 
     /** Message IDs being tracked via WS-native stream events (ignore legacy edit events for these). */
     private val streamingMessageIds = mutableSetOf<Int>()
@@ -109,17 +116,25 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         when (event) {
             Lifecycle.Event.ON_START -> {
                 isInForeground = true
+                WsConnectionGate.setForegroundActive(true)
+                // Foreground owns WS and can preempt any background catch-up run.
+                WsConnectionGate.acquireForeground()
                 // Clear message notifications when app comes to foreground
                 val nm = application.getSystemService(NotificationManager::class.java)
                 nm.cancelAll()
                 // Foreground owns the live WS. Stop background catch-up worker.
                 if (settings.isConfigured) {
                     cancelSyncWorkers()
-                    connect()
+                    if (wsStateReady) {
+                        val (lastSeq, knownServerId) = settings.getWsState()
+                        wsManager.restoreState(lastSeq, knownServerId)
+                        connect()
+                    }
                 }
             }
             Lifecycle.Event.ON_STOP -> {
                 isInForeground = false
+                WsConnectionGate.setForegroundActive(false)
                 // Background mode: release live WS and rely on periodic catch-up.
                 if (settings.isConfigured) {
                     disconnect()
@@ -181,6 +196,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     finalizedMessageIds.addAll(dao.getFinalizedMessageIds("———"))
                 }
                 loadInitialMessages()
+                fetchLocalSessions()
                 android.util.Log.d("WS", "init: loaded ${messages.size} messages, configured=${settings.isConfigured}")
                 // Scroll to bottom after loading history
                 if (messages.isNotEmpty()) scrollTrigger.value++
@@ -189,7 +205,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val (lastSeq, knownServerId) = settings.getWsState()
                     // Restore WS seq state so reconnect doesn't replay everything.
                     wsManager.restoreState(lastSeq, knownServerId)
-                    connect()
+                    wsStateReady = true
+                    if (ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                        connect()
+                    }
                 }
             } catch (e: Exception) {
                 android.util.Log.e("WS", "init FAILED", e)
@@ -262,13 +281,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun loadMore() {
         if (isLoadingMore.value || allLoaded.value) return
         isLoadingMore.value = true
+        val gen = filterGeneration
+        val filter = sessionFilter.value
+        val currentOffset = dbOffset
         viewModelScope.launch {
-            val entities = withContext(Dispatchers.IO) { dao.getPage(PAGE_SIZE, dbOffset) }
+            val entities = withContext(Dispatchers.IO) {
+                if (filter != null) dao.getPageBySession(filter, PAGE_SIZE, currentOffset)
+                else dao.getPage(PAGE_SIZE, currentOffset)
+            }
+            // Discard if filter changed while we were loading
+            if (gen != filterGeneration) {
+                isLoadingMore.value = false
+                return@launch
+            }
             if (entities.isEmpty()) {
                 allLoaded.value = true
             } else {
                 val older = entities.reversed().map { it.toChatMessage() }
-                // Prepend to the beginning
                 messages.addAll(0, older)
                 dbOffset += entities.size
                 rebuildIndex()
@@ -278,14 +307,54 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun fetchLocalSessions() {
+        viewModelScope.launch {
+            val sessions = withContext(Dispatchers.IO) { dao.getDistinctSessions() }
+            availableSessions.clear()
+            availableSessions.addAll(sessions)
+        }
+    }
+
+    fun setSessionFilter(session: String?) {
+        sessionFilter.value = session
+        filterGeneration++
+        val gen = filterGeneration
+        messages.clear()
+        idToIndex.clear()
+        dbOffset = 0
+        allLoaded.value = false
+        isLoadingMore.value = false
+        viewModelScope.launch {
+            val entities = withContext(Dispatchers.IO) {
+                if (session != null) dao.getPageBySession(session, PAGE_SIZE, 0)
+                else dao.getPage(PAGE_SIZE, 0)
+            }
+            // Discard if another filter change happened while loading
+            if (gen != filterGeneration) return@launch
+            val chatMsgs = entities.reversed().map { it.toChatMessage() }
+            messages.addAll(chatMsgs)
+            rebuildIndex()
+            dbOffset = entities.size
+            if (entities.size < PAGE_SIZE) allLoaded.value = true
+            if (messages.isNotEmpty()) scrollTrigger.value++
+        }
+    }
+
+    private fun matchesSessionFilter(session: String): Boolean {
+        val filter = sessionFilter.value ?: return true
+        return session == filter
+    }
+
     fun connect() {
         android.util.Log.d("WS", "ChatViewModel.connect() configured=${settings.isConfigured} url=${settings.wsUrl()}")
         if (!settings.isConfigured) return
+        WsConnectionGate.acquireForeground()
         wsManager.connect(settings.wsUrl())
     }
 
     fun disconnect() {
         wsManager.disconnect()
+        WsConnectionGate.release(WsConnectionGate.OWNER_FOREGROUND)
     }
 
     fun reconnect() {
@@ -548,16 +617,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         buttons = msg.buttons
                     )
 
-                    val idx = messages.size
-                    messages.add(chatMsg)
+                    val showInUi = matchesSessionFilter(msg.session)
+                    if (showInUi) {
+                        val idx = messages.size
+                        messages.add(chatMsg)
+                        if (mid > 0) idToIndex[mid] = idx
+                        scrollTrigger.value++
+                    }
                     if (mid > 0) {
-                        idToIndex[mid] = idx
                         persistedMessageIds.add(mid)
                         pendingIncomingMessageIds.add(mid)
                     }
-                    scrollTrigger.value++
                     val actionable = msg.buttons.flatten().isNotEmpty()
-                    if (actionable) {
+                    if (actionable && showInUi) {
                         pendingAction.value = PendingAction(msg.text, msg.buttons, mid)
                         notifyIfBackgrounded(
                             text = msg.text,
@@ -568,6 +640,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             isReplay = msg.isReplay
                         )
                     }
+                    if (msg.session.isNotEmpty() && msg.session !in availableSessions) {
+                        availableSessions.add(msg.session)
+                    }
                     viewModelScope.launch(Dispatchers.IO) {
                         try {
                             if (mid > 0) {
@@ -575,7 +650,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             } else {
                                 dao.insert(chatMsg.toEntity())
                             }
-                            dbOffset++
+                            if (showInUi) dbOffset++
                         } finally {
                             if (mid > 0) {
                                 withContext(Dispatchers.Main) { pendingIncomingMessageIds.remove(mid) }
@@ -627,14 +702,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             isReplay = msg.isReplay,
                             timestamp = System.currentTimeMillis()
                         )
-                        val newIdx = messages.size
-                        messages.add(chatMsg)
-                        idToIndex[mid] = newIdx
                         persistedMessageIds.add(mid)
-                        scrollTrigger.value++
+                        val editShowInUi = matchesSessionFilter(msg.session)
+                        if (editShowInUi) {
+                            val newIdx = messages.size
+                            messages.add(chatMsg)
+                            idToIndex[mid] = newIdx
+                            scrollTrigger.value++
+                        }
                         viewModelScope.launch(Dispatchers.IO) {
                             dao.upsertByMessageId(chatMsg.toEntity())
-                            dbOffset++
+                            if (editShowInUi) dbOffset++
                         }
                     }
                 }
@@ -652,7 +730,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 val existing = findMessageIndex(mid)
                 if (existing != null) {
-                    if (messages[existing].text.contains("———")) return  // Already finalized, skip
+                    if (messages[existing].text.contains("———")) {
+                        streamingMessageIds.remove(mid)
+                        return  // Already finalized, skip
+                    }
                     messages[existing] = messages[existing].copy(
                         text = "",
                         isReplay = messages[existing].isReplay || msg.isReplay
@@ -667,16 +748,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     return
                 }
 
-                // New stream message: create in memory immediately to preserve event order.
+                // New stream message
                 val chatMsg = ChatMessage(
                     messageId = mid, text = "", isFromBot = true,
                     session = msg.session, isReplay = msg.isReplay, timestamp = System.currentTimeMillis()
                 )
-                val idx = messages.size
-                messages.add(chatMsg)
-                idToIndex[mid] = idx
                 persistedMessageIds.add(mid)
-                scrollTrigger.value++
+                if (msg.session.isNotEmpty() && msg.session !in availableSessions) {
+                    availableSessions.add(msg.session)
+                }
+                if (matchesSessionFilter(msg.session)) {
+                    val idx = messages.size
+                    messages.add(chatMsg)
+                    idToIndex[mid] = idx
+                    scrollTrigger.value++
+                }
                 viewModelScope.launch(Dispatchers.IO) {
                     dao.upsertByMessageId(chatMsg.toEntity())
                 }
@@ -695,6 +781,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (idx == null) {
                     // Replayed append for a finalized message we already have in DB: ignore.
                     if (msg.isReplay && mid in finalizedMessageIds) return
+                    // Filtered-out session: skip in-memory tracking
+                    if (!matchesSessionFilter(msg.session)) return
                     val chatMsg = ChatMessage(
                         messageId = mid, text = "", isFromBot = true,
                         session = msg.session, isReplay = msg.isReplay, timestamp = System.currentTimeMillis()
@@ -709,6 +797,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     idx = newIdx
                 }
                 val appendIdx = idx
+                if (messages[appendIdx].text.contains("———")) {
+                    // Terminal text is authoritative; ignore late append replay/update.
+                    streamingMessageIds.remove(mid)
+                    lastStreamPersist.remove(mid)
+                    finalizedMessageIds.add(mid)
+                    return
+                }
                 // Strip tool status line if present before appending text
                 var currentText = messages[appendIdx].text
                 if (currentText.endsWith("\u200B")) {
@@ -811,12 +906,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         timestamp = System.currentTimeMillis(),
                         fileChanges = parsedChanges
                     )
-                    val newIdx = messages.size
-                    messages.add(chatMsg)
-                    idToIndex[mid] = newIdx
                     persistedMessageIds.add(mid)
                     finalizedMessageIds.add(mid)
-                    scrollTrigger.value++
+                    if (msg.session.isNotEmpty() && msg.session !in availableSessions) {
+                        availableSessions.add(msg.session)
+                    }
+                    if (matchesSessionFilter(msg.session)) {
+                        val newIdx = messages.size
+                        messages.add(chatMsg)
+                        idToIndex[mid] = newIdx
+                        scrollTrigger.value++
+                    }
                     notifyIfBackgrounded(
                         text = finalText,
                         session = chatMsg.session,

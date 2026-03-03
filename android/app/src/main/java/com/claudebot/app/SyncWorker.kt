@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.claudebot.app.data.AppDatabase
@@ -15,6 +16,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.*
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import java.util.concurrent.TimeUnit
 
@@ -29,6 +31,7 @@ class SyncWorker(
 ) : CoroutineWorker(context, params) {
 
     companion object {
+        private const val TAG = "SyncWorker"
         const val WORK_NAME = "ws_sync"
         const val IMMEDIATE_WORK_NAME = "ws_sync_immediate"
         private const val MSG_CHANNEL_ID = "bot_messages"
@@ -50,175 +53,224 @@ class SyncWorker(
     override suspend fun doWork(): Result {
         val settings = SettingsRepository(applicationContext)
         if (!settings.isConfigured) return Result.success()
-
-        val lastSeq = settings.lastSeq
-        val knownServerId = settings.knownServerId
-        val dao = AppDatabase.get(applicationContext).messageDao()
-
-        val client = OkHttpClient.Builder()
-            .readTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .pingInterval(10, TimeUnit.SECONDS)
-            .build()
-
-        // Build WS URL with last_seq
-        val baseUrl = settings.wsUrl()
-        val connectUrl = if (lastSeq > 0) {
-            val sep = if (baseUrl.contains("?")) "&" else "?"
-            "${baseUrl}${sep}last_seq=$lastSeq"
-        } else {
-            baseUrl
+        if (WsConnectionGate.isForegroundActive()) {
+            Log.d(TAG, "Skipping sync: app is in foreground")
+            return Result.success()
+        }
+        if (!WsConnectionGate.tryAcquireBackground()) {
+            Log.d(TAG, "Skipping sync: WS owner=${WsConnectionGate.currentOwner()}")
+            return Result.success()
         }
 
-        val collected = mutableListOf<JSONObject>()
-        val done = CompletableDeferred<Unit>()
-        var newLastSeq = lastSeq
-        var newServerId = knownServerId
-        var syncError = ""
-
-        val request = Request.Builder().url(connectUrl).build()
-        val ws = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                // Connection opened — server will send server_hello then replay
+        try {
+            if (WsConnectionGate.isForegroundActive()) {
+                Log.d(TAG, "Skipping sync after acquire: app moved to foreground")
+                return Result.success()
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                try {
-                    val json = JSONObject(text)
-                    val type = json.optString("type", "")
+            val lastSeq = settings.lastSeq
+            val knownServerId = settings.knownServerId
+            val dao = AppDatabase.get(applicationContext).messageDao()
 
-                    if (type == "server_hello") {
-                        val serverId = json.optString("server_id", "")
-                        if (serverId != knownServerId) {
-                            // Server restarted — accept new numbering
-                            newServerId = serverId
-                            newLastSeq = 0
-                        }
+            val client = OkHttpClient.Builder()
+                .readTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .pingInterval(10, TimeUnit.SECONDS)
+                .build()
+
+            // Build WS URL with last_seq
+            val baseUrl = settings.wsUrl()
+            val connectUrl = if (lastSeq > 0) {
+                val sep = if (baseUrl.contains("?")) "&" else "?"
+                "${baseUrl}${sep}last_seq=$lastSeq"
+            } else {
+                baseUrl
+            }
+
+            val collected = mutableListOf<JSONObject>()
+            val done = CompletableDeferred<Unit>()
+            var newLastSeq = lastSeq
+            var newServerId = knownServerId
+            var syncError = ""
+            val abortedByForeground = AtomicBoolean(false)
+
+            fun ownershipLost(): Boolean {
+                if (WsConnectionGate.isForegroundActive()) return true
+                return WsConnectionGate.currentOwner() != WsConnectionGate.OWNER_BACKGROUND
+            }
+
+            val request = Request.Builder().url(connectUrl).build()
+            val ws = client.newWebSocket(request, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    if (ownershipLost()) {
+                        abortedByForeground.set(true)
+                        webSocket.close(1000, "foreground active")
+                        done.complete(Unit)
                         return
                     }
-
-                    val seq = json.optInt("seq", 0)
-                    if (seq > newLastSeq) {
-                        newLastSeq = seq
-                    }
-
-                    // Collect replay frames we can persist and/or notify from.
-                    if (type == "message" || type == "edit" || (type == "stream" && json.optString("op") == "done")) {
-                        collected.add(json)
-                    }
-                } catch (_: Exception) {}
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                syncError = t.message ?: "WebSocket failure"
-                done.complete(Unit)
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                done.complete(Unit)
-            }
-        })
-
-        // Wait for messages to arrive, then close after a brief window
-        // The server sends replay immediately on connect, so 5s is plenty
-        withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
-            // Give the server time to replay, then close
-            kotlinx.coroutines.delay(5_000)
-        }
-        ws.close(1000, "sync done")
-        // Wait for close confirmation briefly
-        withTimeoutOrNull(2_000) { done.await() }
-        client.dispatcher.executorService.shutdown()
-
-        // Save collected messages to DB and accumulate notification candidates.
-        val notificationsBySession = linkedMapOf<String, NotificationCandidate>()
-        for (json in collected) {
-            val type = json.optString("type", "")
-            val messageId = if (json.has("message_id") && !json.isNull("message_id"))
-                json.getInt("message_id") else 0
-            val session = json.optString("session", "")
-
-            if (type == "edit" && messageId > 0) {
-                val text = json.optString("text", "")
-                // Preserve existing button payload on edit.
-                val existing = dao.findByMessageId(messageId)
-                val buttons = existing?.buttons ?: ""
-                dao.updateByMessageId(messageId, text, session, buttons)
-            } else if (type == "message") {
-                val text = json.optString("text", "")
-                val buttonsJson = extractButtonsJson(json)
-                if (messageId > 0) {
-                    dao.upsertByMessageId(
-                        MessageEntity(
-                            messageId = messageId,
-                            text = text,
-                            isFromBot = true,
-                            session = session,
-                            buttons = buttonsJson
-                        )
-                    )
-                } else {
-                    dao.insert(
-                        MessageEntity(
-                            messageId = messageId,
-                            text = text,
-                            isFromBot = true,
-                            session = session,
-                            buttons = buttonsJson
-                        )
-                    )
+                    // Connection opened — server will send server_hello then replay
                 }
 
-                val actions = extractButtons(json)
-                if (actions.isNotEmpty() && messageId > 0) {
-                    val sessionKey = session.ifBlank { "default" }
-                    notificationsBySession[sessionKey] = NotificationCandidate(
-                        session = session,
-                        messageId = messageId,
-                        text = text,
-                        eventType = NOTIFY_EVENT_ACTIONABLE,
-                        buttons = actions
-                    )
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (ownershipLost()) {
+                        abortedByForeground.set(true)
+                        webSocket.close(1000, "foreground active")
+                        done.complete(Unit)
+                        return
+                    }
+                    try {
+                        val json = JSONObject(text)
+                        val type = json.optString("type", "")
+
+                        if (type == "server_hello") {
+                            val serverId = json.optString("server_id", "")
+                            if (serverId != knownServerId) {
+                                // Server restarted — accept new numbering
+                                newServerId = serverId
+                                newLastSeq = 0
+                            }
+                            return
+                        }
+
+                        val seq = json.optInt("seq", 0)
+                        if (seq > newLastSeq) {
+                            newLastSeq = seq
+                        }
+
+                        // Collect replay frames we can persist and/or notify from.
+                        if (type == "message" || type == "edit" || (type == "stream" && json.optString("op") == "done")) {
+                            collected.add(json)
+                        }
+                    } catch (_: Exception) {}
                 }
-            } else if (type == "stream" && json.optString("op") == "done") {
-                val finalText = buildTerminalText(json)
-                if (messageId > 0) {
-                    dao.upsertByMessageId(
-                        MessageEntity(
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    if (!abortedByForeground.get()) {
+                        syncError = t.message ?: "WebSocket failure"
+                    }
+                    done.complete(Unit)
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    done.complete(Unit)
+                }
+            })
+
+            // Wait for messages to arrive, then close after a brief window.
+            // Exit early if foreground takes over.
+            val start = System.currentTimeMillis()
+            withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
+                while (!done.isCompleted && System.currentTimeMillis() - start < 5_000) {
+                    if (ownershipLost()) {
+                        abortedByForeground.set(true)
+                        break
+                    }
+                    kotlinx.coroutines.delay(200)
+                }
+            }
+
+            ws.close(1000, if (abortedByForeground.get()) "foreground active" else "sync done")
+            // Wait for close confirmation briefly
+            withTimeoutOrNull(2_000) { done.await() }
+            client.dispatcher.executorService.shutdown()
+
+            if (abortedByForeground.get()) {
+                Log.d(TAG, "Aborted sync: foreground took WS ownership")
+                return Result.success()
+            }
+
+            // Save collected messages to DB and accumulate notification candidates.
+            val notificationsBySession = linkedMapOf<String, NotificationCandidate>()
+            for (json in collected) {
+                val type = json.optString("type", "")
+                val messageId = if (json.has("message_id") && !json.isNull("message_id"))
+                    json.getInt("message_id") else 0
+                val session = json.optString("session", "")
+
+                if (type == "edit" && messageId > 0) {
+                    val text = json.optString("text", "")
+                    // Preserve existing button payload on edit.
+                    val existing = dao.findByMessageId(messageId)
+                    val buttons = existing?.buttons ?: ""
+                    dao.updateByMessageId(messageId, text, session, buttons)
+                } else if (type == "message") {
+                    val text = json.optString("text", "")
+                    val buttonsJson = extractButtonsJson(json)
+                    if (messageId > 0) {
+                        dao.upsertByMessageId(
+                            MessageEntity(
+                                messageId = messageId,
+                                text = text,
+                                isFromBot = true,
+                                session = session,
+                                buttons = buttonsJson
+                            )
+                        )
+                    } else {
+                        dao.insert(
+                            MessageEntity(
+                                messageId = messageId,
+                                text = text,
+                                isFromBot = true,
+                                session = session,
+                                buttons = buttonsJson
+                            )
+                        )
+                    }
+
+                    val actions = extractButtons(json)
+                    if (actions.isNotEmpty() && messageId > 0) {
+                        val sessionKey = session.ifBlank { "default" }
+                        notificationsBySession[sessionKey] = NotificationCandidate(
+                            session = session,
+                            messageId = messageId,
+                            text = text,
+                            eventType = NOTIFY_EVENT_ACTIONABLE,
+                            buttons = actions
+                        )
+                    }
+                } else if (type == "stream" && json.optString("op") == "done") {
+                    val finalText = buildTerminalText(json)
+                    if (messageId > 0) {
+                        dao.upsertByMessageId(
+                            MessageEntity(
+                                messageId = messageId,
+                                text = finalText,
+                                isFromBot = true,
+                                session = session
+                            )
+                        )
+                    }
+                    if (messageId > 0) {
+                        val sessionKey = session.ifBlank { "default" }
+                        notificationsBySession[sessionKey] = NotificationCandidate(
+                            session = session,
                             messageId = messageId,
                             text = finalText,
-                            isFromBot = true,
-                            session = session
+                            eventType = NOTIFY_EVENT_TERMINAL
                         )
-                    )
-                }
-                if (messageId > 0) {
-                    val sessionKey = session.ifBlank { "default" }
-                    notificationsBySession[sessionKey] = NotificationCandidate(
-                        session = session,
-                        messageId = messageId,
-                        text = finalText,
-                        eventType = NOTIFY_EVENT_TERMINAL
-                    )
+                    }
                 }
             }
-        }
-        dao.deleteDuplicateMessageIds()
+            dao.deleteDuplicateMessageIds()
 
-        // Persist updated seq
-        if (newLastSeq > lastSeq || newServerId != knownServerId) {
-            settings.updateWsState(newLastSeq, newServerId)
-        } else {
-            // Successful sync window even if no new messages.
-            settings.wsLastSyncAt = System.currentTimeMillis()
-        }
+            // Persist updated seq
+            if (newLastSeq > lastSeq || newServerId != knownServerId) {
+                settings.updateWsState(newLastSeq, newServerId)
+            } else {
+                // Successful sync window even if no new messages.
+                settings.wsLastSyncAt = System.currentTimeMillis()
+            }
 
-        settings.wsLastError = syncError
+            settings.wsLastError = syncError
 
-        // Notify only actionable or terminal events, grouped by session + deduped by message ID.
-        for (candidate in notificationsBySession.values) {
-            showNotification(candidate, settings)
+            // Notify only actionable or terminal events, grouped by session + deduped by message ID.
+            for (candidate in notificationsBySession.values) {
+                showNotification(candidate, settings)
+            }
+            return if (syncError.isNotBlank()) Result.retry() else Result.success()
+        } finally {
+            WsConnectionGate.release(WsConnectionGate.OWNER_BACKGROUND)
         }
-        return if (syncError.isNotBlank()) Result.retry() else Result.success()
     }
 
     private fun showNotification(candidate: NotificationCandidate, settings: SettingsRepository) {

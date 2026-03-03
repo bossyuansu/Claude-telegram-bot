@@ -1,6 +1,8 @@
 package com.claudebot.app.ui.components
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -51,6 +53,10 @@ fun MessageBubble(
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     var showCopied by remember { mutableStateOf(false) }
+    val borderFlashColor by animateColorAsState(
+        targetValue = if (showCopied) AccentOrange else BotBubbleBorder,
+        animationSpec = tween(300), label = "copyFlash"
+    )
     val isBot = message.isFromBot
     val alignment = if (isBot) Alignment.Start else Alignment.End
     val bubbleColor = if (isBot) BotBubble else UserBubble
@@ -78,7 +84,7 @@ fun MessageBubble(
         }
 
         val borderMod = if (isBot) {
-            Modifier.border(1.dp, BotBubbleBorder, shape)
+            Modifier.border(1.dp, borderFlashColor, shape)
         } else {
             Modifier
         }
@@ -307,6 +313,8 @@ private fun FileChangeItem(change: FileChange) {
     val icon = when (change.type) {
         "edit" -> "✏️"
         "write" -> "📝"
+        "delete" -> "🗑️"
+        "move" -> "📦"
         "bash" -> "⚡"
         "read" -> "📖"
         "glob" -> "🔍"

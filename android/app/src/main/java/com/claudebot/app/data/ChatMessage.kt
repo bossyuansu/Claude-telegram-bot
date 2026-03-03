@@ -6,7 +6,7 @@ data class InlineButton(
 )
 
 data class FileChange(
-    val type: String,       // "edit", "write", "bash", "read", "glob", "grep"
+    val type: String,       // "edit", "write", "delete", "move", "bash", "read", "glob", "grep"
     val path: String,
     val old: String = "",   // For edit: old_string
     val new: String = "",   // For edit: new_string

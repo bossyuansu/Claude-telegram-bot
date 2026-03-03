@@ -1,5 +1,16 @@
 package com.claudebot.app.ui.components
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,14 +26,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import com.claudebot.app.speech.SpeechRecognizerState
+import com.claudebot.app.speech.rememberSpeechRecognizerState
 import com.claudebot.app.ui.theme.*
+import kotlinx.coroutines.launch
 
 private data class BotCommand(val cmd: String, val desc: String, val needsArgs: Boolean)
 
@@ -60,6 +78,20 @@ fun InputBar(
     var showMenu by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
     val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val sendScale = remember { Animatable(1f) }
+
+    // Speech recognition (state holder manages recognizer lifecycle)
+    val speechState = rememberSpeechRecognizerState { transcribed ->
+        text = if (text.isBlank()) transcribed else "$text $transcribed"
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) speechState.startListening()
+    }
 
     // Filter commands when user is typing a slash command
     val typedCmd = text.trim()
@@ -71,7 +103,11 @@ fun InputBar(
 
     Column {
         // Command autocomplete suggestions (shown above input)
-        if (suggestions.isNotEmpty()) {
+        AnimatedVisibility(
+            visible = suggestions.isNotEmpty(),
+            enter = fadeIn() + slideInVertically { it / 2 },
+            exit = fadeOut() + slideOutVertically { it / 2 }
+        ) {
             Surface(
                 color = DarkSurface,
                 shadowElevation = 4.dp,
@@ -219,18 +255,42 @@ fun InputBar(
                     ) {
                         Text("\u25A0", style = MaterialTheme.typography.titleMedium)
                     }
+                } else if (text.isBlank() && enabled && speechState.isAvailable) {
+                    // Mic button for voice input with pulse while listening
+                    MicButton(
+                        isListening = speechState.isListening,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            if (speechState.isListening) {
+                                speechState.stopListening()
+                            } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                speechState.startListening()
+                            } else {
+                                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        }
+                    )
                 } else {
-                    // Send button
+                    // Send button with punch animation
                     FilledIconButton(
                         onClick = {
                             if (text.isNotBlank()) {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                scope.launch {
+                                    sendScale.animateTo(0.7f, tween(50))
+                                    sendScale.animateTo(1.1f, tween(80))
+                                    sendScale.animateTo(1f, tween(70))
+                                }
                                 onSend(text.trim())
                                 text = ""
                                 keyboard?.hide()
                             }
                         },
                         enabled = enabled && text.isNotBlank(),
+                        modifier = Modifier.graphicsLayer(
+                            scaleX = sendScale.value,
+                            scaleY = sendScale.value
+                        ),
                         colors = IconButtonDefaults.filledIconButtonColors(
                             containerColor = AccentOrange,
                             contentColor = UserBubbleText,
@@ -243,5 +303,54 @@ fun InputBar(
                 }
             }
         }
+    }
+}
+
+/** Mic button with pulse animation while actively listening. */
+@Composable
+internal fun MicButton(
+    isListening: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val scale = remember { Animatable(1f) }
+    val alpha = remember { Animatable(1f) }
+
+    LaunchedEffect(isListening) {
+        if (isListening) {
+            launch {
+                while (true) {
+                    scale.animateTo(1.3f, tween(600))
+                    scale.animateTo(1f, tween(600))
+                }
+            }
+            launch {
+                while (true) {
+                    alpha.animateTo(0.5f, tween(600))
+                    alpha.animateTo(1f, tween(600))
+                }
+            }
+        } else {
+            scale.snapTo(1f)
+            alpha.snapTo(1f)
+        }
+    }
+
+    FilledIconButton(
+        onClick = onClick,
+        modifier = modifier
+            .size(40.dp)
+            .testTag(if (isListening) "mic_listening" else "mic_idle")
+            .graphicsLayer(
+                scaleX = scale.value,
+                scaleY = scale.value,
+                alpha = alpha.value
+            ),
+        colors = IconButtonDefaults.filledIconButtonColors(
+            containerColor = if (isListening) DisconnectedRed else AccentOrange.copy(alpha = 0.7f),
+            contentColor = UserBubbleText,
+        )
+    ) {
+        Text("\uD83C\uDFA4", fontSize = 16.sp)
     }
 }

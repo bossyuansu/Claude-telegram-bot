@@ -39,6 +39,9 @@ class WebSocketManager(
 ) {
     companion object {
         private const val TAG = "WS"
+        // If replay starts far ahead of expected seq, missed frames are likely
+        // outside the server's bounded buffer. Fast-forward to avoid deadlock.
+        private const val REPLAY_GAP_FAST_FORWARD = 200
     }
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -145,12 +148,12 @@ class WebSocketManager(
                         // the first replayed message has, since old numbering is gone.
                         if (changed) {
                             // Reset in-memory seq tracking (0 = accept next seq as starting point)
-                            // but keep lastSeq for reconnect — server handles last_seq > _ws_seq
+                            // and reset persisted seq baseline to this new server instance.
                             expectedSeq = 0
+                            lastSeq = 0
                             pendingBuffer.clear()
                             resendRequested = false
-                            // Persist new serverId but keep lastSeq intact
-                            onSeqUpdate?.invoke(lastSeq, serverId)
+                            onSeqUpdate?.invoke(0, serverId)
                         }
                         knownServerId = serverId
                         return
@@ -200,6 +203,14 @@ class WebSocketManager(
                                     .put("from_seq", expectedSeq)
                                     .toString()
                                 webSocket.send(resendReq)
+                            }
+                            if (msg.isReplay && (seq - expectedSeq) > REPLAY_GAP_FAST_FORWARD) {
+                                val next = pendingBuffer.firstKey()
+                                Log.w(TAG, "Large replay gap (${seq - expectedSeq}); fast-forwarding expectedSeq to $next")
+                                expectedSeq = next
+                                lastSeq = next - 1
+                                resendRequested = false
+                                flushPending()
                             }
                         }
                     }

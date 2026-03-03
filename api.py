@@ -57,6 +57,21 @@ def _with_replay_flag(payload: str, is_replay: bool) -> str:
         return payload
 
 
+def _should_buffer_event(event_type: str, data: dict, has_clients: bool) -> bool:
+    """Decide whether this event should be retained in replay buffer.
+
+    Preserve stream continuity (`start/append/done`) across reconnects.
+    Only low-value stream noise (`tool/skip`) is dropped while offline.
+    """
+    if event_type != "stream":
+        return True
+
+    op = str(data.get("op", "")).lower()
+    if op in {"tool", "skip"} and not has_clients:
+        return False
+    return True
+
+
 def init_refs(**kwargs):
     """Receive references to bot.py functions and shared dicts."""
     global _handle_command, _handle_message, _handle_callback_query
@@ -114,6 +129,17 @@ def broadcast_ws(chat_id, event_type, data):
     global _ws_seq
 
     with _ws_lock:
+        clients = list(_ws_clients)
+        has_clients = bool(clients)
+        should_buffer = _should_buffer_event(event_type, data, has_clients)
+
+        # No connected clients and this is low-value stream noise: drop it instead
+        # of storing replay clutter that can surface later.
+        if not has_clients and not should_buffer:
+            op = data.get("op", "")
+            print(f"[WS] No clients — dropped noise event type={event_type} op={op}", flush=True)
+            return
+
         _ws_seq += 1
         seq = _ws_seq
         payload = json.dumps({
@@ -124,15 +150,14 @@ def broadcast_ws(chat_id, event_type, data):
             **data,
         })
 
-        # Always buffer for replay on reconnect (filtered at replay time)
-        _ws_buffer.append((seq, payload))
-        if len(_ws_buffer) > _WS_BUFFER_MAX:
-            _ws_buffer.pop(0)
+        if should_buffer:
+            _ws_buffer.append((seq, payload))
+            if len(_ws_buffer) > _WS_BUFFER_MAX:
+                _ws_buffer.pop(0)
 
-        clients = list(_ws_clients)
-
-    if not clients:
-        print(f"[WS] No clients — buffered seq={seq} ({len(_ws_buffer)} queued)", flush=True)
+    if not has_clients:
+        op = data.get("op", "")
+        print(f"[WS] No clients — buffered seq={seq} type={event_type} op={op} ({len(_ws_buffer)} queued)", flush=True)
         return
 
     print(f"[WS] Broadcasting {event_type} seq={seq} to {len(clients)} client(s)", flush=True)

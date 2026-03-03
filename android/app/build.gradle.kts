@@ -14,6 +14,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -39,6 +40,18 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.8"
     }
+
+    testOptions {
+        managedDevices {
+            localDevices {
+                create("pixel2api30") {
+                    device = "Pixel 2"
+                    apiLevel = 30
+                    systemImageSource = "aosp-atd"
+                }
+            }
+        }
+    }
 }
 
 dependencies {
@@ -62,4 +75,22 @@ dependencies {
 
     // WorkManager for periodic background sync
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    // Unit tests
+    testImplementation("junit:junit:4.13.2")
+
+    // Instrumented / Compose UI tests
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("androidx.test:runner:1.5.2")
+    androidTestImplementation("androidx.test:core-ktx:1.5.0")
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.02.00"))
+    androidTestImplementation("androidx.compose.ui:ui-test")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // Room integration tests
+    androidTestImplementation("androidx.room:room-testing:2.6.1")
+
+    // Coroutines test
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }

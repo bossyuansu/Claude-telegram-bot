@@ -14,12 +14,6 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
 - **Question handling** - Interactive buttons for Claude's questions
 - **Photo & file uploads** - Send images and files for Claude to analyze (up to 50MB)
 
-### Userbot (`userbot.py`)
-- **Readonly mode** - Can only read files, search code, answer questions
-- **Auto-responds** in a specific chat as yourself (not as a bot)
-- **Security guardrails** - Won't read .env or output secrets
-- **Streaming** - Same streaming support as main bot
-
 ## Commands
 
 | Command | Description |
@@ -53,17 +47,9 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
    PROJECTS_DIR=/home/user
    ```
 
-4. For userbot, also add:
-   ```
-   TG_API_ID=your_api_id
-   TG_API_HASH=your_api_hash
-   TARGET_CHAT_ID=chat_to_monitor
-   ```
-
-5. Run:
+4. Run:
    ```bash
-   python bot.py      # Main bot
-   python userbot.py  # Userbot
+   python bot.py
    ```
 
 ## Systemd Service

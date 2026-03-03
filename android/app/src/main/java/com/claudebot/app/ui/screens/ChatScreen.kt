@@ -19,6 +19,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.activity.compose.BackHandler
@@ -46,6 +47,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
     var showSearch by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
+    var showFilterMenu by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     val searchQuery by viewModel.searchQuery
     val searchResults = viewModel.searchResults
@@ -70,7 +72,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
 
     // Persistent flag: is the user currently at/near the bottom?
     var stickToBottom by remember { mutableStateOf(true) }
-    var hasNewMessages by remember { mutableStateOf(false) }
+    var newMessageCount by remember { mutableIntStateOf(0) }
 
     // Monitor scroll position
     LaunchedEffect(listState) {
@@ -83,7 +85,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
             }
         }.distinctUntilChanged().collectLatest { atBottom ->
             stickToBottom = atBottom
-            if (atBottom) hasNewMessages = false
+            if (atBottom) newMessageCount = 0
         }
     }
 
@@ -107,7 +109,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
             listState.scrollToItem(messages.size - 1)
             listState.scrollBy(Float.MAX_VALUE)
         } else {
-            hasNewMessages = true
+            newMessageCount++
         }
     }
 
@@ -118,14 +120,22 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val isLoadingMore by viewModel.isLoadingMore
     val allLoaded by viewModel.allLoaded
 
+    // Track message count before loadMore so we can adjust scroll after prepend
+    var sizeBeforeLoad by remember { mutableIntStateOf(0) }
+
     LaunchedEffect(isNearTop) {
         if (isNearTop && !isLoadingMore && !allLoaded && messages.isNotEmpty()) {
-            val sizeBefore = messages.size
+            sizeBeforeLoad = messages.size
             viewModel.loadMore()
-            if (messages.size > sizeBefore) {
-                val added = messages.size - sizeBefore
-                listState.scrollToItem(listState.firstVisibleItemIndex + added)
-            }
+        }
+    }
+
+    // Adjust scroll position after loadMore completes (isLoadingMore: true -> false)
+    LaunchedEffect(isLoadingMore) {
+        if (!isLoadingMore && sizeBeforeLoad > 0 && messages.size > sizeBeforeLoad) {
+            val added = messages.size - sizeBeforeLoad
+            listState.scrollToItem(listState.firstVisibleItemIndex + added)
+            sizeBeforeLoad = 0
         }
     }
 
@@ -196,16 +206,35 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                     if (showSessions) viewModel.fetchSessions()
                                 }
                             ) {
-                                val dotColor = when (connState) {
+                                val baseDotColor = when (connState) {
                                     ConnectionState.CONNECTED -> ConnectedGreen
                                     ConnectionState.RECONNECTING, ConnectionState.CONNECTING -> ReconnectingYellow
                                     ConnectionState.DISCONNECTED -> DisconnectedRed
                                 }
-                                Surface(
-                                    modifier = Modifier.size(8.dp),
-                                    shape = MaterialTheme.shapes.small,
-                                    color = dotColor
-                                ) {}
+                                val dotPulsing = connState == ConnectionState.RECONNECTING || connState == ConnectionState.CONNECTING
+                                if (dotPulsing) {
+                                    val dotTransition = rememberInfiniteTransition(label = "dotPulse")
+                                    val pulseAlpha by dotTransition.animateFloat(
+                                        initialValue = 0.4f,
+                                        targetValue = 1f,
+                                        animationSpec = infiniteRepeatable(
+                                            animation = tween(800),
+                                            repeatMode = RepeatMode.Reverse
+                                        ),
+                                        label = "dotAlpha"
+                                    )
+                                    Surface(
+                                        modifier = Modifier.size(8.dp),
+                                        shape = MaterialTheme.shapes.small,
+                                        color = baseDotColor.copy(alpha = pulseAlpha)
+                                    ) {}
+                                } else {
+                                    Surface(
+                                        modifier = Modifier.size(8.dp),
+                                        shape = MaterialTheme.shapes.small,
+                                        color = baseDotColor
+                                    ) {}
+                                }
                                 Spacer(Modifier.width(8.dp))
                                 Column {
                                     Text(
@@ -234,6 +263,19 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                     Text("Connect", fontSize = 12.sp, color = AccentOrange)
                                 }
                             }
+                            // Compact session filter dropdown
+                            val availableSessions = viewModel.availableSessions
+                            val sessionFilter by viewModel.sessionFilter
+                            if (availableSessions.size > 1) {
+                                SessionFilterButton(
+                                    expanded = showFilterMenu,
+                                    onToggle = { showFilterMenu = !showFilterMenu },
+                                    onDismiss = { showFilterMenu = false },
+                                    sessions = availableSessions,
+                                    activeFilter = sessionFilter,
+                                    onSelect = { viewModel.setSessionFilter(it); showFilterMenu = false }
+                                )
+                            }
                             IconButton(onClick = { showOutline = true }) {
                                 Text("📑", fontSize = 16.sp)
                             }
@@ -246,7 +288,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         }
                     )
 
-                    // Session dropdown
+                    // Session dropdown with stagger animation
                     AnimatedVisibility(visible = showSessions) {
                         Surface(color = DarkSurface) {
                             Column(modifier = Modifier.fillMaxWidth()) {
@@ -259,48 +301,58 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                         modifier = Modifier.padding(16.dp)
                                     )
                                 } else {
-                                    sessions.forEach { session ->
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clickable {
-                                                    showSessions = false
-                                                    if (!session.isActive) viewModel.switchSession(session.name)
-                                                }
-                                                .background(if (session.isActive) DarkSurfaceVariant else DarkSurface)
-                                                .padding(horizontal = 16.dp, vertical = 10.dp),
-                                            verticalAlignment = Alignment.CenterVertically
+                                    sessions.forEachIndexed { index, session ->
+                                        var rowVisible by remember { mutableStateOf(false) }
+                                        LaunchedEffect(Unit) {
+                                            delay(index * 40L)
+                                            rowVisible = true
+                                        }
+                                        AnimatedVisibility(
+                                            visible = rowVisible,
+                                            enter = fadeIn(tween(150)) + slideInVertically(tween(150)) { -it / 2 }
                                         ) {
-                                            // Active indicator
-                                            if (session.isActive) {
-                                                Surface(
-                                                    modifier = Modifier.size(6.dp),
-                                                    shape = MaterialTheme.shapes.small,
-                                                    color = AccentOrange
-                                                ) {}
-                                                Spacer(Modifier.width(8.dp))
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable {
+                                                        showSessions = false
+                                                        if (!session.isActive) viewModel.switchSession(session.name)
+                                                    }
+                                                    .background(if (session.isActive) DarkSurfaceVariant else DarkSurface)
+                                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                if (session.isActive) {
+                                                    Surface(
+                                                        modifier = Modifier.size(6.dp),
+                                                        shape = MaterialTheme.shapes.small,
+                                                        color = AccentOrange
+                                                    ) {}
+                                                    Spacer(Modifier.width(8.dp))
+                                                }
+                                                Text(
+                                                    session.name,
+                                                    color = if (session.isActive) AccentOrange else BotText,
+                                                    fontSize = 14.sp,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                if (session.busy) {
+                                                    Text("\uD83D\uDD04", fontSize = 12.sp)
+                                                    Spacer(Modifier.width(4.dp))
+                                                }
+                                                Text(
+                                                    session.lastCli,
+                                                    color = SessionLabel,
+                                                    fontSize = 11.sp
+                                                )
                                             }
-                                            Text(
-                                                session.name,
-                                                color = if (session.isActive) AccentOrange else BotText,
-                                                fontSize = 14.sp,
-                                                modifier = Modifier.weight(1f)
-                                            )
-                                            if (session.busy) {
-                                                Text("\uD83D\uDD04", fontSize = 12.sp)
-                                                Spacer(Modifier.width(4.dp))
-                                            }
-                                            Text(
-                                                session.lastCli,
-                                                color = SessionLabel,
-                                                fontSize = 11.sp
-                                            )
                                         }
                                     }
                                 }
                             }
                         }
                     }
+
                 }
 
             }
@@ -516,12 +568,12 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 8.dp),
-                    enter = fadeIn() + slideInVertically { it },
+                    enter = fadeIn() + slideInVertically(spring(dampingRatio = Spring.DampingRatioMediumBouncy)) { it },
                     exit = fadeOut() + slideOutVertically { it }
                 ) {
                     FilledTonalButton(
                         onClick = {
-                            hasNewMessages = false
+                            newMessageCount = 0
                             scope.launch {
                                 listState.animateScrollToItem(messages.size - 1)
                             }
@@ -534,7 +586,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                     ) {
                         Text(
-                            if (hasNewMessages) "\u2193 New messages" else "\u2193 Bottom",
+                            if (newMessageCount > 0) "\u2193 $newMessageCount new" else "\u2193 Bottom",
                             fontSize = 12.sp
                         )
                     }
@@ -611,16 +663,59 @@ fun ChatScreen(viewModel: ChatViewModel) {
     }
 }
 
-/** Animated typing indicator — three pulsing dots in a bot-style bubble.
+/** Compact session filter button with dropdown menu. */
+@Composable
+internal fun SessionFilterButton(
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onDismiss: () -> Unit,
+    sessions: List<String>,
+    activeFilter: String?,
+    onSelect: (String?) -> Unit,
+) {
+    Box(modifier = Modifier.testTag("session_filter")) {
+        IconButton(onClick = onToggle) {
+            Text(
+                if (activeFilter != null) "\u25C9" else "\u25CE",
+                fontSize = 18.sp,
+                color = if (activeFilter != null) AccentOrange else SessionLabel
+            )
+        }
+        MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(surface = DarkSurface)) {
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = onDismiss,
+        ) {
+            DropdownMenuItem(
+                text = { Text("All sessions", fontSize = 13.sp, color = if (activeFilter == null) AccentOrange else BotText) },
+                onClick = { onSelect(null) },
+                leadingIcon = {
+                    if (activeFilter == null) Text("\u2713", color = AccentOrange, fontSize = 14.sp)
+                }
+            )
+            sessions.forEach { s ->
+                DropdownMenuItem(
+                    text = { Text(s, fontSize = 13.sp, maxLines = 1, color = if (activeFilter == s) AccentOrange else BotText) },
+                    onClick = { onSelect(s) },
+                    leadingIcon = {
+                        if (activeFilter == s) Text("\u2713", color = AccentOrange, fontSize = 14.sp)
+                    }
+                )
+            }
+        }
+        }
+    }
+}
+
+/** Animated typing indicator — three bouncy dots in a bot-style bubble.
  *  Uses a manual coroutine loop instead of rememberInfiniteTransition
  *  to avoid continuous recomposition that prevents screen timeout. */
 @Composable
 private fun TypingIndicator() {
-    // Cycle through which dot is "active" (0, 1, 2) every 200ms
     var activeDot by remember { mutableIntStateOf(0) }
     LaunchedEffect(Unit) {
         while (true) {
-            kotlinx.coroutines.delay(200)
+            delay(300)
             activeDot = (activeDot + 1) % 3
         }
     }
@@ -641,9 +736,23 @@ private fun TypingIndicator() {
             verticalAlignment = Alignment.CenterVertically
         ) {
             repeat(3) { i ->
-                val alpha = if (i == activeDot) 1f else 0.3f
+                val isActive = i == activeDot
+                val offsetY by animateDpAsState(
+                    targetValue = if (isActive) (-3).dp else 0.dp,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessLow
+                    ),
+                    label = "dotBounce"
+                )
+                val alpha by animateFloatAsState(
+                    targetValue = if (isActive) 1f else 0.3f,
+                    animationSpec = tween(150),
+                    label = "dotAlpha"
+                )
                 Box(
                     modifier = Modifier
+                        .offset(y = offsetY)
                         .size(7.dp)
                         .clip(CircleShape)
                         .background(AccentOrange.copy(alpha = alpha))

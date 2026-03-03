@@ -1344,11 +1344,6 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         if cancelled:
             cancelled_sessions.discard(process_key)
 
-        # Clean up process tracking
-        active_processes.pop(process_key, None)
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-        mark_session_done(process_key)
-
         # Final update - no cursor, indicates completion
         # Use current_chunk_text for the last message. If empty (e.g. tool-only response),
         # fall back to result text. But if text was already chunked across messages, don't repeat.
@@ -1427,6 +1422,11 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         context_overflow = ("prompt is too long" in accumulated_text.lower() or
                            "context length" in accumulated_text.lower() or
                            "too much media" in accumulated_text.lower())
+
+        # Clean up process tracking only after final output is flushed.
+        active_processes.pop(process_key, None)
+        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+        mark_session_done(process_key)
 
         _ws_suppress.active = False
         return accumulated_text, questions, message_id, new_claude_session_id, context_overflow
@@ -2117,8 +2117,6 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         cancelled = process_key in cancelled_sessions
         if cancelled:
             cancelled_sessions.discard(process_key)
-        active_processes.pop(process_key, None)
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
 
         # Save gemini session ID for resume
         if new_session_id and session:
@@ -2354,6 +2352,34 @@ def run_codex_task(chat_id, task, cwd, session=None):
             stdout_reader = io.TextIOWrapper(process.stdout, encoding='utf-8', errors='replace')
             # Track per-item accumulated text length so item.updated deltas can be extracted
             item_text_lengths = {}  # item_id -> length of text already appended
+            seen_file_changes = set()  # (type, path) to avoid duplicate rows
+
+            def _read_file_preview(path, limit=3000):
+                """Best-effort preview for newly created files (for app diff viewer)."""
+                if not path:
+                    return ""
+                try:
+                    abs_path = path if os.path.isabs(path) else os.path.join(cwd or os.getcwd(), path)
+                    if not os.path.isfile(abs_path):
+                        return ""
+                    with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                        return f.read(limit)
+                except Exception:
+                    return ""
+
+            def _append_file_change(change_type, path, old="", new="", content=""):
+                key = (change_type, path)
+                if key in seen_file_changes:
+                    return
+                seen_file_changes.add(key)
+                entry = {"type": change_type, "path": (path or "")[:100]}
+                if old:
+                    entry["old"] = old[:3000]
+                if new:
+                    entry["new"] = new[:3000]
+                if content:
+                    entry["content"] = content[:3000]
+                file_changes.append(entry)
 
             for line in stdout_reader:
                 line = line.strip()
@@ -2413,7 +2439,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                             cmd_str = item.get("command", "")
                             if etype == "item.started":
                                 if item_id and item_id not in processed_item_ids:
-                                    file_changes.append({"type": "bash", "path": cmd_str[:100]})
+                                    _append_file_change("bash", cmd_str)
                                     if item_id:
                                         processed_item_ids.add(item_id)
                                 current_tool = "Bash"
@@ -2425,6 +2451,29 @@ def run_codex_task(chat_id, task, cwd, session=None):
                                     last_update = now
                             elif etype == "item.completed":
                                 current_tool = None
+                        elif itype == "file_change" and etype == "item.completed":
+                            changes = item.get("changes", [])
+                            if isinstance(changes, list):
+                                for ch in changes:
+                                    if not isinstance(ch, dict):
+                                        continue
+                                    kind = str(ch.get("kind", "")).lower()
+                                    path = ch.get("path") or ch.get("new_path") or ch.get("to") or ""
+
+                                    if kind in ("add", "create", "write", "new"):
+                                        content = _read_file_preview(path)
+                                        _append_file_change("write", path, content=content)
+                                    elif kind in ("update", "modify", "edit", "change"):
+                                        _append_file_change("edit", path)
+                                    elif kind in ("delete", "remove"):
+                                        _append_file_change("delete", path)
+                                    elif kind in ("rename", "move"):
+                                        src = ch.get("old_path") or ch.get("from") or ch.get("src") or path
+                                        dst = ch.get("new_path") or ch.get("to") or ch.get("dst") or path
+                                        move_path = f"{src} -> {dst}" if src and dst and src != dst else (dst or src)
+                                        _append_file_change("move", move_path)
+                                    else:
+                                        _append_file_change(kind or "file", path)
 
                     # Stream update: chunk overflow
                     while len(current_chunk_text) > max_chunk_len:
@@ -2457,9 +2506,6 @@ def run_codex_task(chat_id, task, cwd, session=None):
             cancelled = session_id in cancelled_sessions
             if cancelled:
                 cancelled_sessions.discard(session_id)
-            active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-            mark_session_done(session_id)
 
             # Save codex session ID for resume
             if new_thread_id and session:
@@ -2513,23 +2559,18 @@ def run_codex_task(chat_id, task, cwd, session=None):
                     time.sleep(0.2)
 
         except FileNotFoundError:
-            active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-            mark_session_done(session_id)
             if message_id:
                 edit_message(chat_id, message_id, "❌ Codex CLI not found.", force=True)
             else:
                 send_message(chat_id, "❌ Codex CLI not found.")
         except Exception as e:
-            active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-            mark_session_done(session_id)
             error_text = accumulated_text + f"\n\n———\n❌ Codex error: {str(e)[:200]}"
             if message_id:
                 edit_message(chat_id, message_id, error_text[:4000], force=True)
             else:
                 send_message(chat_id, error_text[:4000])
         finally:
+            mark_session_done(session_id)
             active_processes.pop(session_id, None)
             _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             process_message_queue(chat_id, session)
@@ -2774,9 +2815,6 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             cancelled = session_id in cancelled_sessions
             if cancelled:
                 cancelled_sessions.discard(session_id)
-            active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-            mark_session_done(session_id)
 
             # Populate result for callers that join the thread
             result["output"] = accumulated_text
@@ -2854,18 +2892,12 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                     time.sleep(0.2)
 
         except FileNotFoundError:
-            active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-            mark_session_done(session_id)
             result["error"] = "Gemini CLI not found"
             if message_id:
                 edit_message(chat_id, message_id, "❌ Gemini CLI not found.", force=True)
             else:
                 send_message(chat_id, "❌ Gemini CLI not found.")
         except Exception as e:
-            active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-            mark_session_done(session_id)
             result["error"] = str(e)[:300]
             error_text = accumulated_text + f"\n\n———\n❌ Gemini error: {str(e)[:200]}"
             if message_id:
@@ -2878,6 +2910,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                 watchdog_stop.set()
             except UnboundLocalError:
                 pass
+            mark_session_done(session_id)
             active_processes.pop(session_id, None)
             _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
             process_message_queue(chat_id, session)

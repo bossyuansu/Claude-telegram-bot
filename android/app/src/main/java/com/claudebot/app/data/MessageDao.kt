@@ -14,6 +14,15 @@ abstract class MessageDao {
     @Query("SELECT COUNT(*) FROM messages")
     abstract suspend fun count(): Int
 
+    @Query("SELECT * FROM messages WHERE session = :session ORDER BY timestamp DESC, id DESC LIMIT :limit OFFSET :offset")
+    abstract suspend fun getPageBySession(session: String, limit: Int, offset: Int): List<MessageEntity>
+
+    @Query("SELECT COUNT(*) FROM messages WHERE session = :session")
+    abstract suspend fun countBySession(session: String): Int
+
+    @Query("SELECT DISTINCT session FROM messages WHERE session != '' ORDER BY session ASC")
+    abstract suspend fun getDistinctSessions(): List<String>
+
     @Query(
         """
         DELETE FROM messages
