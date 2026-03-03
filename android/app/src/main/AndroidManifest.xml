@@ -28,6 +28,9 @@
             android:name=".WsService"
             android:foregroundServiceType="specialUse"
             android:exported="false" />
+        <receiver
+            android:name=".NotificationActionReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

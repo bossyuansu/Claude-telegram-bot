@@ -3,6 +3,7 @@ package com.claudebot.app.network
 import com.claudebot.app.data.InlineButton
 import okhttp3.*
 import org.json.JSONObject
+import android.util.Log
 import java.util.TreeMap
 import java.util.concurrent.TimeUnit
 
@@ -14,6 +15,7 @@ data class WsMessage(
     val text: String,
     val session: String,
     val seq: Int = 0,
+    val isReplay: Boolean = false,
     val buttons: List<List<InlineButton>> = emptyList(),
     // Status fields (for type="status")
     val mode: String = "",
@@ -32,8 +34,12 @@ class WebSocketManager(
     private val onMessage: (WsMessage) -> Unit,
     private val onStateChange: (ConnectionState) -> Unit,
     private val onServerRestart: (() -> Unit)? = null,
-    private val onSeqUpdate: ((seq: Int, serverId: String) -> Unit)? = null
+    private val onSeqUpdate: ((seq: Int, serverId: String) -> Unit)? = null,
+    private val onError: ((String) -> Unit)? = null
 ) {
+    companion object {
+        private const val TAG = "WS"
+    }
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(30, TimeUnit.SECONDS)
@@ -69,6 +75,7 @@ class WebSocketManager(
     }
 
     fun connect(wsUrl: String) {
+        Log.d(TAG, "connect() called url=$wsUrl")
         // Close any existing connection before opening a new one
         reconnectThread?.interrupt()
         reconnectThread = null
@@ -108,10 +115,12 @@ class WebSocketManager(
             baseUrl
         }
 
+        Log.d(TAG, "doConnect() url=$connectUrl attempt=$reconnectAttempt")
         val request = Request.Builder().url(connectUrl).build()
         ws = client.newWebSocket(request, object : WebSocketListener() {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.d(TAG, "onOpen — connected!")
                 reconnectAttempt = 0
                 pendingBuffer.clear()
                 resendRequested = false
@@ -135,11 +144,13 @@ class WebSocketManager(
                         // New server (restart or first connect) — accept whatever seq
                         // the first replayed message has, since old numbering is gone.
                         if (changed) {
-                            lastSeq = 0
-                            expectedSeq = 0  // 0 = "accept next seq as starting point"
+                            // Reset in-memory seq tracking (0 = accept next seq as starting point)
+                            // but keep lastSeq for reconnect — server handles last_seq > _ws_seq
+                            expectedSeq = 0
                             pendingBuffer.clear()
                             resendRequested = false
-                            onSeqUpdate?.invoke(0, serverId)
+                            // Persist new serverId but keep lastSeq intact
+                            onSeqUpdate?.invoke(lastSeq, serverId)
                         }
                         knownServerId = serverId
                         return
@@ -196,11 +207,18 @@ class WebSocketManager(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.e(TAG, "onFailure: ${t.message}", t)
+                onError?.invoke(t.message ?: "WebSocket failure")
                 scheduleReconnect()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (code != 1000) scheduleReconnect()
+                Log.d(TAG, "onClosed code=$code reason=$reason")
+                if (code != 1000) {
+                    val msg = if (reason.isNotBlank()) "Closed ($code): $reason" else "Closed ($code)"
+                    onError?.invoke(msg)
+                    scheduleReconnect()
+                }
                 else onStateChange(ConnectionState.DISCONNECTED)
             }
         })
@@ -265,6 +283,7 @@ class WebSocketManager(
             text = json.optString("text", ""),
             session = json.optString("session", ""),
             seq = seq,
+            isReplay = json.optBoolean("is_replay", false),
             buttons = buttons,
             mode = json.optString("mode", ""),
             phase = json.optString("phase", ""),
@@ -286,6 +305,7 @@ class WebSocketManager(
         onStateChange(ConnectionState.RECONNECTING)
         reconnectAttempt++
         val delay = minOf(1000L * (1L shl minOf(reconnectAttempt, 5)), 30_000L)
+        Log.d(TAG, "scheduleReconnect attempt=$reconnectAttempt delay=${delay}ms")
 
         reconnectThread = Thread {
             try {

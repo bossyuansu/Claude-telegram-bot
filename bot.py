@@ -412,6 +412,7 @@ def get_updates(offset=0):
 
 _api_module = None  # Set in main() after api.py is loaded
 _ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadcasts
+_ws_session_override = threading.local()  # Per-thread session name for WS broadcasts (avoids get_active_session races)
 
 
 def _ws_broadcast(chat_id, event_type, data):
@@ -442,10 +443,11 @@ def _ws_stream(chat_id, op, message_id, session="", **kwargs):
     _ws_broadcast(chat_id, "stream", data)
 
 
-def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3):
+def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retries=3, session_name=None):
     """Send a message back to the user. Returns message_id.
     Retries on network/timeout errors with exponential backoff.
     Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
+    session_name: if provided, use this as the WS session label instead of get_active_session().
     """
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
@@ -495,8 +497,15 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
         # Broadcast via WebSocket (independent of TG success/failure)
         # Suppressed when streaming — stream events replace legacy message/edit broadcasts
         if not getattr(_ws_suppress, 'active', False):
-            _session = get_active_session(chat_id)
-            _sess_name = _session.get("name", "") if _session else ""
+            # Session name priority: explicit param > thread-local override > active session lookup
+            _override = getattr(_ws_session_override, 'name', None)
+            if session_name is not None:
+                _sess_name = session_name
+            elif _override is not None:
+                _sess_name = _override
+            else:
+                _session = get_active_session(chat_id)
+                _sess_name = _session.get("name", "") if _session else ""
             ws_data = {"text": chunk, "message_id": chunk_msg_id, "session": _sess_name}
             # Include inline keyboard buttons in WS payload (last chunk only)
             if reply_markup and i == len(chunks) - 1:
@@ -564,8 +573,12 @@ def edit_message(chat_id, message_id, text, parse_mode="Markdown", force=False):
 
     # Broadcast edit via WebSocket (suppressed during streaming — stream events replace it)
     if not getattr(_ws_suppress, 'active', False):
-        _session = get_active_session(chat_id)
-        _sess_name = _session.get("name", "") if _session else ""
+        _override = getattr(_ws_session_override, 'name', None)
+        if _override is not None:
+            _sess_name = _override
+        else:
+            _session = get_active_session(chat_id)
+            _sess_name = _session.get("name", "") if _session else ""
         _ws_broadcast(chat_id, "edit", {"message_id": message_id, "text": text, "session": _sess_name})
 
     if message_id < 0:
@@ -1033,8 +1046,9 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
     process = None  # Initialize before try block so exception handler can safely reference it
 
     # WS-native streaming: the app uses stream events instead of edit events
-    _session = get_active_session(chat_id)
-    _stream_session = _session.get("name", "") if _session else ""
+    # Use the session passed in (captured at dispatch time), not get_active_session()
+    # which could return a different session if the user switched mid-stream
+    _stream_session = session.get("name", "") if session else ""
     _ws_stream(chat_id, "start", message_id, session=_stream_session)
 
     try:
@@ -1100,7 +1114,22 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                         {"label": "Reject", "description": "Revise the plan"},
                     ]
                 })
-            elif tool_name in ["Write", "Edit", "Bash", "Read", "Glob", "Grep"]:
+            elif tool_name == "Edit":
+                path = tool_input.get("file_path", "")
+                file_changes.append({
+                    "type": "edit", "path": path[:100],
+                    "old": tool_input.get("old_string", "")[:3000],
+                    "new": tool_input.get("new_string", "")[:3000],
+                })
+                current_tool = tool_name
+            elif tool_name == "Write":
+                path = tool_input.get("file_path", "")
+                file_changes.append({
+                    "type": "write", "path": path[:100],
+                    "content": tool_input.get("content", "")[:3000],
+                })
+                current_tool = tool_name
+            elif tool_name in ["Bash", "Read", "Glob", "Grep"]:
                 path = tool_input.get("file_path") or tool_input.get("command") or tool_input.get("pattern") or ""
                 file_changes.append({"type": tool_name.lower(), "path": path[:100]})
                 current_tool = tool_name
@@ -2029,7 +2058,13 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
                     tool_name = event.get("tool_name") or "tool"
                     params = event.get("parameters", {})
                     path = params.get("file_path") or params.get("command") or params.get("pattern") or params.get("dir_path") or ""
-                    file_changes.append({"type": tool_name.lower(), "path": path[:100]})
+                    change = {"type": tool_name.lower(), "path": path[:100]}
+                    if tool_name.lower() in ("edit", "replace"):
+                        change["old"] = (params.get("old_string") or "")[:3000]
+                        change["new"] = (params.get("new_string") or "")[:3000]
+                    elif tool_name.lower() in ("write", "write_file"):
+                        change["content"] = (params.get("content") or "")[:3000]
+                    file_changes.append(change)
                     current_tool = tool_name
                     now = time.time()
                     if now - last_update >= update_interval:
@@ -2108,24 +2143,6 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
             print(f"[Gemini-stream] Startup timeout with --resume, clearing stale Gemini session ID", flush=True)
             update_cli_session_id(chat_id, session, "Gemini", None)
 
-        if file_changes:
-            final_chunk += "\n\n📁 *File Operations:*"
-            for change in file_changes:
-                ctype = change["type"]
-                path = change["path"]
-                if ctype in ["write", "write_file"]:
-                    final_chunk += f"\n  ✅ Created: `{shorten_path(path)}`"
-                elif ctype in ["edit", "replace"]:
-                    final_chunk += f"\n  ✅ Edited: `{shorten_path(path)}`"
-                elif ctype in ["bash", "run_shell_command"]:
-                    final_chunk += f"\n  ✅ Ran: `{path[:80]}{'...' if len(path) > 80 else ''}`"
-                elif ctype in ["read", "read_file"]:
-                    final_chunk += f"\n  📖 Read: `{shorten_path(path)}`"
-                elif ctype in ["glob", "grep", "grep_search"]:
-                    final_chunk += f"\n  🔍 Search: `{path[:60]}{'...' if len(path) > 60 else ''}`"
-                else:
-                    final_chunk += f"\n  🔧 {ctype}: `{shorten_path(path)}`"
-
         error_occurred = False
         if cancelled:
             final_chunk += "\n\n———\n⚠️ _cancelled_"
@@ -2148,6 +2165,14 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
             final_chunk += f"\n\n———\n⚠️ _complete with errors:_ {gemini_errors[-1][:150]}"
         else:
             final_chunk += "\n\n———\n✓ _complete_"
+
+        # WS stream: send done event with file changes for diff viewer
+        _ws_session = getattr(_ws_session_override, 'name', None) or (get_active_session(chat_id) if chat_id else "")
+        _ws_stream(chat_id, "done", message_ids[0] if message_ids else message_id,
+                   session=_ws_session or "",
+                   text=accumulated_text.strip(),
+                   cancelled=cancelled,
+                   file_changes=file_changes)
 
         if final_chunk and len(final_chunk) <= 4000:
             edit_message(chat_id, message_id, final_chunk, force=True)
@@ -2453,11 +2478,6 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 else:
                     final_chunk = ""
 
-            if file_changes:
-                final_chunk += "\n\n📁 *File Operations:*"
-                for change in file_changes:
-                    final_chunk += f"\n  ✅ Ran: `{change['path'][:80]}{'...' if len(change['path']) > 80 else ''}`"
-
             # Wait for stderr drain
             try:
                 stderr_thread.join(timeout=5)
@@ -2470,6 +2490,14 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 final_chunk += f"\n\n———\n❌ _No output:_ {codex_stderr_lines[-1][:200]}"
             else:
                 final_chunk += "\n\n———\n✓ _complete_"
+
+            # WS stream: send done event with file changes for diff viewer
+            _ws_session = getattr(_ws_session_override, 'name', None) or (session_name if session_name else "")
+            _ws_stream(chat_id, "done", message_ids[0] if message_ids else (message_id or 0),
+                       session=_ws_session,
+                       text=accumulated_text.strip(),
+                       cancelled=cancelled,
+                       file_changes=file_changes)
 
             if len(final_chunk) <= 4000:
                 if message_id:
@@ -3267,6 +3295,7 @@ def run_omni_loop(chat_id, task, session):
     cwd = session["cwd"]
     log_prefix = f"[Omni {chat_id}:{session.get('name', 'unknown')}]"
     original_task = task  # Preserve original task — don't mutate
+    _ws_session_override.name = session.get("name", "")
 
     print(f"{log_prefix} Starting. Task: {task[:200]}", flush=True)
     print(f"{log_prefix} Session ID: {session_id}, CWD: {cwd}", flush=True)
@@ -3332,6 +3361,7 @@ _Use /cancel to stop at any time._""")
                     arch_prompt, chat_id, cwd=cwd, continue_session=True,
                     session_id=session_id, session=session
                 )
+                _ws_broadcast_status(chat_id, "omni", phase, step)  # Re-assert after Claude exits
                 if not omni_active.get(chat_key, {}).get("active"):
                     break
 
@@ -3464,6 +3494,7 @@ _Use /cancel to stop at any time._""")
                         exec_prompt, chat_id, cwd=cwd, continue_session=True,
                         session_id=session_id, session=session
                     )
+                    _ws_broadcast_status(chat_id, "omni", phase, step)  # Re-assert after Claude exits
                     if not omni_active.get(chat_key, {}).get("active"):
                         break
 
@@ -3588,6 +3619,7 @@ _Session preserved. You can continue chatting in this session._""")
         user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "omni", "", 0, active=False)
+        _ws_session_override.name = None
         if not notified_exit:
             send_message(chat_id, f"🏁 *Omni process finished* for `{session.get('name', 'unknown')}`.")
 
@@ -3603,6 +3635,7 @@ _Session preserved. You can continue chatting in this session._""")
         user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "omni", "", 0, active=False)
+        _ws_session_override.name = None
 
 
 def run_justdoit_loop(chat_id, task, session):
@@ -3611,6 +3644,8 @@ def run_justdoit_loop(chat_id, task, session):
     chat_key = f"{chat_id}:{session_id}"
     cwd = session["cwd"]
     log_prefix = f"[JustDoIt {chat_id}:{session.get('name', 'unknown')}]"
+    # Pin WS session label to the originating session for all send_message calls on this thread
+    _ws_session_override.name = session.get("name", "")
 
     print(f"{log_prefix} Starting. Task: {task[:200]}", flush=True)
     print(f"{log_prefix} Session ID: {session_id}, CWD: {cwd}", flush=True)
@@ -3759,6 +3794,9 @@ Format as a compact bullet list."""
                 current_prompt, chat_id, cwd=cwd, continue_session=True,
                 session_id=session_id, session=session
             )
+
+            # Re-assert busy status — run_claude_streaming broadcasts busy:False on exit
+            _ws_broadcast_status(chat_id, "justdoit", phase, step)
 
             print(f"{log_prefix} Step {step}: Claude response length: {len(response) if response else 0}, questions: {bool(questions)}, context_overflow: {context_overflow}", flush=True)
             if response:
@@ -4029,6 +4067,7 @@ _Session preserved. You can continue chatting with Claude in this session._""")
         justdoit_active.pop(chat_key, None)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "justdoit", "", 0, active=False)
+        _ws_session_override.name = None  # Clear thread-local override
 
 
 def run_codex_deepreview(claude_output, review_history, step, cwd, phase):
@@ -4312,6 +4351,7 @@ def run_deepreview_loop(chat_id, session):
     chat_key = f"{chat_id}:{session_id}"
     cwd = session["cwd"]
     log_prefix = f"[DeepReview {chat_id}:{session.get('name', 'unknown')}]"
+    _ws_session_override.name = session.get("name", "")
 
     print(f"{log_prefix} Starting deep review", flush=True)
 
@@ -4424,6 +4464,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
                 prompt, chat_id, cwd=cwd, continue_session=True,
                 session_id=session_id, session=session
             )
+            _ws_broadcast_status(chat_id, "deepreview", phase, step)  # Re-assert after Claude exits
 
             if claude_sid:
                 update_claude_session_id(chat_id, session, claude_sid)
@@ -4437,6 +4478,7 @@ After fixing, do another pass to make sure you didn't introduce regressions. Rep
                     prompt, chat_id, cwd=cwd, continue_session=True,
                     session_id=session_id, session=session
                 )
+                _ws_broadcast_status(chat_id, "deepreview", phase, step)
                 if claude_sid:
                     update_claude_session_id(chat_id, session, claude_sid)
                     session = get_session_by_id(chat_id, session_id) or session
@@ -4689,6 +4731,7 @@ If Codex's work is solid and the code is clean, say exactly: ALL_CLEAN"""
                 critique_prompt, chat_id, cwd=cwd, continue_session=True,
                 session_id=session_id, session=session
             )
+            _ws_broadcast_status(chat_id, "deepreview", phase, step)  # Re-assert after Claude exits
             if claude_sid:
                 update_claude_session_id(chat_id, session, claude_sid)
                 session = get_session_by_id(chat_id, session_id) or session
@@ -4699,6 +4742,7 @@ If Codex's work is solid and the code is clean, say exactly: ALL_CLEAN"""
                     critique_prompt, chat_id, cwd=cwd, continue_session=True,
                     session_id=session_id, session=session
                 )
+                _ws_broadcast_status(chat_id, "deepreview", phase, step)
                 if claude_sid:
                     update_claude_session_id(chat_id, session, claude_sid)
                     session = get_session_by_id(chat_id, session_id) or session
@@ -4767,6 +4811,7 @@ _Session preserved. You can continue chatting._""")
             pass
         deepreview_active.pop(chat_key, None)
         _ws_broadcast_status(chat_id, "deepreview", "", 0, active=False)
+        _ws_session_override.name = None
 
 
 def handle_command(chat_id, text):

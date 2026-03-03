@@ -21,6 +21,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import com.claudebot.app.ChatViewModel
 import com.claudebot.app.network.ConnectionState
 import com.claudebot.app.ui.components.InputBar
@@ -48,6 +52,21 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val isSearching by viewModel.isSearching
     val taskStatus by viewModel.taskStatus
     val isBusy by viewModel.isBotBusy
+
+    // Back-to-exit confirmation: only intercept when NOT already primed
+    var backPressedOnce by remember { mutableStateOf(false) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    BackHandler(enabled = !backPressedOnce) {
+        backPressedOnce = true
+        scope.launch {
+            snackbarHostState.showSnackbar(
+                message = "Swipe again to close",
+                duration = SnackbarDuration.Short
+            )
+            delay(2000)
+            backPressedOnce = false
+        }
+    }
 
     // Persistent flag: is the user currently at/near the bottom?
     var stickToBottom by remember { mutableStateOf(true) }
@@ -113,6 +132,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
     Scaffold(
         modifier = Modifier.imePadding(),
         containerColor = DarkBg,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Column {
                 if (showSearch) {
@@ -289,11 +309,104 @@ fun ChatScreen(viewModel: ChatViewModel) {
             if (!showSearch) {
                 val session by viewModel.currentSession
                 val switching by viewModel.isSwitchingSession
-                InputBar(
-                    onSend = { viewModel.sendMessage(it) },
-                    enabled = connState == ConnectionState.CONNECTED && !switching,
-                    currentSession = if (switching) "Switching session..." else session
-                )
+                val action by viewModel.pendingAction
+                Column {
+                    // Sticky action bar for pending questions/approvals
+                    if (action != null) {
+                        Surface(
+                            color = DarkSurface,
+                            shadowElevation = 8.dp,
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp)
+                            ) {
+                                // "View plan" tap to scroll to the plan message
+                                Text(
+                                    text = "▲ Tap to view full message",
+                                    color = AccentOrangeLight,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            val mid = action!!.messageId
+                                            val idx = messages.indexOfFirst { it.messageId == mid }
+                                            if (idx >= 0) {
+                                                scope.launch { listState.animateScrollToItem(idx) }
+                                            }
+                                        }
+                                        .padding(bottom = 6.dp)
+                                )
+                                // Question text — scrollable for long plans
+                                Text(
+                                    text = action!!.text,
+                                    color = BotText,
+                                    fontSize = 13.sp,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 120.dp)
+                                        .verticalScroll(rememberScrollState())
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                // Action buttons
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    action!!.buttons.flatten().forEach { btn ->
+                                        val isApprove = btn.text.contains("Approve", ignoreCase = true)
+                                        val isReject = btn.text.contains("Reject", ignoreCase = true)
+                                        if (isApprove) {
+                                            Button(
+                                                onClick = { viewModel.pressButton(action!!.messageId, btn) },
+                                                modifier = Modifier.weight(1f),
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = ConnectedGreen,
+                                                    contentColor = UserBubbleText,
+                                                ),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Text(btn.text, fontSize = 14.sp)
+                                            }
+                                        } else if (isReject) {
+                                            OutlinedButton(
+                                                onClick = { viewModel.pressButton(action!!.messageId, btn) },
+                                                modifier = Modifier.weight(1f),
+                                                border = BorderStroke(1.dp, DisconnectedRed),
+                                                colors = ButtonDefaults.outlinedButtonColors(
+                                                    contentColor = DisconnectedRed,
+                                                ),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Text(btn.text, fontSize = 14.sp)
+                                            }
+                                        } else {
+                                            OutlinedButton(
+                                                onClick = { viewModel.pressButton(action!!.messageId, btn) },
+                                                modifier = Modifier.weight(1f),
+                                                border = BorderStroke(1.dp, AccentOrange),
+                                                colors = ButtonDefaults.outlinedButtonColors(
+                                                    contentColor = AccentOrange,
+                                                ),
+                                                shape = RoundedCornerShape(8.dp)
+                                            ) {
+                                                Text(btn.text, fontSize = 14.sp, maxLines = 1)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    InputBar(
+                        onSend = { viewModel.sendMessage(it) },
+                        enabled = connState == ConnectionState.CONNECTED && !switching,
+                        currentSession = if (switching) "Switching session..." else session,
+                        isBusy = isBusy,
+                        onCancel = { viewModel.sendMessage("/cancel") }
+                    )
+                }
             }
         }
     ) { padding ->

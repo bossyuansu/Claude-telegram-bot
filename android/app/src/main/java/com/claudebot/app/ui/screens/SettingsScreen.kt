@@ -8,16 +8,30 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.claudebot.app.ChatViewModel
+import com.claudebot.app.network.ConnectionState
 import com.claudebot.app.ui.theme.*
+import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(viewModel: ChatViewModel) {
     val settings = viewModel.settings
+    val connectionState by viewModel.connectionState
+    var diagnosticsTick by remember { mutableStateOf(0L) }
 
     var host by remember { mutableStateOf(settings.host) }
     var port by remember { mutableStateOf(settings.port.toString()) }
     var token by remember { mutableStateOf(settings.token) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            diagnosticsTick++
+        }
+    }
 
     val fieldColors = OutlinedTextFieldDefaults.colors(
         focusedBorderColor = InputBorderFocused,
@@ -115,6 +129,49 @@ fun SettingsScreen(viewModel: ChatViewModel) {
                     style = MaterialTheme.typography.bodySmall,
                     color = TimestampColor
                 )
+            }
+
+            HorizontalDivider(color = BotBubbleBorder)
+
+            val lastSync = settings.wsLastSyncAt
+            val nowMs = remember(diagnosticsTick) { System.currentTimeMillis() }
+            val lastSyncText = if (lastSync > 0L) {
+                val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(lastSync))
+                val ageSec = ((nowMs - lastSync).coerceAtLeast(0L) / 1000L)
+                "$ts (${ageSec}s ago)"
+            } else {
+                "Never"
+            }
+            val stateLabel = when (connectionState) {
+                ConnectionState.CONNECTED -> "CONNECTED"
+                ConnectionState.CONNECTING -> "CONNECTING"
+                ConnectionState.RECONNECTING -> "RECONNECTING"
+                ConnectionState.DISCONNECTED -> "DISCONNECTED"
+            }
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = DarkSurfaceVariant),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text("Connection Diagnostics", color = AccentOrangeLight, style = MaterialTheme.typography.titleSmall)
+                    Text("State: $stateLabel", color = BotText, style = MaterialTheme.typography.bodySmall)
+                    Text("Last Sync: $lastSyncText", color = BotText, style = MaterialTheme.typography.bodySmall)
+                    Text("Last Seq: ${settings.lastSeq}", color = BotText, style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        "Server ID: ${settings.knownServerId.ifBlank { "(none)" }}",
+                        color = BotText,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "Last Error: ${settings.wsLastError.ifBlank { "(none)" }}",
+                        color = if (settings.wsLastError.isBlank()) TimestampColor else AccentOrange,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
             }
         }
     }

@@ -25,9 +25,12 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import androidx.work.BackoffPolicy
+import androidx.work.ExistingWorkPolicy
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.Constraints
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import java.util.concurrent.Executors
@@ -51,6 +54,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** True while a session-changing command (/switch, /new, /resume, /end, /delete) is in-flight. */
     val isSwitchingSession = mutableStateOf(false)
+
+    /** Pending action bar — shown when a message with buttons arrives (plan approval, questions). */
+    data class PendingAction(val text: String, val buttons: List<List<InlineButton>>, val messageId: Int)
+    val pendingAction = mutableStateOf<PendingAction?>(null)
 
     // Session list (from /api/sessions)
     data class SessionInfo(val name: String, val busy: Boolean, val isActive: Boolean, val lastCli: String)
@@ -76,12 +83,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Message IDs being tracked via WS-native stream events (ignore legacy edit events for these). */
     private val streamingMessageIds = mutableSetOf<Int>()
+    /** Message IDs currently being inserted from WS replay; prevents duplicate races. */
+    private val pendingIncomingMessageIds = mutableSetOf<Int>()
+    /** Positive message IDs already persisted in local DB (used for replay dedupe without async races). */
+    private val persistedMessageIds = mutableSetOf<Int>()
+    /** Positive message IDs that already reached terminal state ("done"). */
+    private val finalizedMessageIds = mutableSetOf<Int>()
+
+    /** Debounce DB writes during streaming — track last persist time per message ID. */
+    private val lastStreamPersist = mutableMapOf<Int, Long>()
+    private val STREAM_PERSIST_INTERVAL_MS = 2000L
 
     companion object {
         private const val PAGE_SIZE = 50
         private const val SEARCH_PAGE_SIZE = 30
         private const val MSG_NOTIFICATION_ID = 100
         private const val MSG_CHANNEL_ID = "bot_messages"
+        private const val NOTIFY_EVENT_ACTIONABLE = "actionable"
+        private const val NOTIFY_EVENT_TERMINAL = "terminal"
     }
 
     // Track whether the app is in the foreground for notifications
@@ -92,13 +111,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 isInForeground = true
                 // Clear message notifications when app comes to foreground
                 val nm = application.getSystemService(NotificationManager::class.java)
-                nm.cancel(MSG_NOTIFICATION_ID)
-                // Reconnect WebSocket when app returns to foreground
-                if (settings.isConfigured && connectionState.value != ConnectionState.CONNECTED) {
+                nm.cancelAll()
+                // Foreground owns the live WS. Stop background catch-up worker.
+                if (settings.isConfigured) {
+                    cancelSyncWorkers()
                     connect()
                 }
             }
-            Lifecycle.Event.ON_STOP -> isInForeground = false
+            Lifecycle.Event.ON_STOP -> {
+                isInForeground = false
+                // Background mode: release live WS and rely on periodic catch-up.
+                if (settings.isConfigured) {
+                    disconnect()
+                    scheduleImmediateSyncWorker()
+                    scheduleSyncWorker()
+                }
+            }
             else -> {}
         }
     }
@@ -108,6 +136,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         onStateChange = { state ->
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 connectionState.value = state
+                settings.wsLastState = state.name
+                if (state == ConnectionState.CONNECTED) {
+                    settings.wsLastError = ""
+                }
             }
         },
         onServerRestart = {
@@ -119,27 +151,48 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         },
         onSeqUpdate = { seq, serverId ->
-            settings.lastSeq = seq
-            settings.knownServerId = serverId
+            settings.updateWsState(seq, serverId)
+            if (settings.wsLastError.isNotBlank()) {
+                settings.wsLastError = ""
+            }
+        },
+        onError = { message ->
+            settings.wsLastError = message
         }
     )
 
     init {
+        android.util.Log.d("WS", "ChatViewModel init START")
         // Register lifecycle observer for foreground tracking
         ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycleObserver)
         // Create notification channel for background messages
         createMessageNotificationChannel()
-        // Schedule periodic background sync
-        scheduleSyncWorker()
+        // App starts in foreground: keep periodic worker cancelled.
+        cancelSyncWorkers()
         // Load recent messages from DB
         viewModelScope.launch {
-            loadInitialMessages()
-            // Scroll to bottom after loading history
-            if (messages.isNotEmpty()) scrollTrigger.value++
-            if (settings.isConfigured) {
-                // Restore WS seq state so reconnect doesn't replay everything
-                wsManager.restoreState(settings.lastSeq, settings.knownServerId)
-                connect()
+            try {
+                android.util.Log.d("WS", "init: loading messages...")
+                withContext(Dispatchers.IO) {
+                    dao.deleteDuplicateMessageIds()
+                    persistedMessageIds.clear()
+                    persistedMessageIds.addAll(dao.getPersistedMessageIds())
+                    finalizedMessageIds.clear()
+                    finalizedMessageIds.addAll(dao.getFinalizedMessageIds("———"))
+                }
+                loadInitialMessages()
+                android.util.Log.d("WS", "init: loaded ${messages.size} messages, configured=${settings.isConfigured}")
+                // Scroll to bottom after loading history
+                if (messages.isNotEmpty()) scrollTrigger.value++
+                if (settings.isConfigured) {
+                    // Read seq/server_id atomically to avoid mismatched state on reconnect.
+                    val (lastSeq, knownServerId) = settings.getWsState()
+                    // Restore WS seq state so reconnect doesn't replay everything.
+                    wsManager.restoreState(lastSeq, knownServerId)
+                    connect()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("WS", "init FAILED", e)
             }
         }
     }
@@ -154,9 +207,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         WorkManager.getInstance(getApplication())
             .enqueueUniquePeriodicWork(
                 SyncWorker.WORK_NAME,
-                ExistingPeriodicWorkPolicy.KEEP,
+                ExistingPeriodicWorkPolicy.UPDATE,
                 request
             )
+    }
+
+    private fun scheduleImmediateSyncWorker() {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+        val request = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setConstraints(constraints)
+            .setInitialDelay(5, TimeUnit.SECONDS)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
+        WorkManager.getInstance(getApplication())
+            .enqueueUniqueWork(
+                SyncWorker.IMMEDIATE_WORK_NAME,
+                ExistingWorkPolicy.REPLACE,
+                request
+            )
+    }
+
+    private fun cancelSyncWorkers() {
+        WorkManager.getInstance(getApplication())
+            .cancelUniqueWork(SyncWorker.WORK_NAME)
+        WorkManager.getInstance(getApplication())
+            .cancelUniqueWork(SyncWorker.IMMEDIATE_WORK_NAME)
     }
 
     private fun createMessageNotificationChannel() {
@@ -202,6 +279,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connect() {
+        android.util.Log.d("WS", "ChatViewModel.connect() configured=${settings.isConfigured} url=${settings.wsUrl()}")
         if (!settings.isConfigured) return
         wsManager.connect(settings.wsUrl())
     }
@@ -269,6 +347,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun pressButton(messageId: Int, button: InlineButton) {
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         handler.post {
+            // Clear pending action bar if this was the active one
+            pendingAction.value?.let { if (it.messageId == messageId) pendingAction.value = null }
             val idx = idToIndex[messageId]
             if (idx != null && idx < messages.size && messages[idx].messageId == messageId) {
                 messages[idx] = messages[idx].copy(buttons = emptyList())
@@ -375,30 +455,68 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         sendMessage("/switch $name")
     }
 
-    private fun notifyIfBackgrounded(text: String, session: String) {
-        if (isInForeground) return
-        val app = getApplication<Application>()
-        val intent = Intent(app, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val pending = PendingIntent.getActivity(
-            app, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val preview = if (text.length > 120) text.take(120) + "..." else text
-        val notification = Notification.Builder(app, MSG_CHANNEL_ID)
-            .setContentTitle(session.ifEmpty { "Claude Bot" })
-            .setContentText(preview)
-            .setStyle(Notification.BigTextStyle().bigText(preview))
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentIntent(pending)
-            .setAutoCancel(true)
-            .build()
-        app.getSystemService(NotificationManager::class.java)
-            .notify(MSG_NOTIFICATION_ID, notification)
+    private fun sessionNotificationTag(session: String): String {
+        val key = session.ifBlank { "default" }.trim()
+        return "claudebot.session.$key"
     }
 
-    /** No-op — foreground service removed to avoid ForegroundServiceDidNotStartInTimeException.
-     *  Background sync is handled by WorkManager's periodic SyncWorker instead. */
+    private fun notifyIfBackgrounded(
+        text: String,
+        session: String,
+        eventType: String,
+        buttons: List<List<InlineButton>> = emptyList(),
+        messageId: Int = 0,
+        isReplay: Boolean = false,
+    ) {
+        if (isInForeground || isReplay) return
+        if (!settings.shouldNotifyEvent(session, messageId, eventType)) return
+        val app = getApplication<Application>()
+        val tapIntent = Intent(app, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val tapPending = PendingIntent.getActivity(
+            app, 0, tapIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val hasButtons = eventType == NOTIFY_EVENT_ACTIONABLE && buttons.flatten().isNotEmpty()
+        // Show full text for actionable messages (plan approval etc), truncate otherwise
+        val preview = if (hasButtons) text else if (text.length > 120) text.take(120) + "..." else text
+        val title = if (hasButtons) "Action Required" else session.ifEmpty { "Claude Bot" }
+        val sessionTag = sessionNotificationTag(session)
+
+        val builder = Notification.Builder(app, MSG_CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(if (hasButtons) session.ifEmpty { "Claude Bot" } else preview)
+            .setStyle(Notification.BigTextStyle().bigText(preview))
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(tapPending)
+            .setGroup(sessionTag)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(true)
+
+        // Add button actions (flatten rows, max 3 per Android limit)
+        var requestCode = 200
+        for (btn in buttons.flatten().take(3)) {
+            val actionIntent = Intent(app, NotificationActionReceiver::class.java).apply {
+                action = NotificationActionReceiver.ACTION_CALLBACK
+                putExtra(NotificationActionReceiver.EXTRA_CALLBACK_DATA, btn.callbackData)
+                putExtra(NotificationActionReceiver.EXTRA_MESSAGE_ID, messageId)
+                putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_ID, MSG_NOTIFICATION_ID)
+                putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_TAG, sessionTag)
+            }
+            val actionPending = PendingIntent.getBroadcast(
+                app, requestCode++, actionIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(Notification.Action.Builder(null, btn.text, actionPending).build())
+        }
+
+        app.getSystemService(NotificationManager::class.java)
+            .notify(sessionTag, MSG_NOTIFICATION_ID, builder.build())
+    }
+
+    /** No-op — foreground service removed to avoid ForegroundServiceDidNotStartInTimeException. */
+    @Suppress("UNUSED_PARAMETER")
     private fun updateKeepAlive(busy: Boolean) { /* no-op */ }
 
     // --- WS message handling ---
@@ -412,26 +530,57 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val mid = msg.messageId ?: 0
                     // Skip legacy "message" events for stream-tracked messages
                     // (the initial "Thinking..." and continuation messages)
-                    if (mid != 0 && mid in streamingMessageIds) return@post
+                    if (mid > 0 && mid in streamingMessageIds) return@post
                     // Skip if we already have this message in memory (replay dedup)
-                    if (mid != 0 && idToIndex.containsKey(mid)) return@post
+                    if (mid > 0 && findMessageIndex(mid) != null) return@post
+                    // Skip if this replayed message is already persisted but not currently loaded.
+                    if (mid > 0 && msg.isReplay && mid in persistedMessageIds) return@post
+                    if (mid > 0 && mid in pendingIncomingMessageIds) return@post
+
                     if (msg.session.isNotEmpty()) currentSession.value = msg.session
                     val chatMsg = ChatMessage(
                         messageId = mid,
                         text = msg.text,
                         isFromBot = true,
                         session = msg.session,
+                        isReplay = msg.isReplay,
                         timestamp = System.currentTimeMillis(),
                         buttons = msg.buttons
                     )
+
                     val idx = messages.size
                     messages.add(chatMsg)
-                    if (mid != 0) idToIndex[mid] = idx
+                    if (mid > 0) {
+                        idToIndex[mid] = idx
+                        persistedMessageIds.add(mid)
+                        pendingIncomingMessageIds.add(mid)
+                    }
                     scrollTrigger.value++
-                    notifyIfBackgrounded(msg.text, msg.session)
+                    val actionable = msg.buttons.flatten().isNotEmpty()
+                    if (actionable) {
+                        pendingAction.value = PendingAction(msg.text, msg.buttons, mid)
+                        notifyIfBackgrounded(
+                            text = msg.text,
+                            session = msg.session,
+                            eventType = NOTIFY_EVENT_ACTIONABLE,
+                            buttons = msg.buttons,
+                            messageId = mid,
+                            isReplay = msg.isReplay
+                        )
+                    }
                     viewModelScope.launch(Dispatchers.IO) {
-                        dao.insert(chatMsg.toEntity())
-                        dbOffset++
+                        try {
+                            if (mid > 0) {
+                                dao.upsertByMessageId(chatMsg.toEntity())
+                            } else {
+                                dao.insert(chatMsg.toEntity())
+                            }
+                            dbOffset++
+                        } finally {
+                            if (mid > 0) {
+                                withContext(Dispatchers.Main) { pendingIncomingMessageIds.remove(mid) }
+                            }
+                        }
                     }
                 }
                 "status" -> {
@@ -445,10 +594,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             step = msg.step,
                             active = msg.active
                         )
-                        if (msg.active) {
-                            isBotBusy.value = true
-                            updateKeepAlive(true)
-                        }
+                        isBotBusy.value = msg.active
+                        updateKeepAlive(msg.active)
                     }
                 }
                 "edit" -> {
@@ -456,46 +603,38 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // Skip legacy "edit" events for stream-tracked messages
                     if (mid in streamingMessageIds) return@post
                     if (msg.session.isNotEmpty()) currentSession.value = msg.session
-                    val idx = idToIndex[mid]
-                    if (idx != null && idx < messages.size && messages[idx].messageId == mid) {
+                    val idx = findMessageIndex(mid)
+                    if (idx != null) {
                         val updated = messages[idx].copy(
                             text = msg.text,
-                            session = msg.session.ifEmpty { messages[idx].session }
+                            session = msg.session.ifEmpty { messages[idx].session },
+                            isReplay = messages[idx].isReplay || msg.isReplay
                         )
                         messages[idx] = updated
-                        scrollTrigger.value++
+                        if (idx == messages.lastIndex) scrollTrigger.value++
                         viewModelScope.launch(Dispatchers.IO) {
                             dao.updateByMessageId(mid, updated.text, updated.session, updated.buttonsToJson())
                         }
                     } else {
-                        val fallbackIdx = messages.indexOfLast { it.messageId == mid }
-                        if (fallbackIdx >= 0) {
-                            idToIndex[mid] = fallbackIdx
-                            val updated = messages[fallbackIdx].copy(
-                                text = msg.text,
-                                session = msg.session.ifEmpty { messages[fallbackIdx].session }
-                            )
-                            messages[fallbackIdx] = updated
-                            scrollTrigger.value++
-                            viewModelScope.launch(Dispatchers.IO) {
-                                dao.updateByMessageId(mid, updated.text, updated.session, updated.buttonsToJson())
-                            }
-                        } else {
-                            val chatMsg = ChatMessage(
-                                messageId = mid,
-                                text = msg.text,
-                                isFromBot = true,
-                                session = msg.session,
-                                timestamp = System.currentTimeMillis()
-                            )
-                            val newIdx = messages.size
-                            messages.add(chatMsg)
-                            idToIndex[mid] = newIdx
-                            scrollTrigger.value++
-                            viewModelScope.launch(Dispatchers.IO) {
-                                dao.insert(chatMsg.toEntity())
-                                dbOffset++
-                            }
+                        // Replayed edit for an older, non-loaded message: keep DB as source of truth.
+                        if (msg.isReplay && mid in persistedMessageIds) return@post
+
+                        val chatMsg = ChatMessage(
+                            messageId = mid,
+                            text = msg.text,
+                            isFromBot = true,
+                            session = msg.session,
+                            isReplay = msg.isReplay,
+                            timestamp = System.currentTimeMillis()
+                        )
+                        val newIdx = messages.size
+                        messages.add(chatMsg)
+                        idToIndex[mid] = newIdx
+                        persistedMessageIds.add(mid)
+                        scrollTrigger.value++
+                        viewModelScope.launch(Dispatchers.IO) {
+                            dao.upsertByMessageId(chatMsg.toEntity())
+                            dbOffset++
                         }
                     }
                 }
@@ -510,39 +649,38 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // Mark this message for stream-based updates (skip legacy edit events)
                 streamingMessageIds.add(mid)
                 if (msg.session.isNotEmpty()) currentSession.value = msg.session
-                val existing = idToIndex[mid]
-                if (existing != null && existing < messages.size && messages[existing].messageId == mid) {
-                    // Message already exists (from DB load or replay) — reuse it
-                    messages[existing] = messages[existing].copy(text = "")
-                } else if (existing != null) {
-                    // Stale index — rebuild and check again
-                    val fallback = messages.indexOfLast { it.messageId == mid }
-                    if (fallback >= 0) {
-                        idToIndex[mid] = fallback
-                        messages[fallback] = messages[fallback].copy(text = "")
-                    } else {
-                        val chatMsg = ChatMessage(
-                            messageId = mid, text = "", isFromBot = true,
-                            session = msg.session, timestamp = System.currentTimeMillis()
-                        )
-                        val idx = messages.size
-                        messages.add(chatMsg)
-                        idToIndex[mid] = idx
-                    }
-                } else {
-                    // New message — create empty bot message
-                    val chatMsg = ChatMessage(
-                        messageId = mid,
+
+                val existing = findMessageIndex(mid)
+                if (existing != null) {
+                    if (messages[existing].text.contains("———")) return  // Already finalized, skip
+                    messages[existing] = messages[existing].copy(
                         text = "",
-                        isFromBot = true,
-                        session = msg.session,
-                        timestamp = System.currentTimeMillis()
+                        isReplay = messages[existing].isReplay || msg.isReplay
                     )
-                    val idx = messages.size
-                    messages.add(chatMsg)
-                    idToIndex[mid] = idx
+                    if (existing == messages.lastIndex) scrollTrigger.value++
+                    return
                 }
+
+                // Already finalized from earlier replay/session; do not resurrect.
+                if (msg.isReplay && mid in finalizedMessageIds) {
+                    streamingMessageIds.remove(mid)
+                    return
+                }
+
+                // New stream message: create in memory immediately to preserve event order.
+                val chatMsg = ChatMessage(
+                    messageId = mid, text = "", isFromBot = true,
+                    session = msg.session, isReplay = msg.isReplay, timestamp = System.currentTimeMillis()
+                )
+                val idx = messages.size
+                messages.add(chatMsg)
+                idToIndex[mid] = idx
+                persistedMessageIds.add(mid)
                 scrollTrigger.value++
+                viewModelScope.launch(Dispatchers.IO) {
+                    dao.upsertByMessageId(chatMsg.toEntity())
+                }
+                lastStreamPersist[mid] = System.currentTimeMillis()
             }
             "skip" -> {
                 // Server tells us to ignore this message ID (TG continuation message)
@@ -550,34 +688,60 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             "append" -> {
                 // If we missed the "start" (e.g. reconnect mid-stream), create the message
+                var idx = findMessageIndex(mid)
                 if (mid !in streamingMessageIds) {
                     streamingMessageIds.add(mid)
-                    if (idToIndex[mid] == null) {
-                        val chatMsg = ChatMessage(
-                            messageId = mid, text = "", isFromBot = true,
-                            session = msg.session, timestamp = System.currentTimeMillis()
-                        )
-                        val newIdx = messages.size
-                        messages.add(chatMsg)
-                        idToIndex[mid] = newIdx
-                    }
                 }
-                val idx = idToIndex[mid]
-                if (idx != null && idx < messages.size && messages[idx].messageId == mid) {
-                    // Strip tool status line if present before appending text
-                    var currentText = messages[idx].text
-                    if (currentText.endsWith("\u200B")) {
-                        // Remove the tool status line (everything from last newline before marker)
-                        val lastNl = currentText.lastIndexOf('\n', currentText.length - 2)
-                        currentText = if (lastNl >= 0) currentText.substring(0, lastNl) else ""
+                if (idx == null) {
+                    // Replayed append for a finalized message we already have in DB: ignore.
+                    if (msg.isReplay && mid in finalizedMessageIds) return
+                    val chatMsg = ChatMessage(
+                        messageId = mid, text = "", isFromBot = true,
+                        session = msg.session, isReplay = msg.isReplay, timestamp = System.currentTimeMillis()
+                    )
+                    val newIdx = messages.size
+                    messages.add(chatMsg)
+                    idToIndex[mid] = newIdx
+                    persistedMessageIds.add(mid)
+                    // Persist new entry immediately
+                    viewModelScope.launch(Dispatchers.IO) { dao.upsertByMessageId(chatMsg.toEntity()) }
+                    lastStreamPersist[mid] = System.currentTimeMillis()
+                    idx = newIdx
+                }
+                val appendIdx = idx
+                // Strip tool status line if present before appending text
+                var currentText = messages[appendIdx].text
+                if (currentText.endsWith("\u200B")) {
+                    // Remove the tool status line (everything from last newline before marker)
+                    val lastNl = currentText.lastIndexOf('\n', currentText.length - 2)
+                    currentText = if (lastNl >= 0) currentText.substring(0, lastNl) else ""
+                }
+                val newText = currentText + msg.text
+                messages[appendIdx] = messages[appendIdx].copy(
+                    text = newText,
+                    isReplay = messages[appendIdx].isReplay || msg.isReplay
+                )
+                if (appendIdx == messages.lastIndex) scrollTrigger.value++
+                // Debounced DB persist — save accumulated text every 2s
+                val now = System.currentTimeMillis()
+                val lastPersist = lastStreamPersist[mid] ?: 0L
+                if (now - lastPersist >= STREAM_PERSIST_INTERVAL_MS) {
+                    lastStreamPersist[mid] = now
+                    val session = messages[appendIdx].session
+                    val timestamp = messages[appendIdx].timestamp
+                    viewModelScope.launch(Dispatchers.IO) {
+                        dao.upsertByMessageId(
+                            MessageEntity(
+                                messageId = mid, text = newText, isFromBot = true,
+                                session = session, timestamp = timestamp
+                            )
+                        )
                     }
-                    messages[idx] = messages[idx].copy(text = currentText + msg.text)
-                    scrollTrigger.value++
                 }
             }
             "tool" -> {
-                val idx = idToIndex[mid]
-                if (idx != null && idx < messages.size && messages[idx].messageId == mid) {
+                val idx = findMessageIndex(mid)
+                if (idx != null) {
                     var currentText = messages[idx].text
                     // Remove existing tool status line if present
                     if (currentText.endsWith("\u200B")) {
@@ -587,88 +751,85 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // Append tool status as a replaceable line (marked with zero-width space)
                     val toolLine = formatToolStatus(msg.tool, msg.path)
                     messages[idx] = messages[idx].copy(text = currentText + "\n" + toolLine + "\u200B")
-                    scrollTrigger.value++
+                    if (idx == messages.lastIndex) scrollTrigger.value++
                 }
             }
             "done" -> {
                 streamingMessageIds.remove(mid)
+                lastStreamPersist.remove(mid)
+                val doneExisting = findMessageIndex(mid)
+                // Skip if already finalized in memory (replay of completed message)
+                if (doneExisting != null && messages[doneExisting].text.contains("———")) return
                 if (msg.session.isNotEmpty()) currentSession.value = msg.session
+                val parsedChanges = msg.fileChanges.map { fc ->
+                    FileChange(
+                        type = fc["type"] ?: "",
+                        path = fc["path"] ?: "",
+                        old = fc["old"] ?: "",
+                        new = fc["new"] ?: "",
+                        content = fc["content"] ?: ""
+                    )
+                }
                 val finalText = buildString {
                     append(msg.text)
-                    append(formatFileChanges(msg.fileChanges))
                     append("\n\n———\n")
                     append(if (msg.cancelled) "⚠️ _cancelled_" else "✓ _complete_")
                 }
-                val idx = idToIndex[mid]
-                if (idx != null && idx < messages.size && messages[idx].messageId == mid) {
+
+                val idx = doneExisting
+                if (idx != null) {
                     val updated = messages[idx].copy(
                         text = finalText,
-                        session = msg.session.ifEmpty { messages[idx].session }
+                        session = msg.session.ifEmpty { messages[idx].session },
+                        isReplay = messages[idx].isReplay || msg.isReplay,
+                        fileChanges = parsedChanges
                     )
                     messages[idx] = updated
-                    scrollTrigger.value++
-                    notifyIfBackgrounded(finalText, msg.session)
-                    // Persist final text to DB
+                    if (idx == messages.lastIndex) scrollTrigger.value++
+                    notifyIfBackgrounded(
+                        text = finalText,
+                        session = updated.session,
+                        eventType = NOTIFY_EVENT_TERMINAL,
+                        messageId = mid,
+                        isReplay = msg.isReplay
+                    )
+                    persistedMessageIds.add(mid)
+                    finalizedMessageIds.add(mid)
                     viewModelScope.launch(Dispatchers.IO) {
-                        dao.insert(updated.toEntity())
-                        dbOffset++
+                        dao.upsertByMessageId(updated.toEntity())
                     }
                 } else {
-                    // Index missing or stale — search list before creating
-                    val fallback = messages.indexOfLast { it.messageId == mid }
-                    if (fallback >= 0) {
-                        idToIndex[mid] = fallback
-                        val updated = messages[fallback].copy(
-                            text = finalText,
-                            session = msg.session.ifEmpty { messages[fallback].session }
-                        )
-                        messages[fallback] = updated
-                        scrollTrigger.value++
-                        notifyIfBackgrounded(finalText, msg.session)
-                        viewModelScope.launch(Dispatchers.IO) {
-                            dao.insert(updated.toEntity())
-                            dbOffset++
-                        }
-                    } else {
-                        val chatMsg = ChatMessage(
-                            messageId = mid,
-                            text = finalText,
-                            isFromBot = true,
-                            session = msg.session,
-                            timestamp = System.currentTimeMillis()
-                        )
-                        val newIdx = messages.size
-                        messages.add(chatMsg)
-                        idToIndex[mid] = newIdx
-                        scrollTrigger.value++
-                        notifyIfBackgrounded(finalText, msg.session)
-                        viewModelScope.launch(Dispatchers.IO) {
-                            dao.insert(chatMsg.toEntity())
-                            dbOffset++
-                        }
+                    // Replayed terminal event for an already finalized, non-loaded message.
+                    if (msg.isReplay && mid in finalizedMessageIds) return
+
+                    val chatMsg = ChatMessage(
+                        messageId = mid,
+                        text = finalText,
+                        isFromBot = true,
+                        session = msg.session,
+                        isReplay = msg.isReplay,
+                        timestamp = System.currentTimeMillis(),
+                        fileChanges = parsedChanges
+                    )
+                    val newIdx = messages.size
+                    messages.add(chatMsg)
+                    idToIndex[mid] = newIdx
+                    persistedMessageIds.add(mid)
+                    finalizedMessageIds.add(mid)
+                    scrollTrigger.value++
+                    notifyIfBackgrounded(
+                        text = finalText,
+                        session = chatMsg.session,
+                        eventType = NOTIFY_EVENT_TERMINAL,
+                        messageId = mid,
+                        isReplay = msg.isReplay
+                    )
+                    viewModelScope.launch(Dispatchers.IO) {
+                        dao.upsertByMessageId(chatMsg.toEntity())
                     }
                 }
             }
         }
-    }
-
-    private fun formatFileChanges(changes: List<Map<String, String>>): String {
-        if (changes.isEmpty()) return ""
-        val sb = StringBuilder("\n\n\uD83D\uDCC1 *File Operations:*")
-        for (change in changes) {
-            val type = change["type"] ?: ""
-            val path = change["path"] ?: ""
-            val shortPath = if (path.length > 80) path.takeLast(77).let { "...$it" } else path
-            when (type) {
-                "write" -> sb.append("\n  ✅ Created: `$shortPath`")
-                "edit" -> sb.append("\n  ✅ Edited: `$shortPath`")
-                "bash" -> sb.append("\n  ✅ Ran: `$shortPath`")
-                "read" -> sb.append("\n  \uD83D\uDCD6 Read: `$shortPath`")
-                "glob", "grep" -> sb.append("\n  \uD83D\uDD0D Search: `$shortPath`")
-                else -> sb.append("\n  ✅ $type: `$shortPath`")
-            }
-        }
-        return sb.toString()
     }
 
     private fun formatToolStatus(tool: String, path: String): String {
@@ -681,6 +842,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "glob", "grep" -> "\uD83D\uDD0D Searching: `$shortPath`"
             else -> "\uD83D\uDD27 $tool: `$shortPath`"
         }
+    }
+
+    /** Validate fast map lookup and recover from stale indexes by linear fallback. */
+    private fun findMessageIndex(messageId: Int): Int? {
+        if (messageId == 0) return null
+        val idx = idToIndex[messageId]
+        if (idx != null && idx < messages.size && messages[idx].messageId == messageId) {
+            return idx
+        }
+        val fallback = messages.indexOfLast { it.messageId == messageId }
+        if (fallback >= 0) {
+            idToIndex[messageId] = fallback
+            return fallback
+        }
+        idToIndex.remove(messageId)
+        return null
     }
 
     private fun rebuildIndex() {

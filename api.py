@@ -47,6 +47,16 @@ _WS_BUFFER_MAX = 500
 _server_id = str(uuid.uuid4())[:8]  # Unique ID per server boot
 
 
+def _with_replay_flag(payload: str, is_replay: bool) -> str:
+    """Return payload JSON with explicit replay flag for client-side UX decisions."""
+    try:
+        obj = json.loads(payload)
+        obj["is_replay"] = bool(is_replay)
+        return json.dumps(obj)
+    except Exception:
+        return payload
+
+
 def init_refs(**kwargs):
     """Receive references to bot.py functions and shared dicts."""
     global _handle_command, _handle_message, _handle_callback_query
@@ -106,7 +116,13 @@ def broadcast_ws(chat_id, event_type, data):
     with _ws_lock:
         _ws_seq += 1
         seq = _ws_seq
-        payload = json.dumps({"seq": seq, "type": event_type, "chat_id": int(chat_id), **data})
+        payload = json.dumps({
+            "seq": seq,
+            "type": event_type,
+            "chat_id": int(chat_id),
+            "is_replay": False,
+            **data,
+        })
 
         # Always buffer for replay on reconnect (filtered at replay time)
         _ws_buffer.append((seq, payload))
@@ -294,14 +310,15 @@ async def ws_endpoint(
             # Client's seq is ahead — server was restarted, replay full buffer
             replay = list(_ws_buffer)
         else:
-            # Fresh connect (last_seq=0) — replay full buffer
+            # Fresh connect (last_seq=0) — replay full buffer so client
+            # catches up on anything it missed (e.g. first-time connect).
             replay = list(_ws_buffer)
     print(f"[WS] Client connected (last_seq={last_seq}, replaying {len(replay)})", flush=True)
 
     # Replay missed messages (throttled to avoid flooding)
     for i, (_, payload) in enumerate(replay):
         try:
-            await websocket.send_text(payload)
+            await websocket.send_text(_with_replay_flag(payload, True))
             if (i + 1) % 10 == 0:
                 await asyncio.sleep(0.05)
         except Exception:
@@ -327,7 +344,7 @@ async def ws_endpoint(
                             print(f"[WS] Resend request from_seq={from_seq}, sending {len(resend)} messages", flush=True)
                             for _, p in resend:
                                 try:
-                                    await websocket.send_text(p)
+                                    await websocket.send_text(_with_replay_flag(p, True))
                                 except Exception:
                                     break
                         else:

@@ -52,7 +52,9 @@ private val COMMANDS = listOf(
 fun InputBar(
     onSend: (String) -> Unit,
     enabled: Boolean = true,
-    currentSession: String = ""
+    currentSession: String = "",
+    isBusy: Boolean = false,
+    onCancel: () -> Unit = {}
 ) {
     var text by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
@@ -202,24 +204,42 @@ fun InputBar(
 
                 Spacer(Modifier.width(8.dp))
 
-                FilledIconButton(
-                    onClick = {
-                        if (text.isNotBlank()) {
+                if (isBusy && text.isBlank()) {
+                    // Cancel button when bot is busy and no text typed
+                    FilledIconButton(
+                        onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onSend(text.trim())
-                            text = ""
-                            keyboard?.hide()
-                        }
-                    },
-                    enabled = enabled && text.isNotBlank(),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = AccentOrange,
-                        contentColor = UserBubbleText,
-                        disabledContainerColor = DarkSurfaceVariant,
-                        disabledContentColor = PlaceholderText,
-                    )
-                ) {
-                    Text("\u2191", style = MaterialTheme.typography.titleMedium)
+                            onCancel()
+                        },
+                        modifier = Modifier.size(40.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = DisconnectedRed,
+                            contentColor = UserBubbleText,
+                        )
+                    ) {
+                        Text("\u25A0", style = MaterialTheme.typography.titleMedium)
+                    }
+                } else {
+                    // Send button
+                    FilledIconButton(
+                        onClick = {
+                            if (text.isNotBlank()) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onSend(text.trim())
+                                text = ""
+                                keyboard?.hide()
+                            }
+                        },
+                        enabled = enabled && text.isNotBlank(),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = AccentOrange,
+                            contentColor = UserBubbleText,
+                            disabledContainerColor = DarkSurfaceVariant,
+                            disabledContentColor = PlaceholderText,
+                        )
+                    ) {
+                        Text("\u2191", style = MaterialTheme.typography.titleMedium)
+                    }
                 }
             }
         }

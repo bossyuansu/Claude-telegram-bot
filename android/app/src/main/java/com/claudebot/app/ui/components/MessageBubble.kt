@@ -1,5 +1,6 @@
 package com.claudebot.app.ui.components
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -22,10 +23,14 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.claudebot.app.data.ChatMessage
+import com.claudebot.app.data.FileChange
 import com.claudebot.app.data.InlineButton
 import com.claudebot.app.ui.theme.*
 import com.claudebot.app.util.MessageSegment
@@ -180,6 +185,12 @@ fun MessageBubble(
             }
         }
 
+        // File changes / diff viewer
+        if (message.fileChanges.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            FileChangesSection(message.fileChanges)
+        }
+
         // Inline keyboard buttons
         if (message.buttons.isNotEmpty() && onButtonClick != null) {
             Spacer(Modifier.height(4.dp))
@@ -217,6 +228,14 @@ fun MessageBubble(
 
         // Timestamp + copied indicator
         Row(verticalAlignment = Alignment.CenterVertically) {
+            if (message.isReplay) {
+                Text(
+                    text = "replayed",
+                    fontSize = 10.sp,
+                    color = AccentOrangeLight,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                )
+            }
             Text(
                 text = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(message.timestamp)),
                 fontSize = 10.sp,
@@ -229,6 +248,202 @@ fun MessageBubble(
                     fontSize = 10.sp,
                     color = ConnectedGreen,
                     modifier = Modifier.padding(start = 4.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FileChangesSection(changes: List<FileChange>) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(
+        modifier = Modifier
+            .widthIn(max = 320.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .border(1.dp, BotBubbleBorder, RoundedCornerShape(8.dp))
+            .background(DarkSurface)
+            .animateContentSize()
+    ) {
+        // Header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "File Operations (${changes.size})",
+                fontSize = 12.sp,
+                color = AccentOrangeLight,
+                fontFamily = FontFamily.Monospace
+            )
+            Text(
+                text = if (expanded) "▲" else "▼",
+                fontSize = 10.sp,
+                color = SessionLabel
+            )
+        }
+
+        if (expanded) {
+            changes.forEach { change ->
+                FileChangeItem(change)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FileChangeItem(change: FileChange) {
+    val clipboard = LocalClipboardManager.current
+    val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    var showDiff by remember { mutableStateOf(false) }
+    var showCopiedPath by remember { mutableStateOf(false) }
+    val hasDiff = change.old.isNotEmpty() || change.new.isNotEmpty() || change.content.isNotEmpty()
+    val icon = when (change.type) {
+        "edit" -> "✏️"
+        "write" -> "📝"
+        "bash" -> "⚡"
+        "read" -> "📖"
+        "glob" -> "🔍"
+        "grep" -> "🔎"
+        else -> "📄"
+    }
+    val parts = change.path.split("/")
+    val shortPath = parts.takeLast(3).joinToString("/").ifEmpty { change.path.take(60) }
+    val isTruncated = parts.size > 3
+    val displayPath = if (isTruncated) ".../$shortPath" else shortPath
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(text = icon, fontSize = 12.sp)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = if (showCopiedPath) "Copied!" else displayPath,
+                fontSize = 11.sp,
+                color = if (showCopiedPath) ConnectedGreen else BotText,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier
+                    .weight(1f)
+                    .combinedClickable(
+                        onClick = { if (hasDiff) showDiff = !showDiff },
+                        onLongClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            clipboard.setText(AnnotatedString(change.path))
+                            showCopiedPath = true
+                            scope.launch { delay(1500); showCopiedPath = false }
+                        }
+                    ),
+                maxLines = 1
+            )
+            if (hasDiff) {
+                Text(
+                    text = if (showDiff) "▲" else "▼",
+                    fontSize = 9.sp,
+                    color = SessionLabel
+                )
+            }
+        }
+
+        if (showDiff) {
+            when (change.type) {
+                "edit" -> DiffView(old = change.old, new = change.new)
+                "write" -> NewFileView(content = change.content)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiffView(old: String, new: String) {
+    val diffText = buildAnnotatedString {
+        if (old.isNotEmpty()) {
+            old.lines().forEach { line ->
+                withStyle(SpanStyle(color = DiffRemovedText)) {
+                    append("- $line\n")
+                }
+            }
+        }
+        if (new.isNotEmpty()) {
+            new.lines().forEach { line ->
+                withStyle(SpanStyle(color = DiffAddedText)) {
+                    append("+ $line\n")
+                }
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(CodeBlockBg)
+            .horizontalScroll(rememberScrollState())
+            .padding(8.dp)
+    ) {
+        Column {
+            Text(
+                text = diffText,
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                lineHeight = 14.sp
+            )
+            if (old.length >= 2990 || new.length >= 2990) {
+                Text(
+                    text = "(truncated)",
+                    fontSize = 9.sp,
+                    color = SessionLabel
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NewFileView(content: String) {
+    val text = buildAnnotatedString {
+        content.lines().forEach { line ->
+            withStyle(SpanStyle(color = DiffAddedText)) {
+                append("+ $line\n")
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(CodeBlockBg)
+            .horizontalScroll(rememberScrollState())
+            .padding(8.dp)
+    ) {
+        Column {
+            Text(
+                text = text,
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                lineHeight = 14.sp
+            )
+            if (content.length >= 2990) {
+                Text(
+                    text = "(truncated)",
+                    fontSize = 9.sp,
+                    color = SessionLabel
                 )
             }
         }

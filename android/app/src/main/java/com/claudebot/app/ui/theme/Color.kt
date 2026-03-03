@@ -45,3 +45,9 @@ val TopBarTitle = Color(0xFFE4E4ED)
 
 // Timestamp
 val TimestampColor = Color(0xFF5C5C72)
+
+// Diff viewer
+val DiffAddedText = Color(0xFF34D399)
+val DiffAddedBg = Color(0x1A34D399)
+val DiffRemovedText = Color(0xFFF87171)
+val DiffRemovedBg = Color(0x1AF87171)
