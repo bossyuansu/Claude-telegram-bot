@@ -459,7 +459,6 @@ def _ws_broadcast_schedule(chat_id, event, task_id, task):
             "schedule_type": task["schedule_type"],
             "cron_expr": task.get("cron_expr"),
             "run_at": task.get("run_at"),
-            "mode": task["mode"],
             "enabled": task["enabled"],
             "next_run": task.get("next_run"),
             "last_run": task.get("last_run"),
@@ -582,7 +581,7 @@ def save_scheduled_tasks():
             print(f"Error saving scheduled tasks: {e}", flush=True)
 
 
-def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_expr=None, run_at=None, mode="justdoit"):
+def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_expr=None, run_at=None):
     """Create a new scheduled task. Returns (task_id, task_dict) or raises ValueError."""
     import uuid
     task_id = f"sched_{uuid.uuid4().hex[:8]}"
@@ -607,9 +606,6 @@ def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_exp
     else:
         raise ValueError(f"Invalid schedule_type: {schedule_type}")
 
-    if mode not in ("justdoit", "remind"):
-        raise ValueError(f"Invalid mode: {mode}")
-
     task = {
         "id": task_id,
         "chat_id": str(chat_id),
@@ -618,7 +614,6 @@ def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_exp
         "schedule_type": schedule_type,
         "cron_expr": cron_expr,
         "run_at": run_at,
-        "mode": mode,
         "enabled": True,
         "created_at": time.time(),
         "last_run": None,
@@ -636,9 +631,10 @@ def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_exp
 # --- Scheduler thread ---
 
 def _trigger_scheduled_task(task_id, task):
-    """Execute a due scheduled task: launch JustDoIt or send a reminder."""
+    """Execute a due scheduled task by routing the prompt as if the user typed it."""
     chat_id = int(task["chat_id"])
     session_name = task["session_name"]
+    prompt = task.get("prompt", "")
 
     # Find the session
     user_data = user_sessions.get(str(chat_id), {})
@@ -669,24 +665,17 @@ def _trigger_scheduled_task(task_id, task):
     save_scheduled_tasks()
     _ws_broadcast_schedule(chat_id, "triggered", task_id, task)
 
-    if task["mode"] == "justdoit":
-        session_id = get_session_id(session)
-        jdi_key = f"{chat_id}:{session_id}"
-        if (justdoit_active.get(jdi_key, {}).get("active")
-                or omni_active.get(jdi_key, {}).get("active")
-                or deepreview_active.get(jdi_key, {}).get("active")
-                or session_id in active_processes):
-            send_message(chat_id, f"⏰ Scheduled task fired but session `{session_name}` is busy. Skipping.\n\nTask: _{task['prompt'][:200]}_")
-            return
-        send_message(chat_id, f"⏰ *Scheduled task triggered*\nSession: `{session_name}`\nTask: _{task['prompt'][:200]}_")
-        thread = threading.Thread(
-            target=run_justdoit_loop,
-            args=(chat_id, task["prompt"], session),
-            daemon=True,
-        )
-        thread.start()
-    elif task["mode"] == "remind":
-        send_message(chat_id, f"⏰ *Scheduled reminder*\nSession: `{session_name}`\n\n{task['prompt']}")
+    send_message(chat_id, f"⏰ *Scheduled task triggered*\nSession: `{session_name}`\nTask: _{prompt[:200]}_")
+
+    # Switch to target session so commands (which call get_active_session internally) pick it up
+    session_id = get_session_id(session)
+    set_active_session(chat_id, session_id)
+
+    # Route exactly like a user message
+    if prompt.startswith("/"):
+        handle_command(chat_id, prompt)
+    else:
+        handle_message(chat_id, prompt, session=session)
 
 
 def _start_scheduler():
@@ -5394,12 +5383,6 @@ Add `remind` before the spec to get a reminder instead of auto-execution:
             send_message(chat_id, f"❌ Session `{session_name}` not found.")
             return True
 
-        # Parse mode
-        mode = "justdoit"
-        if spec_raw.lower().startswith("remind "):
-            mode = "remind"
-            spec_raw = spec_raw[7:].strip()
-
         # Parse schedule spec
         try:
             spec_lower = spec_raw.lower()
@@ -5433,11 +5416,10 @@ Add `remind` before the spec to get a reminder instead of auto-execution:
 
             task_id, task = create_scheduled_task(
                 chat_id, session_name, prompt, schedule_type,
-                cron_expr=cron_expr, run_at=run_at, mode=mode,
+                cron_expr=cron_expr, run_at=run_at,
             )
             next_dt = datetime.fromtimestamp(task["next_run"]).strftime("%Y-%m-%d %H:%M") if task.get("next_run") else "?"
-            mode_label = "🤖 Auto-execute" if mode == "justdoit" else "🔔 Remind"
-            send_message(chat_id, f"✅ *Scheduled task created*\nID: `{task_id}`\nSession: `{session_name}`\nMode: {mode_label}\nNext run: {next_dt}\n\nTask: _{prompt[:200]}_")
+            send_message(chat_id, f"✅ *Scheduled task created*\nID: `{task_id}`\nSession: `{session_name}`\nNext run: {next_dt}\n\nTask: _{prompt[:200]}_")
         except ValueError as e:
             send_message(chat_id, f"❌ {e}")
         return True
@@ -5454,13 +5436,12 @@ Add `remind` before the spec to get a reminder instead of auto-execution:
         lines = ["*Scheduled Tasks:*\n"]
         for tid, t in sorted(tasks, key=lambda x: x[1].get("next_run") or float("inf")):
             status = "✅" if t["enabled"] else "⏸"
-            mode_icon = "🤖" if t["mode"] == "justdoit" else "🔔"
             if t["schedule_type"] == "cron":
                 sched_desc = t.get("cron_expr", "?")
             else:
                 sched_desc = f"once {t.get('run_at', '?')}"
             next_dt = datetime.fromtimestamp(t["next_run"]).strftime("%m/%d %H:%M") if t.get("next_run") else "—"
-            lines.append(f"{status} {mode_icon} `{tid}`\n   {t['session_name']} • {sched_desc}\n   Next: {next_dt} • Runs: {t.get('run_count', 0)}\n   _{t['prompt'][:80]}_\n")
+            lines.append(f"{status} `{tid}`\n   {t['session_name']} • {sched_desc}\n   Next: {next_dt} • Runs: {t.get('run_count', 0)}\n   _{t['prompt'][:80]}_\n")
 
         send_message(chat_id, "\n".join(lines))
         return True
@@ -6406,12 +6387,13 @@ def process_message_queue(chat_id, session=None):
         run_claude_in_thread(chat_id, queued_text, session)
 
 
-def handle_message(chat_id, text):
-    """Handle a regular message."""
+def handle_message(chat_id, text, session=None):
+    """Handle a regular message. If session is provided, use it instead of the active session."""
     chat_key = str(chat_id)
 
     # Collect user feedback during justdoit/omni — queued for next audit/review step
-    session = get_active_session(chat_id)
+    if session is None:
+        session = get_active_session(chat_id)
     if session:
         jdi_key = f"{chat_id}:{get_session_id(session)}"
         jdi_state = justdoit_active.get(jdi_key, {})
@@ -6465,8 +6447,9 @@ def handle_message(chat_id, text):
                 run_claude_in_thread(chat_id, answer_text, session)
         return
 
-    # Get active session
-    session = get_active_session(chat_id)
+    # Get active session (unless already provided)
+    if session is None:
+        session = get_active_session(chat_id)
     session_id = get_session_id(session) if session else str(chat_id)
     print(f"[handle_message] session={session.get('name') if session else None}, last_cli={session.get('last_cli') if session else None}, id={id(session) if session else None}", flush=True)
 

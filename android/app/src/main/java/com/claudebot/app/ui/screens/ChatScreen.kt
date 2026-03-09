@@ -772,8 +772,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 AddScheduleDialog(
                     sessions = viewModel.sessionList.map { it.name },
                     onDismiss = { showAddSchedule = false },
-                    onCreate = { sessionName, prompt, scheduleType, cronExpr, runAt, mode ->
-                        viewModel.createScheduledTask(sessionName, prompt, scheduleType, cronExpr, runAt, mode)
+                    onCreate = { sessionName, prompt, scheduleType, cronExpr, runAt ->
+                        viewModel.createScheduledTask(sessionName, prompt, scheduleType, cronExpr, runAt)
                         showAddSchedule = false
                     }
                 )
@@ -1307,29 +1307,12 @@ private fun ScheduledTaskRow(
         verticalAlignment = Alignment.Top,
     ) {
         Column(modifier = Modifier.weight(1f).alpha(dimAlpha)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    task.sessionName,
-                    color = AccentOrange,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Spacer(Modifier.width(8.dp))
-                // Mode badge
-                val (modeLabel, modeColor) = if (task.mode == "justdoit") {
-                    "EXECUTE" to AccentOrange
-                } else {
-                    "REMIND" to Color(0xFF64B5F6)
-                }
-                Text(
-                    modeLabel,
-                    fontSize = 9.sp,
-                    color = DarkSurface,
-                    modifier = Modifier
-                        .background(modeColor, RoundedCornerShape(4.dp))
-                        .padding(horizontal = 5.dp, vertical = 1.dp)
-                )
-            }
+            Text(
+                task.sessionName,
+                color = AccentOrange,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
 
             Spacer(Modifier.height(3.dp))
 
@@ -1437,7 +1420,7 @@ private fun Modifier.alpha(a: Float): Modifier = this.graphicsLayer(alpha = a)
 private fun AddScheduleDialog(
     sessions: List<String>,
     onDismiss: () -> Unit,
-    onCreate: (sessionName: String, prompt: String, scheduleType: String, cronExpr: String?, runAt: String?, mode: String) -> Unit,
+    onCreate: (sessionName: String, prompt: String, scheduleType: String, cronExpr: String?, runAt: String?) -> Unit,
 ) {
     var selectedSession by remember { mutableStateOf(sessions.firstOrNull() ?: "") }
     var prompt by remember { mutableStateOf("") }
@@ -1445,7 +1428,6 @@ private fun AddScheduleDialog(
     var cronExpr by remember { mutableStateOf("0 9 * * *") }
     var runAtDate by remember { mutableStateOf("") }
     var runAtTime by remember { mutableStateOf("09:00") }
-    var mode by remember { mutableStateOf("justdoit") }
     var sessionExpanded by remember { mutableStateOf(false) }
 
     AlertDialog(
@@ -1594,30 +1576,6 @@ private fun AddScheduleDialog(
                     )
                 }
 
-                // Mode selector
-                Text("Execution mode", color = SessionLabel, fontSize = 12.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = mode == "justdoit",
-                        onClick = { mode = "justdoit" },
-                        label = { Text("Execute") },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = AccentOrange,
-                            selectedLabelColor = DarkSurface,
-                            labelColor = SessionLabel,
-                        ),
-                    )
-                    FilterChip(
-                        selected = mode == "remind",
-                        onClick = { mode = "remind" },
-                        label = { Text("Remind") },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = Color(0xFF64B5F6),
-                            selectedLabelColor = DarkSurface,
-                            labelColor = SessionLabel,
-                        ),
-                    )
-                }
             }
         },
         confirmButton = {
@@ -1626,7 +1584,7 @@ private fun AddScheduleDialog(
                     if (selectedSession.isNotEmpty() && prompt.isNotEmpty()) {
                         val finalCronExpr = if (scheduleType == "cron") cronExpr else null
                         val finalRunAt = if (scheduleType == "once") "${runAtDate}T${runAtTime}" else null
-                        onCreate(selectedSession, prompt, scheduleType, finalCronExpr, finalRunAt, mode)
+                        onCreate(selectedSession, prompt, scheduleType, finalCronExpr, finalRunAt)
                     }
                 },
                 enabled = selectedSession.isNotEmpty() && prompt.isNotEmpty(),

@@ -155,14 +155,12 @@ class ScheduleTaskRequest(BaseModel):
     schedule_type: str  # "cron" | "once"
     cron_expr: Optional[str] = None
     run_at: Optional[str] = None
-    mode: str = "justdoit"  # "justdoit" | "remind"
 
 class ScheduleTaskUpdate(BaseModel):
     enabled: Optional[bool] = None
     prompt: Optional[str] = None
     cron_expr: Optional[str] = None
     run_at: Optional[str] = None
-    mode: Optional[str] = None
 
 
 # --- Task helpers ---
@@ -560,7 +558,7 @@ def api_create_schedule_task(req: ScheduleTaskRequest, _=Depends(verify_auth)):
     try:
         task_id, task = _create_scheduled_task(
             chat_id, req.session_name, req.prompt, req.schedule_type,
-            cron_expr=req.cron_expr, run_at=req.run_at, mode=req.mode,
+            cron_expr=req.cron_expr, run_at=req.run_at,
         )
         return {"status": "created", "task_id": task_id, "next_run": task.get("next_run")}
     except ValueError as e:
@@ -579,10 +577,6 @@ def api_update_schedule_task(task_id: str, req: ScheduleTaskUpdate, _=Depends(ve
                 task["enabled"] = req.enabled
             if req.prompt is not None:
                 task["prompt"] = req.prompt
-            if req.mode is not None:
-                if req.mode not in ("justdoit", "remind"):
-                    raise HTTPException(status_code=400, detail="Invalid mode")
-                task["mode"] = req.mode
             if req.cron_expr is not None:
                 task["cron_expr"] = req.cron_expr
                 task["schedule_type"] = "cron"

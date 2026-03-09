@@ -74,7 +74,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val scheduleType: String,  // "cron" | "once"
         val cronExpr: String?,
         val runAt: String?,
-        val mode: String,          // "justdoit" | "remind"
         val enabled: Boolean,
         val nextRun: Long?,        // epoch seconds
         val lastRun: Long?,
@@ -722,7 +721,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             scheduleType = t.optString("schedule_type"),
                             cronExpr = if (t.has("cron_expr") && !t.isNull("cron_expr")) t.optString("cron_expr") else null,
                             runAt = if (t.has("run_at") && !t.isNull("run_at")) t.optString("run_at") else null,
-                            mode = t.optString("mode"),
                             enabled = t.optBoolean("enabled", true),
                             nextRun = if (t.has("next_run") && !t.isNull("next_run")) t.optLong("next_run") else null,
                             lastRun = if (t.has("last_run") && !t.isNull("last_run")) t.optLong("last_run") else null,
@@ -740,7 +738,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun createScheduledTask(
         sessionName: String, prompt: String, scheduleType: String,
-        cronExpr: String?, runAt: String?, mode: String,
+        cronExpr: String?, runAt: String?,
     ) {
         sendExecutor.submit {
             try {
@@ -751,7 +749,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     put("schedule_type", scheduleType)
                     if (cronExpr != null) put("cron_expr", cronExpr)
                     if (runAt != null) put("run_at", runAt)
-                    put("mode", mode)
                 }.toString()
                 val body = json.toRequestBody("application/json".toMediaType())
                 val reqBuilder = Request.Builder().url(url).post(body)
