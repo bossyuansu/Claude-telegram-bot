@@ -1300,32 +1300,42 @@ private fun ScheduledTaskRow(
     onDelete: (String) -> Unit,
 ) {
     val dimAlpha = if (task.enabled) 1f else 0.5f
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.Top,
     ) {
-        Column(modifier = Modifier.weight(1f).alpha(dimAlpha)) {
+        // Header: session name + switch
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             Text(
                 task.sessionName,
-                color = AccentOrange,
+                color = AccentOrange.copy(alpha = dimAlpha),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
             )
+            Switch(
+                checked = task.enabled,
+                onCheckedChange = { onToggle(task.id, it) },
+                modifier = Modifier.height(28.dp),
+                colors = SwitchDefaults.colors(
+                    checkedTrackColor = AccentOrange,
+                    uncheckedTrackColor = InputBorder,
+                ),
+            )
+        }
 
-            Spacer(Modifier.height(3.dp))
-
-            // Schedule description
+        // Details
+        Column(modifier = Modifier.alpha(dimAlpha)) {
             Text(
                 formatScheduleDescription(task),
                 color = SessionLabel,
                 fontSize = 12.sp,
             )
-
             Spacer(Modifier.height(2.dp))
-
-            // Prompt preview
             Text(
                 task.prompt,
                 color = BotText.copy(alpha = 0.7f),
@@ -1333,8 +1343,6 @@ private fun ScheduledTaskRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-
-            // Next run
             if (task.nextRun != null) {
                 Spacer(Modifier.height(2.dp))
                 val relTime = formatRelativeTime(task.nextRun)
@@ -1346,31 +1354,28 @@ private fun ScheduledTaskRow(
             }
         }
 
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Switch(
-                checked = task.enabled,
-                onCheckedChange = { onToggle(task.id, it) },
-                modifier = Modifier.height(28.dp),
-                colors = SwitchDefaults.colors(
-                    checkedTrackColor = AccentOrange,
-                    uncheckedTrackColor = InputBorder,
-                ),
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Run Now",
-                color = ConnectedGreen,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.clickable { onTrigger(task.id) },
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Delete",
-                color = Color(0xFFCF6679),
-                fontSize = 11.sp,
-                modifier = Modifier.clickable { onDelete(task.id) },
-            )
+        // Action buttons
+        Spacer(Modifier.height(6.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            OutlinedButton(
+                onClick = { onTrigger(task.id) },
+                modifier = Modifier.height(32.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                border = BorderStroke(1.dp, ConnectedGreen),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = ConnectedGreen),
+            ) {
+                Text("Run Now", fontSize = 12.sp)
+            }
+            TextButton(
+                onClick = { onDelete(task.id) },
+                modifier = Modifier.height(32.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+            ) {
+                Text("Delete", color = Color(0xFFCF6679), fontSize = 12.sp)
+            }
         }
     }
 }
