@@ -739,16 +739,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun createScheduledTask(
-        prompt: String, scheduleType: String,
+        sessionName: String, prompt: String, scheduleType: String,
         cronExpr: String?, runAt: String?,
     ) {
         sendExecutor.submit {
             try {
                 val url = "http://${settings.host}:${settings.port}/api/schedule-task"
                 val json = JSONObject().apply {
-                    // Server resolves active session's cwd if no explicit session_name
-                    val activeSession = sessionList.find { it.name == currentSession.value }
-                    if (activeSession != null) put("session_name", activeSession.name)
+                    put("session_name", sessionName)
                     put("prompt", prompt)
                     put("schedule_type", scheduleType)
                     if (cronExpr != null) put("cron_expr", cronExpr)

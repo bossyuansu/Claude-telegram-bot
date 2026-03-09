@@ -774,9 +774,10 @@ fun ChatScreen(viewModel: ChatViewModel) {
             }
             if (showAddSchedule) {
                 AddScheduleDialog(
+                    sessions = viewModel.sessionList.map { it.name },
                     onDismiss = { showAddSchedule = false },
-                    onCreate = { prompt, scheduleType, cronExpr, runAt ->
-                        viewModel.createScheduledTask(prompt, scheduleType, cronExpr, runAt)
+                    onCreate = { sessionName, prompt, scheduleType, cronExpr, runAt ->
+                        viewModel.createScheduledTask(sessionName, prompt, scheduleType, cronExpr, runAt)
                         showAddSchedule = false
                     }
                 )
@@ -1444,14 +1445,17 @@ private fun Modifier.alpha(a: Float): Modifier = this.graphicsLayer(alpha = a)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddScheduleDialog(
+    sessions: List<String>,
     onDismiss: () -> Unit,
-    onCreate: (prompt: String, scheduleType: String, cronExpr: String?, runAt: String?) -> Unit,
+    onCreate: (sessionName: String, prompt: String, scheduleType: String, cronExpr: String?, runAt: String?) -> Unit,
 ) {
+    var selectedSession by remember { mutableStateOf(sessions.firstOrNull() ?: "") }
     var prompt by remember { mutableStateOf("") }
     var scheduleType by remember { mutableStateOf("cron") } // "cron" | "once"
     var cronExpr by remember { mutableStateOf("0 9 * * *") }
     var runAtDate by remember { mutableStateOf("") }
     var runAtTime by remember { mutableStateOf("09:00") }
+    var sessionExpanded by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1466,7 +1470,39 @@ private fun AddScheduleDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text("Uses the current session's working directory.", color = SessionLabel, fontSize = 11.sp)
+                // Session picker (used to resolve working directory)
+                Text("Working directory (from session)", color = SessionLabel, fontSize = 12.sp)
+                ExposedDropdownMenuBox(
+                    expanded = sessionExpanded,
+                    onExpandedChange = { sessionExpanded = it },
+                ) {
+                    OutlinedTextField(
+                        value = selectedSession,
+                        onValueChange = {},
+                        readOnly = true,
+                        modifier = Modifier.fillMaxWidth().menuAnchor(),
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sessionExpanded) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                    )
+                    ExposedDropdownMenu(
+                        expanded = sessionExpanded,
+                        onDismissRequest = { sessionExpanded = false },
+                        modifier = Modifier.background(DarkSurface),
+                    ) {
+                        sessions.forEach { name ->
+                            DropdownMenuItem(
+                                text = { Text(name, color = BotText) },
+                                onClick = { selectedSession = name; sessionExpanded = false },
+                            )
+                        }
+                    }
+                }
 
                 // Prompt
                 Text("Task prompt", color = SessionLabel, fontSize = 12.sp)
@@ -1570,17 +1606,18 @@ private fun AddScheduleDialog(
             }
         },
         confirmButton = {
+            val canCreate = selectedSession.isNotEmpty() && prompt.isNotEmpty()
             TextButton(
                 onClick = {
-                    if (prompt.isNotEmpty()) {
+                    if (canCreate) {
                         val finalCronExpr = if (scheduleType == "cron") cronExpr else null
                         val finalRunAt = if (scheduleType == "once") "${runAtDate}T${runAtTime}" else null
-                        onCreate(prompt, scheduleType, finalCronExpr, finalRunAt)
+                        onCreate(selectedSession, prompt, scheduleType, finalCronExpr, finalRunAt)
                     }
                 },
-                enabled = prompt.isNotEmpty(),
+                enabled = canCreate,
             ) {
-                Text("Create", color = if (prompt.isNotEmpty()) AccentOrange else SessionLabel)
+                Text("Create", color = if (canCreate) AccentOrange else SessionLabel)
             }
         },
         dismissButton = {
