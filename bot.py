@@ -65,7 +65,7 @@ _sessions_file_lock = threading.Lock()  # protects user_sessions dict and sessio
 omni_active = {}  # "chat_id:session_id" -> state
 cancelled_sessions = set()  # session_ids explicitly cancelled via /cancel
 user_feedback_queue = {}  # "chat_id:session_id" -> [messages] — user messages during justdoit/omni
-scheduled_tasks = {}  # task_id -> {id, chat_id, session_name, prompt, schedule_type, cron_expr, ...}
+scheduled_tasks = {}  # task_id -> {id, chat_id, cwd, prompt, schedule_type, cron_expr, last_result, ...}
 _scheduled_tasks_lock = threading.Lock()
 _scheduler_generation = 0
 
@@ -423,6 +423,7 @@ _api_module = None  # Set in main() after api.py is loaded
 _ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadcasts
 _ws_session_override = threading.local()  # Per-thread session name for WS broadcasts (avoids get_active_session races)
 _active_session_override = threading.local()  # Per-thread session override for scheduled tasks (avoids mutating global active session)
+_sched_result_capture = threading.local()  # Per-thread list to capture bot responses during scheduled task runs
 
 
 def _ws_broadcast(chat_id, event_type, data):
@@ -455,7 +456,7 @@ def _ws_broadcast_schedule(chat_id, event, task_id, task):
         "task_id": task_id,
         "task": {
             "id": task["id"],
-            "session_name": task["session_name"],
+            "cwd": task.get("cwd", ""),
             "prompt": (task.get("prompt") or "")[:200],
             "schedule_type": task["schedule_type"],
             "cron_expr": task.get("cron_expr"),
@@ -463,6 +464,7 @@ def _ws_broadcast_schedule(chat_id, event, task_id, task):
             "enabled": task["enabled"],
             "next_run": task.get("next_run"),
             "last_run": task.get("last_run"),
+            "last_result": (task.get("last_result") or "")[:500],
             "run_count": task.get("run_count", 0),
         }
     })
@@ -582,8 +584,10 @@ def save_scheduled_tasks():
             print(f"Error saving scheduled tasks: {e}", flush=True)
 
 
-def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_expr=None, run_at=None):
-    """Create a new scheduled task. Returns (task_id, task_dict) or raises ValueError."""
+def create_scheduled_task(chat_id, prompt, schedule_type, cron_expr=None, run_at=None, cwd=None):
+    """Create a new scheduled task. Returns (task_id, task_dict) or raises ValueError.
+    cwd: working directory for the task. If not provided, uses current directory.
+    """
     import uuid
     task_id = f"sched_{uuid.uuid4().hex[:8]}"
 
@@ -610,7 +614,7 @@ def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_exp
     task = {
         "id": task_id,
         "chat_id": str(chat_id),
-        "session_name": session_name,
+        "cwd": cwd or os.getcwd(),
         "prompt": prompt,
         "schedule_type": schedule_type,
         "cron_expr": cron_expr,
@@ -618,6 +622,7 @@ def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_exp
         "enabled": True,
         "created_at": time.time(),
         "last_run": None,
+        "last_result": None,
         "next_run": next_run,
         "run_count": 0,
     }
@@ -632,26 +637,28 @@ def create_scheduled_task(chat_id, session_name, prompt, schedule_type, cron_exp
 # --- Scheduler thread ---
 
 def _trigger_scheduled_task(task_id, task):
-    """Execute a due scheduled task by routing the prompt as if the user typed it."""
+    """Execute a due scheduled task. Session-free: uses stored cwd and last_result as context."""
     chat_id = int(task["chat_id"])
-    session_name = task["session_name"]
     prompt = task.get("prompt", "")
+    cwd = task.get("cwd", os.getcwd())
 
-    # Find the session
-    user_data = user_sessions.get(str(chat_id), {})
-    session = None
-    for s in user_data.get("sessions", []):
-        if s.get("name") == session_name:
-            session = s
-            break
+    # Build a temporary session dict — not tied to any named session
+    temp_session = {
+        "name": f"sched:{task_id}",
+        "cwd": cwd,
+        "history": [],
+        "model": "sonnet",
+    }
 
-    if not session:
-        send_message(chat_id, f"⚠️ Scheduled task `{task_id}` skipped: session `{session_name}` not found.")
-        with _scheduled_tasks_lock:
-            task["enabled"] = False
-        save_scheduled_tasks()
-        _ws_broadcast_schedule(chat_id, "updated", task_id, task)
-        return
+    # Prepend last run result as context if available
+    last_result = task.get("last_result")
+    if last_result and not prompt.startswith("/"):
+        effective_prompt = (
+            f"[Previous run result (for context)]\n{last_result}\n\n"
+            f"[Current task]\n{prompt}"
+        )
+    else:
+        effective_prompt = prompt
 
     # Update task state
     with _scheduled_tasks_lock:
@@ -666,18 +673,33 @@ def _trigger_scheduled_task(task_id, task):
     save_scheduled_tasks()
     _ws_broadcast_schedule(chat_id, "triggered", task_id, task)
 
-    send_message(chat_id, f"⏰ *Scheduled task triggered*\nSession: `{session_name}`\nTask: _{prompt[:200]}_")
+    cwd_short = os.path.basename(cwd) or cwd
+    send_message(chat_id, f"⏰ *Scheduled task triggered*\nDir: `{cwd_short}`\nTask: _{prompt[:200]}_")
 
-    # Use thread-local override so get_active_session returns the target session
-    # on this thread without mutating the user's actual active session
-    _active_session_override.session = session
+    # Use thread-local overrides for session and WS labeling
+    _active_session_override.session = temp_session
+    _ws_session_override.name = f"sched:{task_id}"
+    # Set up result capture
+    _sched_result_capture.messages = []
     try:
-        if prompt.startswith("/"):
-            handle_command(chat_id, prompt)
+        if effective_prompt.startswith("/"):
+            handle_command(chat_id, effective_prompt)
         else:
-            handle_message(chat_id, prompt, session=session)
+            handle_message(chat_id, effective_prompt, session=temp_session)
     finally:
         _active_session_override.session = None
+        _ws_session_override.name = None
+        # Store captured result as last_result (truncate to 4000 chars)
+        captured = getattr(_sched_result_capture, 'messages', [])
+        _sched_result_capture.messages = None
+        if captured:
+            # Skip the trigger notification message itself (first captured message)
+            result_msgs = captured[1:] if len(captured) > 1 else captured
+            result_text = "\n".join(result_msgs)[-4000:]
+            with _scheduled_tasks_lock:
+                task["last_result"] = result_text
+            save_scheduled_tasks()
+            _ws_broadcast_schedule(chat_id, "updated", task_id, task)
 
 
 def _start_scheduler():
@@ -742,6 +764,11 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
     Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
     session_name: if provided, use this as the WS session label instead of get_active_session().
     """
+    # Capture text for scheduled task result tracking
+    _capture = getattr(_sched_result_capture, 'messages', None)
+    if _capture is not None:
+        _capture.append(text)
+
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
     message_id = None
@@ -5362,36 +5389,32 @@ Send any message to chat with Claude!""")
     if cmd == "/schedule":
         if not args:
             send_message(chat_id, """*Schedule a task:*
-`/schedule daily HH:MM | session | prompt`
-`/schedule weekly DAY HH:MM | session | prompt`
-`/schedule hourly | session | prompt`
-`/schedule cron EXPR | session | prompt`
-`/schedule once YYYY-MM-DD HH:MM | session | prompt`
+`/schedule daily HH:MM | prompt`
+`/schedule weekly DAY HH:MM | prompt`
+`/schedule hourly | prompt`
+`/schedule cron EXPR | prompt`
+`/schedule once YYYY-MM-DD HH:MM | prompt`
 
-Add `remind` before the spec to get a reminder instead of auto-execution:
-`/schedule remind daily 09:00 | myproject | Check test results`""")
+Uses the current session's working directory.
+Example: `/schedule daily 09:00 | Run tests and fix failures`""")
             return True
 
-        # Parse: /schedule [remind] <spec> | <session> | <prompt>
-        parts = args.split("|", 2)
-        if len(parts) < 3:
-            send_message(chat_id, "❌ Format: `/schedule <spec> | <session> | <prompt>`")
+        # Parse: /schedule <spec> | <prompt>
+        parts = args.split("|", 1)
+        if len(parts) < 2:
+            send_message(chat_id, "❌ Format: `/schedule <spec> | <prompt>`")
             return True
 
         spec_raw = parts[0].strip()
-        session_name = parts[1].strip()
-        prompt = parts[2].strip()
+        prompt = parts[1].strip()
 
-        if not session_name or not prompt:
-            send_message(chat_id, "❌ Session name and prompt are required.")
+        if not prompt:
+            send_message(chat_id, "❌ Prompt is required.")
             return True
 
-        # Check session exists
-        user_data = user_sessions.get(str(chat_id), {})
-        found = any(s.get("name") == session_name for s in user_data.get("sessions", []))
-        if not found:
-            send_message(chat_id, f"❌ Session `{session_name}` not found.")
-            return True
+        # Get cwd from current active session
+        active_session = get_active_session(chat_id)
+        task_cwd = active_session.get("cwd", os.getcwd()) if active_session else os.getcwd()
 
         # Parse schedule spec
         try:
@@ -5425,11 +5448,12 @@ Add `remind` before the spec to get a reminder instead of auto-execution:
                 return True
 
             task_id, task = create_scheduled_task(
-                chat_id, session_name, prompt, schedule_type,
-                cron_expr=cron_expr, run_at=run_at,
+                chat_id, prompt, schedule_type,
+                cron_expr=cron_expr, run_at=run_at, cwd=task_cwd,
             )
+            cwd_short = os.path.basename(task_cwd) or task_cwd
             next_dt = datetime.fromtimestamp(task["next_run"]).strftime("%Y-%m-%d %H:%M") if task.get("next_run") else "?"
-            send_message(chat_id, f"✅ *Scheduled task created*\nID: `{task_id}`\nSession: `{session_name}`\nNext run: {next_dt}\n\nTask: _{prompt[:200]}_")
+            send_message(chat_id, f"✅ *Scheduled task created*\nID: `{task_id}`\nDir: `{cwd_short}`\nNext run: {next_dt}\n\nTask: _{prompt[:200]}_")
         except ValueError as e:
             send_message(chat_id, f"❌ {e}")
         return True
@@ -5450,8 +5474,9 @@ Add `remind` before the spec to get a reminder instead of auto-execution:
                 sched_desc = t.get("cron_expr", "?")
             else:
                 sched_desc = f"once {t.get('run_at', '?')}"
+            cwd_short = os.path.basename(t.get("cwd", "")) or t.get("cwd", "?")
             next_dt = datetime.fromtimestamp(t["next_run"]).strftime("%m/%d %H:%M") if t.get("next_run") else "—"
-            lines.append(f"{status} `{tid}`\n   {t['session_name']} • {sched_desc}\n   Next: {next_dt} • Runs: {t.get('run_count', 0)}\n   _{t['prompt'][:80]}_\n")
+            lines.append(f"{status} `{tid}`\n   {cwd_short} • {sched_desc}\n   Next: {next_dt} • Runs: {t.get('run_count', 0)}\n   _{t['prompt'][:80]}_\n")
 
         send_message(chat_id, "\n".join(lines))
         return True

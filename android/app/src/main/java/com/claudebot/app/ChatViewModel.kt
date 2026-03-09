@@ -69,7 +69,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Scheduled tasks
     data class ScheduledTask(
         val id: String,
-        val sessionName: String,
+        val cwd: String,
         val prompt: String,
         val scheduleType: String,  // "cron" | "once"
         val cronExpr: String?,
@@ -77,6 +77,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val enabled: Boolean,
         val nextRun: Long?,        // epoch seconds
         val lastRun: Long?,
+        val lastResult: String?,
         val runCount: Int,
     )
     val scheduledTasks = mutableStateListOf<ScheduledTask>()
@@ -716,7 +717,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val t = arr.getJSONObject(i)
                         tasks.add(ScheduledTask(
                             id = t.optString("id"),
-                            sessionName = t.optString("session_name"),
+                            cwd = t.optString("cwd", ""),
                             prompt = t.optString("prompt"),
                             scheduleType = t.optString("schedule_type"),
                             cronExpr = if (t.has("cron_expr") && !t.isNull("cron_expr")) t.optString("cron_expr") else null,
@@ -724,6 +725,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             enabled = t.optBoolean("enabled", true),
                             nextRun = if (t.has("next_run") && !t.isNull("next_run")) t.optLong("next_run") else null,
                             lastRun = if (t.has("last_run") && !t.isNull("last_run")) t.optLong("last_run") else null,
+                            lastResult = if (t.has("last_result") && !t.isNull("last_result")) t.optString("last_result") else null,
                             runCount = t.optInt("run_count", 0),
                         ))
                     }
@@ -737,14 +739,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun createScheduledTask(
-        sessionName: String, prompt: String, scheduleType: String,
+        prompt: String, scheduleType: String,
         cronExpr: String?, runAt: String?,
     ) {
         sendExecutor.submit {
             try {
                 val url = "http://${settings.host}:${settings.port}/api/schedule-task"
                 val json = JSONObject().apply {
-                    put("session_name", sessionName)
+                    // Server resolves active session's cwd if no explicit session_name
+                    val activeSession = sessionList.find { it.name == currentSession.value }
+                    if (activeSession != null) put("session_name", activeSession.name)
                     put("prompt", prompt)
                     put("schedule_type", scheduleType)
                     if (cronExpr != null) put("cron_expr", cronExpr)

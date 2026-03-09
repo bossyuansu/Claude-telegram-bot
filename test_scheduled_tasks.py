@@ -263,17 +263,18 @@ class TestCreateScheduledTask(unittest.TestCase):
 
     def test_cron_task_created(self):
         tid, task = self.bot.create_scheduled_task(
-            123, "test-session", "Run tests", "cron", cron_expr="0 9 * * *")
+            123, "Run tests", "cron", cron_expr="0 9 * * *")
         self.assertTrue(tid.startswith("sched_"))
         self.assertEqual(task["schedule_type"], "cron")
-        self.assertEqual(task["mode"], "justdoit")
         self.assertIsNotNone(task["next_run"])
+        self.assertIn("cwd", task)
+        self.assertIsNone(task["last_result"])
 
     def test_once_task_with_space_separator(self):
         """Date with space separator (YYYY-MM-DD HH:MM) should work."""
         future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
         tid, task = self.bot.create_scheduled_task(
-            123, "test-session", "One-time task", "once", run_at=future)
+            123, "One-time task", "once", run_at=future)
         self.assertEqual(task["schedule_type"], "once")
         self.assertIsNotNone(task["next_run"])
 
@@ -281,44 +282,46 @@ class TestCreateScheduledTask(unittest.TestCase):
         """Date with T separator (ISO 8601) should also work."""
         future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
         tid, task = self.bot.create_scheduled_task(
-            123, "test-session", "One-time task", "once", run_at=future)
+            123, "One-time task", "once", run_at=future)
         self.assertEqual(task["schedule_type"], "once")
+
+    def test_cwd_stored(self):
+        """Task stores explicit cwd when provided."""
+        tid, task = self.bot.create_scheduled_task(
+            123, "p", "cron", cron_expr="0 9 * * *", cwd="/tmp/test")
+        self.assertEqual(task["cwd"], "/tmp/test")
+
+    def test_cwd_defaults_to_cwd(self):
+        """Task defaults cwd to os.getcwd() when not provided."""
+        tid, task = self.bot.create_scheduled_task(
+            123, "p", "cron", cron_expr="0 9 * * *")
+        self.assertEqual(task["cwd"], os.getcwd())
 
     def test_invalid_cron_raises(self):
         with self.assertRaises(ValueError):
             self.bot.create_scheduled_task(
-                123, "s", "p", "cron", cron_expr="bad bad bad")
+                123, "p", "cron", cron_expr="bad bad bad")
 
     def test_missing_cron_expr_raises(self):
         with self.assertRaises(ValueError):
-            self.bot.create_scheduled_task(123, "s", "p", "cron")
+            self.bot.create_scheduled_task(123, "p", "cron")
 
     def test_missing_run_at_raises(self):
         with self.assertRaises(ValueError):
-            self.bot.create_scheduled_task(123, "s", "p", "once")
+            self.bot.create_scheduled_task(123, "p", "once")
 
     def test_past_run_at_raises(self):
         with self.assertRaises(ValueError):
             self.bot.create_scheduled_task(
-                123, "s", "p", "once", run_at="2020-01-01T00:00")
-
-    def test_invalid_mode_raises(self):
-        with self.assertRaises(ValueError):
-            self.bot.create_scheduled_task(
-                123, "s", "p", "cron", cron_expr="0 9 * * *", mode="invalid")
+                123, "p", "once", run_at="2020-01-01T00:00")
 
     def test_invalid_schedule_type_raises(self):
         with self.assertRaises(ValueError):
-            self.bot.create_scheduled_task(123, "s", "p", "biweekly")
-
-    def test_remind_mode(self):
-        tid, task = self.bot.create_scheduled_task(
-            123, "s", "p", "cron", cron_expr="0 9 * * *", mode="remind")
-        self.assertEqual(task["mode"], "remind")
+            self.bot.create_scheduled_task(123, "p", "biweekly")
 
     def test_ws_broadcast_called(self):
         self.bot.create_scheduled_task(
-            123, "s", "p", "cron", cron_expr="0 9 * * *")
+            123, "p", "cron", cron_expr="0 9 * * *")
         self.bot._ws_broadcast_schedule.assert_called_once()
         args = self.bot._ws_broadcast_schedule.call_args[0]
         self.assertEqual(args[0], 123)
@@ -427,7 +430,7 @@ class TestCreateScheduleTaskAPI(ScheduleAPITestBase):
         self.mock_create.return_value = ("sched_abc", {"next_run": 9999})
         resp = self.client.post("/api/schedule-task", json={
             "chat_id": 123, "session_name": "proj", "prompt": "test",
-            "schedule_type": "cron", "cron_expr": "0 9 * * *", "mode": "justdoit",
+            "schedule_type": "cron", "cron_expr": "0 9 * * *",
         }, headers=self.headers)
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -439,15 +442,15 @@ class TestCreateScheduleTaskAPI(ScheduleAPITestBase):
         self.mock_create.side_effect = ValueError("bad cron")
         resp = self.client.post("/api/schedule-task", json={
             "chat_id": 123, "session_name": "proj", "prompt": "test",
-            "schedule_type": "cron", "cron_expr": "bad", "mode": "justdoit",
+            "schedule_type": "cron", "cron_expr": "bad",
         }, headers=self.headers)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("bad cron", resp.json()["detail"])
 
     def test_create_requires_auth(self):
         resp = self.client.post("/api/schedule-task", json={
-            "session_name": "p", "prompt": "t", "schedule_type": "cron",
-            "cron_expr": "0 0 * * *", "mode": "justdoit",
+            "prompt": "t", "schedule_type": "cron",
+            "cron_expr": "0 0 * * *",
         })
         self.assertEqual(resp.status_code, 401)
 
@@ -457,10 +460,10 @@ class TestUpdateScheduleTaskAPI(ScheduleAPITestBase):
 
     def _add_task(self):
         task = {
-            "id": "sched_1", "chat_id": "123", "session_name": "proj",
+            "id": "sched_1", "chat_id": "123", "cwd": "/tmp/proj",
             "prompt": "test", "schedule_type": "cron", "cron_expr": "0 9 * * *",
-            "run_at": None, "mode": "justdoit", "enabled": True,
-            "next_run": 9999, "last_run": None, "run_count": 0,
+            "run_at": None, "enabled": True,
+            "next_run": 9999, "last_run": None, "last_result": None, "run_count": 0,
         }
         self.scheduled_tasks["sched_1"] = task
         return task
@@ -479,19 +482,6 @@ class TestUpdateScheduleTaskAPI(ScheduleAPITestBase):
             json={"prompt": "new prompt"}, headers=self.headers)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self.scheduled_tasks["sched_1"]["prompt"], "new prompt")
-
-    def test_update_mode(self):
-        self._add_task()
-        resp = self.client.put("/api/schedule-task/sched_1",
-            json={"mode": "remind"}, headers=self.headers)
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self.scheduled_tasks["sched_1"]["mode"], "remind")
-
-    def test_update_invalid_mode_returns_400(self):
-        self._add_task()
-        resp = self.client.put("/api/schedule-task/sched_1",
-            json={"mode": "invalid"}, headers=self.headers)
-        self.assertEqual(resp.status_code, 400)
 
     def test_update_cron_expr(self):
         self._add_task()
@@ -582,7 +572,7 @@ class TestDeleteScheduleTaskAPI(ScheduleAPITestBase):
 # ──────────────────────────────────────────────────────────
 
 class TestTriggerScheduledTask(unittest.TestCase):
-    """Test _trigger_scheduled_task: justdoit launch, remind send, busy skip, once disable."""
+    """Test _trigger_scheduled_task: routes prompt through handle_message/handle_command."""
 
     def setUp(self):
         self.bot = _get_bot()
@@ -592,27 +582,15 @@ class TestTriggerScheduledTask(unittest.TestCase):
             'save_scheduled_tasks': self.bot.save_scheduled_tasks,
             '_ws_broadcast_schedule': self.bot._ws_broadcast_schedule,
             'send_message': self.bot.send_message,
-            'user_sessions': self.bot.user_sessions,
-            'get_session_id': self.bot.get_session_id,
-            'justdoit_active': self.bot.justdoit_active,
-            'omni_active': self.bot.omni_active,
-            'deepreview_active': self.bot.deepreview_active,
-            'active_processes': self.bot.active_processes,
-            'run_justdoit_loop': self.bot.run_justdoit_loop,
+            'handle_message': self.bot.handle_message,
+            'handle_command': self.bot.handle_command,
         }
         # Set up mocks
         self.bot.save_scheduled_tasks = MagicMock()
         self.bot._ws_broadcast_schedule = MagicMock()
         self.bot.send_message = MagicMock()
-        self.bot.get_session_id = MagicMock(return_value="sid1")
-        self.bot.run_justdoit_loop = MagicMock()
-        self.bot.justdoit_active = {}
-        self.bot.omni_active = {}
-        self.bot.deepreview_active = {}
-        self.bot.active_processes = {}
-        self.bot.user_sessions = {
-            "123": {"sessions": [{"name": "proj", "id": "sid1"}], "active": "sid1"}
-        }
+        self.bot.handle_message = MagicMock()
+        self.bot.handle_command = MagicMock()
 
     def tearDown(self):
         for key, val in self._orig.items():
@@ -620,11 +598,11 @@ class TestTriggerScheduledTask(unittest.TestCase):
 
     def _make_cron_task(self):
         return {
-            "id": "sched_1", "chat_id": "123", "session_name": "proj",
+            "id": "sched_1", "chat_id": "123", "cwd": "/tmp/proj",
             "prompt": "Run tests", "schedule_type": "cron",
             "cron_expr": "0 9 * * *", "run_at": None,
-            "mode": "justdoit", "enabled": True,
-            "last_run": None, "next_run": time.time() - 10, "run_count": 0,
+            "enabled": True, "last_run": None, "last_result": None,
+            "next_run": time.time() - 10, "run_count": 0,
         }
 
     def _make_once_task(self):
@@ -633,37 +611,41 @@ class TestTriggerScheduledTask(unittest.TestCase):
                     run_at="2026-12-25T09:00", id="sched_once")
         return task
 
-    def test_justdoit_launches_thread(self):
-        """Trigger a justdoit task → sends notification, starts run_justdoit_loop thread."""
+    def test_routes_text_to_handle_message(self):
+        """Trigger routes non-command prompts through handle_message."""
         task = self._make_cron_task()
-        with patch("threading.Thread") as mock_thread:
-            mock_thread.return_value.start = MagicMock()
-            self.bot._trigger_scheduled_task("sched_1", task)
-            mock_thread.assert_called_once()
-            mock_thread.return_value.start.assert_called_once()
-        # Notification sent
+        self.bot._trigger_scheduled_task("sched_1", task)
+        self.bot.handle_message.assert_called_once()
+        call_args = self.bot.handle_message.call_args
+        self.assertEqual(call_args[0][0], 123)  # chat_id
+        self.bot.handle_command.assert_not_called()
+
+    def test_routes_command_to_handle_command(self):
+        """Trigger routes /command prompts through handle_command."""
+        task = self._make_cron_task()
+        task["prompt"] = "/justdoit check health"
+        self.bot._trigger_scheduled_task("sched_1", task)
+        self.bot.handle_command.assert_called_once()
+        self.bot.handle_message.assert_not_called()
+
+    def test_trigger_notification_sent(self):
+        """Trigger sends notification message."""
+        task = self._make_cron_task()
+        self.bot._trigger_scheduled_task("sched_1", task)
         calls = self.bot.send_message.call_args_list
         self.assertTrue(any("triggered" in str(c).lower() for c in calls))
-        # Task state updated
+
+    def test_task_state_updated(self):
+        """Trigger updates last_run and run_count."""
+        task = self._make_cron_task()
+        self.bot._trigger_scheduled_task("sched_1", task)
         self.assertIsNotNone(task["last_run"])
         self.assertEqual(task["run_count"], 1)
         self.bot.save_scheduled_tasks.assert_called()
 
-    def test_remind_sends_message(self):
-        """Trigger a remind task → sends reminder, no thread launched."""
-        task = self._make_cron_task()
-        task["mode"] = "remind"
-        with patch("threading.Thread") as mock_thread:
-            self.bot._trigger_scheduled_task("sched_1", task)
-            mock_thread.assert_not_called()
-        # Reminder message sent
-        calls = self.bot.send_message.call_args_list
-        self.assertTrue(any("reminder" in str(c).lower() for c in calls))
-
     def test_once_task_disables_after_trigger(self):
         """Once task sets enabled=False and next_run=None after trigger."""
         task = self._make_once_task()
-        task["mode"] = "remind"
         self.bot._trigger_scheduled_task("sched_once", task)
         self.assertFalse(task["enabled"])
         self.assertIsNone(task["next_run"])
@@ -671,66 +653,35 @@ class TestTriggerScheduledTask(unittest.TestCase):
     def test_cron_task_recomputes_next_run(self):
         """Cron task recomputes next_run after trigger."""
         task = self._make_cron_task()
-        task["mode"] = "remind"
         old_next = task["next_run"]
         self.bot._trigger_scheduled_task("sched_1", task)
         self.assertNotEqual(task["next_run"], old_next)
         self.assertGreater(task["next_run"], time.time())
 
-    def test_busy_justdoit_skips(self):
-        """If justdoit_active has an active task on the session, skip."""
+    def test_last_result_prepended_as_context(self):
+        """When last_result exists, it's prepended to the prompt as context."""
         task = self._make_cron_task()
-        self.bot.justdoit_active["123:sid1"] = {"active": True}
-        with patch("threading.Thread") as mock_thread:
-            self.bot._trigger_scheduled_task("sched_1", task)
-            mock_thread.assert_not_called()
-        # "busy" message sent
-        calls = self.bot.send_message.call_args_list
-        self.assertTrue(any("busy" in str(c).lower() for c in calls))
-
-    def test_busy_omni_skips(self):
-        """If omni_active has an active task on the session, skip."""
-        task = self._make_cron_task()
-        self.bot.omni_active["123:sid1"] = {"active": True}
-        with patch("threading.Thread") as mock_thread:
-            self.bot._trigger_scheduled_task("sched_1", task)
-            mock_thread.assert_not_called()
-        calls = self.bot.send_message.call_args_list
-        self.assertTrue(any("busy" in str(c).lower() for c in calls))
-
-    def test_busy_deepreview_skips(self):
-        """If deepreview_active has an active task on the session, skip."""
-        task = self._make_cron_task()
-        self.bot.deepreview_active["123:sid1"] = {"active": True}
-        with patch("threading.Thread") as mock_thread:
-            self.bot._trigger_scheduled_task("sched_1", task)
-            mock_thread.assert_not_called()
-        calls = self.bot.send_message.call_args_list
-        self.assertTrue(any("busy" in str(c).lower() for c in calls))
-
-    def test_busy_active_process_skips(self):
-        """If active_processes has a process on the session, skip."""
-        task = self._make_cron_task()
-        self.bot.active_processes["sid1"] = MagicMock()
-        with patch("threading.Thread") as mock_thread:
-            self.bot._trigger_scheduled_task("sched_1", task)
-            mock_thread.assert_not_called()
-        calls = self.bot.send_message.call_args_list
-        self.assertTrue(any("busy" in str(c).lower() for c in calls))
-
-    def test_session_not_found_disables_task(self):
-        """If session is deleted, task is disabled and user is notified."""
-        task = self._make_cron_task()
-        task["session_name"] = "nonexistent"
+        task["last_result"] = "All tests passed"
         self.bot._trigger_scheduled_task("sched_1", task)
-        self.assertFalse(task["enabled"])
-        calls = self.bot.send_message.call_args_list
-        self.assertTrue(any("not found" in str(c).lower() for c in calls))
+        call_args = self.bot.handle_message.call_args
+        prompt = call_args[0][1]  # second positional arg is the text
+        self.assertIn("Previous run result", prompt)
+        self.assertIn("All tests passed", prompt)
+        self.assertIn("Run tests", prompt)
+
+    def test_last_result_not_prepended_for_commands(self):
+        """last_result is NOT prepended when prompt is a command."""
+        task = self._make_cron_task()
+        task["prompt"] = "/justdoit check health"
+        task["last_result"] = "previous result"
+        self.bot._trigger_scheduled_task("sched_1", task)
+        call_args = self.bot.handle_command.call_args
+        prompt = call_args[0][1]
+        self.assertNotIn("Previous run result", prompt)
 
     def test_ws_broadcast_triggered_event(self):
         """Trigger broadcasts a 'triggered' WS event."""
         task = self._make_cron_task()
-        task["mode"] = "remind"
         self.bot._trigger_scheduled_task("sched_1", task)
         ws_calls = self.bot._ws_broadcast_schedule.call_args_list
         events = [c[0][1] for c in ws_calls]
@@ -839,10 +790,10 @@ class TestPersistenceRoundTrip(unittest.TestCase):
         """Save tasks, reload, verify data integrity."""
         self.bot.scheduled_tasks = {
             "sched_1": {
-                "id": "sched_1", "chat_id": "123", "session_name": "proj",
+                "id": "sched_1", "chat_id": "123", "cwd": "/tmp/proj",
                 "prompt": "test", "schedule_type": "cron", "cron_expr": "0 9 * * *",
-                "mode": "justdoit", "enabled": True, "next_run": 9999.0,
-                "last_run": None, "run_count": 0,
+                "enabled": True, "next_run": 9999.0,
+                "last_run": None, "last_result": None, "run_count": 0,
             }
         }
         self.bot.save_scheduled_tasks()
@@ -905,41 +856,41 @@ class TestRunAtParsing(unittest.TestCase):
         """'YYYY-MM-DD HH:MM' works (user-friendly format)."""
         future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
         tid, task = self.bot.create_scheduled_task(
-            123, "s", "p", "once", run_at=future)
+            123, "p", "once", run_at=future)
         self.assertIsNotNone(task["next_run"])
 
     def test_t_separator(self):
         """'YYYY-MM-DDTHH:MM' works (ISO 8601)."""
         future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
         tid, task = self.bot.create_scheduled_task(
-            123, "s", "p", "once", run_at=future)
+            123, "p", "once", run_at=future)
         self.assertIsNotNone(task["next_run"])
 
     def test_with_seconds(self):
         """'YYYY-MM-DDTHH:MM:SS' works."""
         future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
         tid, task = self.bot.create_scheduled_task(
-            123, "s", "p", "once", run_at=future)
+            123, "p", "once", run_at=future)
         self.assertIsNotNone(task["next_run"])
 
     def test_space_with_seconds(self):
         """'YYYY-MM-DD HH:MM:SS' works."""
         future = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
         tid, task = self.bot.create_scheduled_task(
-            123, "s", "p", "once", run_at=future)
+            123, "p", "once", run_at=future)
         self.assertIsNotNone(task["next_run"])
 
     def test_invalid_date_raises(self):
         """Garbage date string raises ValueError."""
         with self.assertRaises(ValueError):
-            self.bot.create_scheduled_task(123, "s", "p", "once", run_at="not-a-date")
+            self.bot.create_scheduled_task(123, "p", "once", run_at="not-a-date")
 
     def test_date_only_no_time_raises(self):
         """Date without time component should still parse (date-only ISO)."""
         future = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
         # Python's fromisoformat handles date-only strings (returns midnight)
         tid, task = self.bot.create_scheduled_task(
-            123, "s", "p", "once", run_at=future)
+            123, "p", "once", run_at=future)
         self.assertIsNotNone(task["next_run"])
 
 
@@ -954,14 +905,14 @@ class TestAPICRUDLifecycle(ScheduleAPITestBase):
         """Create, list, update, delete — full round trip."""
         # Create
         self.mock_create.return_value = ("sched_lc", {
-            "id": "sched_lc", "chat_id": "123", "session_name": "proj",
+            "id": "sched_lc", "chat_id": "123", "cwd": "/tmp/proj",
             "prompt": "lifecycle test", "schedule_type": "cron",
-            "cron_expr": "0 9 * * *", "mode": "justdoit", "enabled": True,
-            "next_run": 9999, "last_run": None, "run_count": 0,
+            "cron_expr": "0 9 * * *", "enabled": True,
+            "next_run": 9999, "last_run": None, "last_result": None, "run_count": 0,
         })
         resp = self.client.post("/api/schedule-task", json={
             "chat_id": 123, "session_name": "proj", "prompt": "lifecycle test",
-            "schedule_type": "cron", "cron_expr": "0 9 * * *", "mode": "justdoit",
+            "schedule_type": "cron", "cron_expr": "0 9 * * *",
         }, headers=self.headers)
         self.assertEqual(resp.status_code, 200)
         task_id = resp.json()["task_id"]
@@ -981,11 +932,11 @@ class TestAPICRUDLifecycle(ScheduleAPITestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(self.scheduled_tasks[task_id]["enabled"])
 
-        # Update (change mode)
+        # Update (change prompt)
         resp = self.client.put(f"/api/schedule-task/{task_id}",
-            json={"mode": "remind"}, headers=self.headers)
+            json={"prompt": "updated prompt"}, headers=self.headers)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self.scheduled_tasks[task_id]["mode"], "remind")
+        self.assertEqual(self.scheduled_tasks[task_id]["prompt"], "updated prompt")
 
         # Delete
         resp = self.client.delete(f"/api/schedule-task/{task_id}", headers=self.headers)

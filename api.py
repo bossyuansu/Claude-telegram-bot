@@ -150,11 +150,12 @@ class TaskActionRequest(BaseModel):
 
 class ScheduleTaskRequest(BaseModel):
     chat_id: Optional[int] = None
-    session_name: str
+    session_name: Optional[str] = None  # Resolved to cwd server-side
     prompt: str
     schedule_type: str  # "cron" | "once"
     cron_expr: Optional[str] = None
     run_at: Optional[str] = None
+    cwd: Optional[str] = None  # Explicit cwd (takes priority over session_name)
 
 class ScheduleTaskUpdate(BaseModel):
     enabled: Optional[bool] = None
@@ -555,10 +556,19 @@ def api_create_schedule_task(req: ScheduleTaskRequest, _=Depends(verify_auth)):
     chat_id = req.chat_id or _default_chat_id
     if not chat_id or not _is_allowed(chat_id):
         raise HTTPException(status_code=403, detail="Chat ID not allowed")
+
+    # Resolve cwd: explicit cwd > session_name lookup > current directory
+    task_cwd = req.cwd
+    if not task_cwd and req.session_name:
+        user_data = _user_sessions.get(str(chat_id), {})
+        for s in user_data.get("sessions", []):
+            if s.get("name") == req.session_name:
+                task_cwd = s.get("cwd")
+                break
     try:
         task_id, task = _create_scheduled_task(
-            chat_id, req.session_name, req.prompt, req.schedule_type,
-            cron_expr=req.cron_expr, run_at=req.run_at,
+            chat_id, req.prompt, req.schedule_type,
+            cron_expr=req.cron_expr, run_at=req.run_at, cwd=task_cwd,
         )
         return {"status": "created", "task_id": task_id, "next_run": task.get("next_run")}
     except ValueError as e:
