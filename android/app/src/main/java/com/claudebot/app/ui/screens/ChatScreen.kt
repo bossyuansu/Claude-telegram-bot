@@ -1300,23 +1300,65 @@ private fun ScheduledTaskRow(
     onDelete: (String) -> Unit,
 ) {
     val dimAlpha = if (task.enabled) 1f else 0.5f
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.Top,
     ) {
-        // Header: session name + switch
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                task.sessionName,
-                color = AccentOrange.copy(alpha = dimAlpha),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f),
-            )
+        Column(modifier = Modifier.weight(1f)) {
+            // Header: session name + Run Now chip
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    task.sessionName,
+                    color = AccentOrange.copy(alpha = dimAlpha),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "RUN",
+                    fontSize = 9.sp,
+                    color = DarkSurface,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(ConnectedGreen)
+                        .clickable { onTrigger(task.id) }
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+
+            Spacer(Modifier.height(3.dp))
+
+            // Details
+            Column(modifier = Modifier.alpha(dimAlpha)) {
+                Text(
+                    formatScheduleDescription(task),
+                    color = SessionLabel,
+                    fontSize = 12.sp,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    task.prompt,
+                    color = BotText.copy(alpha = 0.7f),
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (task.nextRun != null) {
+                    Spacer(Modifier.height(2.dp))
+                    val relTime = formatRelativeTime(task.nextRun)
+                    Text(
+                        "Next: $relTime${if (task.runCount > 0) " · ${task.runCount} runs" else ""}",
+                        color = SessionLabel,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+        }
+
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Switch(
                 checked = task.enabled,
                 onCheckedChange = { onToggle(task.id, it) },
@@ -1326,56 +1368,13 @@ private fun ScheduledTaskRow(
                     uncheckedTrackColor = InputBorder,
                 ),
             )
-        }
-
-        // Details
-        Column(modifier = Modifier.alpha(dimAlpha)) {
+            Spacer(Modifier.height(4.dp))
             Text(
-                formatScheduleDescription(task),
-                color = SessionLabel,
-                fontSize = 12.sp,
+                "Delete",
+                color = Color(0xFFCF6679),
+                fontSize = 11.sp,
+                modifier = Modifier.clickable { onDelete(task.id) },
             )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                task.prompt,
-                color = BotText.copy(alpha = 0.7f),
-                fontSize = 12.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (task.nextRun != null) {
-                Spacer(Modifier.height(2.dp))
-                val relTime = formatRelativeTime(task.nextRun)
-                Text(
-                    "Next: $relTime${if (task.runCount > 0) " · ${task.runCount} runs" else ""}",
-                    color = SessionLabel,
-                    fontSize = 11.sp,
-                )
-            }
-        }
-
-        // Action buttons
-        Spacer(Modifier.height(6.dp))
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            OutlinedButton(
-                onClick = { onTrigger(task.id) },
-                modifier = Modifier.height(32.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-                border = BorderStroke(1.dp, ConnectedGreen),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = ConnectedGreen),
-            ) {
-                Text("Run Now", fontSize = 12.sp)
-            }
-            TextButton(
-                onClick = { onDelete(task.id) },
-                modifier = Modifier.height(32.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-            ) {
-                Text("Delete", color = Color(0xFFCF6679), fontSize = 12.sp)
-            }
         }
     }
 }
