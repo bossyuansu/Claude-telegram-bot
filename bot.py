@@ -6540,6 +6540,7 @@ def _reinit_api_refs():
             scheduled_tasks_lock=_scheduled_tasks_lock,
             save_scheduled_tasks=save_scheduled_tasks,
             create_scheduled_task=create_scheduled_task,
+            trigger_scheduled_task=_trigger_scheduled_task,
             next_cron_run_fn=_next_cron_run,
             ws_broadcast_schedule=_ws_broadcast_schedule,
         )
@@ -6664,6 +6665,7 @@ def startup():
             scheduled_tasks_lock=_scheduled_tasks_lock,
             save_scheduled_tasks=save_scheduled_tasks,
             create_scheduled_task=create_scheduled_task,
+            trigger_scheduled_task=_trigger_scheduled_task,
             next_cron_run_fn=_next_cron_run,
             ws_broadcast_schedule=_ws_broadcast_schedule,
         )

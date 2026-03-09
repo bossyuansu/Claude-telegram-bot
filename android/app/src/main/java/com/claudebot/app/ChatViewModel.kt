@@ -785,6 +785,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun triggerScheduledTask(taskId: String) {
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/schedule-task/$taskId/trigger"
+                val body = "".toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* WS will update state */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "triggerScheduledTask failed: ${e.message}")
+            }
+        }
+    }
+
     fun deleteScheduledTask(taskId: String) {
         // Optimistic removal
         scheduledTasks.removeAll { it.id == taskId }

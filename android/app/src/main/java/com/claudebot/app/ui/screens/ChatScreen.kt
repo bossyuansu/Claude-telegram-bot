@@ -763,6 +763,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         viewModel.viewTaskSession(sessionName)
                     },
                     onToggleSchedule = { id, enabled -> viewModel.toggleScheduledTask(id, enabled) },
+                    onTriggerSchedule = { viewModel.triggerScheduledTask(it) },
                     onDeleteSchedule = { viewModel.deleteScheduledTask(it) },
                     onAddSchedule = { showAddSchedule = true },
                 )
@@ -868,6 +869,7 @@ private fun MissionControlContent(
     onResume: (String) -> Unit,
     onJumpToSession: (String) -> Unit,
     onToggleSchedule: (String, Boolean) -> Unit,
+    onTriggerSchedule: (String) -> Unit,
     onDeleteSchedule: (String) -> Unit,
     onAddSchedule: () -> Unit,
 ) {
@@ -960,6 +962,7 @@ private fun MissionControlContent(
                 ScheduledTasksTab(
                     tasks = scheduledTasks,
                     onToggle = onToggleSchedule,
+                    onTrigger = onTriggerSchedule,
                     onDelete = onDeleteSchedule,
                     onAdd = onAddSchedule,
                 )
@@ -1248,6 +1251,7 @@ private fun TypingIndicator() {
 private fun ScheduledTasksTab(
     tasks: List<ChatViewModel.ScheduledTask>,
     onToggle: (String, Boolean) -> Unit,
+    onTrigger: (String) -> Unit,
     onDelete: (String) -> Unit,
     onAdd: () -> Unit,
 ) {
@@ -1266,7 +1270,7 @@ private fun ScheduledTasksTab(
                     .heightIn(max = 450.dp)
             ) {
                 items(tasks, key = { it.id }) { task ->
-                    ScheduledTaskRow(task, onToggle, onDelete)
+                    ScheduledTaskRow(task, onToggle, onTrigger, onDelete)
                     HorizontalDivider(color = InputBorder)
                 }
             }
@@ -1292,6 +1296,7 @@ private fun ScheduledTasksTab(
 private fun ScheduledTaskRow(
     task: ChatViewModel.ScheduledTask,
     onToggle: (String, Boolean) -> Unit,
+    onTrigger: (String) -> Unit,
     onDelete: (String) -> Unit,
 ) {
     val dimAlpha = if (task.enabled) 1f else 0.5f
@@ -1367,6 +1372,14 @@ private fun ScheduledTaskRow(
                     checkedTrackColor = AccentOrange,
                     uncheckedTrackColor = InputBorder,
                 ),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Run Now",
+                color = ConnectedGreen,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clickable { onTrigger(task.id) },
             )
             Spacer(Modifier.height(4.dp))
             Text(

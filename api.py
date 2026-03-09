@@ -41,6 +41,7 @@ _scheduled_tasks = None
 _scheduled_tasks_lock = None
 _save_scheduled_tasks = None
 _create_scheduled_task = None
+_trigger_scheduled_task = None
 _next_cron_run_fn = None
 _ws_broadcast_schedule = None
 
@@ -91,7 +92,7 @@ def init_refs(**kwargs):
     global _justdoit_active, _omni_active, _deepreview_active
     global _send_message, _send_message_no_ws
     global _cancelled_sessions, _ws_broadcast_status, _save_active_tasks, _user_feedback_queue, _get_active_sessions_data
-    global _scheduled_tasks, _scheduled_tasks_lock, _save_scheduled_tasks, _create_scheduled_task, _next_cron_run_fn, _ws_broadcast_schedule
+    global _scheduled_tasks, _scheduled_tasks_lock, _save_scheduled_tasks, _create_scheduled_task, _trigger_scheduled_task, _next_cron_run_fn, _ws_broadcast_schedule
     global API_SECRET, _default_chat_id
 
     _handle_command = kwargs["handle_command"]
@@ -116,6 +117,7 @@ def init_refs(**kwargs):
     _scheduled_tasks_lock = kwargs.get("scheduled_tasks_lock")
     _save_scheduled_tasks = kwargs.get("save_scheduled_tasks")
     _create_scheduled_task = kwargs.get("create_scheduled_task")
+    _trigger_scheduled_task = kwargs.get("trigger_scheduled_task")
     _next_cron_run_fn = kwargs.get("next_cron_run_fn")
     _ws_broadcast_schedule = kwargs.get("ws_broadcast_schedule")
     API_SECRET = os.environ.get("API_SECRET", "")
@@ -618,6 +620,20 @@ def api_delete_schedule_task(task_id: str, _=Depends(verify_auth)):
     if _ws_broadcast_schedule and chat_id:
         _ws_broadcast_schedule(chat_id, "deleted", task_id, task)
     return {"status": "deleted", "task_id": task_id}
+
+
+@app.post("/api/schedule-task/{task_id}/trigger")
+def api_trigger_schedule_task(task_id: str, _=Depends(verify_auth)):
+    """Trigger a scheduled task immediately (run now)."""
+    with _scheduled_tasks_lock:
+        task = (_scheduled_tasks or {}).get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not _trigger_scheduled_task:
+        raise HTTPException(status_code=500, detail="Trigger function not available")
+    import threading
+    threading.Thread(target=_trigger_scheduled_task, args=(task_id, task), daemon=True).start()
+    return {"status": "triggered", "task_id": task_id}
 
 
 # --- WebSocket endpoint ---
