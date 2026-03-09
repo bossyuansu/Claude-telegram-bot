@@ -2591,6 +2591,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
         message_ids = []
         file_changes = []
         processed_item_ids = set()
+        _ws_session_override.name = session.get("name", "") if session else ""
         try:
             if session:
                 needs_compaction = increment_message_count(chat_id, session, "Codex")
@@ -2908,6 +2909,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 send_message(chat_id, error_text[:4000])
         finally:
             _ws_suppress.active = False
+            _ws_session_override.name = None
             mark_session_done(session_id)
             active_processes.pop(session_id, None)
             _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
@@ -2939,6 +2941,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
         process = None
         message_id = None
         accumulated_text = ""
+        _ws_session_override.name = session.get("name", "") if session else ""
         current_chunk_text = ""
         message_ids = []
         file_changes = []
@@ -3248,6 +3251,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                 watchdog_stop.set()
             except UnboundLocalError:
                 pass
+            _ws_session_override.name = None
             mark_session_done(session_id)
             active_processes.pop(session_id, None)
             _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
