@@ -667,13 +667,19 @@ def _trigger_scheduled_task(task_id, task):
 
     send_message(chat_id, f"⏰ *Scheduled task triggered*\nSession: `{session_name}`\nTask: _{prompt[:200]}_")
 
-    # Switch to target session so commands (which call get_active_session internally) pick it up
     session_id = get_session_id(session)
-    set_active_session(chat_id, session_id)
 
     # Route exactly like a user message
     if prompt.startswith("/"):
-        handle_command(chat_id, prompt)
+        # Commands call get_active_session internally — temporarily switch, then restore
+        chat_key = str(chat_id)
+        prev_active = user_sessions.get(chat_key, {}).get("active")
+        set_active_session(chat_id, session_id)
+        try:
+            handle_command(chat_id, prompt)
+        finally:
+            if prev_active is not None:
+                set_active_session(chat_id, prev_active)
     else:
         handle_message(chat_id, prompt, session=session)
 
