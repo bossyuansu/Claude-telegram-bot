@@ -1,9 +1,5 @@
 package com.claudebot.app.ui.components
 
-import android.Manifest
-import android.content.pm.PackageManager
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
@@ -28,17 +24,12 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
-import com.claudebot.app.speech.SpeechRecognizerState
-import com.claudebot.app.speech.rememberSpeechRecognizerState
 import com.claudebot.app.ui.theme.*
 import kotlinx.coroutines.launch
 
@@ -78,20 +69,8 @@ fun InputBar(
     var showMenu by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
     val haptic = LocalHapticFeedback.current
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val sendScale = remember { Animatable(1f) }
-
-    // Speech recognition (state holder manages recognizer lifecycle)
-    val speechState = rememberSpeechRecognizerState { transcribed ->
-        text = if (text.isBlank()) transcribed else "$text $transcribed"
-    }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) speechState.startListening()
-    }
 
     // Filter commands when user is typing a slash command
     val typedCmd = text.trim()
@@ -255,21 +234,6 @@ fun InputBar(
                     ) {
                         Text("\u25A0", style = MaterialTheme.typography.titleMedium)
                     }
-                } else if (text.isBlank() && enabled && speechState.isAvailable) {
-                    // Mic button for voice input with pulse while listening
-                    MicButton(
-                        isListening = speechState.isListening,
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            if (speechState.isListening) {
-                                speechState.stopListening()
-                            } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                speechState.startListening()
-                            } else {
-                                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            }
-                        }
-                    )
                 } else {
                     // Send button with punch animation
                     FilledIconButton(
@@ -303,54 +267,5 @@ fun InputBar(
                 }
             }
         }
-    }
-}
-
-/** Mic button with pulse animation while actively listening. */
-@Composable
-internal fun MicButton(
-    isListening: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val scale = remember { Animatable(1f) }
-    val alpha = remember { Animatable(1f) }
-
-    LaunchedEffect(isListening) {
-        if (isListening) {
-            launch {
-                while (true) {
-                    scale.animateTo(1.3f, tween(600))
-                    scale.animateTo(1f, tween(600))
-                }
-            }
-            launch {
-                while (true) {
-                    alpha.animateTo(0.5f, tween(600))
-                    alpha.animateTo(1f, tween(600))
-                }
-            }
-        } else {
-            scale.snapTo(1f)
-            alpha.snapTo(1f)
-        }
-    }
-
-    FilledIconButton(
-        onClick = onClick,
-        modifier = modifier
-            .size(40.dp)
-            .testTag(if (isListening) "mic_listening" else "mic_idle")
-            .graphicsLayer(
-                scaleX = scale.value,
-                scaleY = scale.value,
-                alpha = alpha.value
-            ),
-        colors = IconButtonDefaults.filledIconButtonColors(
-            containerColor = if (isListening) DisconnectedRed else AccentOrange.copy(alpha = 0.7f),
-            contentColor = UserBubbleText,
-        )
-    ) {
-        Text("\uD83C\uDFA4", fontSize = 16.sp)
     }
 }

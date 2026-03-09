@@ -1,11 +1,13 @@
 package com.claudebot.app
 
 import android.app.Application
+import android.util.Log
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
@@ -52,6 +54,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val taskStatus = mutableStateOf(TaskStatus())
     val isBotBusy = mutableStateOf(false)
 
+    // Mission Control: all active autonomous tasks across sessions
+    data class ActiveTask(
+        val mode: String,
+        val session: String,
+        val task: String,
+        val phase: String,
+        val step: Int,
+        val started: Long,
+        val paused: Boolean = false
+    )
+    val activeTasks = mutableStateMapOf<String, ActiveTask>()
+
+    // Scheduled tasks
+    data class ScheduledTask(
+        val id: String,
+        val sessionName: String,
+        val prompt: String,
+        val scheduleType: String,  // "cron" | "once"
+        val cronExpr: String?,
+        val runAt: String?,
+        val mode: String,          // "justdoit" | "remind"
+        val enabled: Boolean,
+        val nextRun: Long?,        // epoch seconds
+        val lastRun: Long?,
+        val runCount: Int,
+    )
+    val scheduledTasks = mutableStateListOf<ScheduledTask>()
+
     /** True while a session-changing command (/switch, /new, /resume, /end, /delete) is in-flight. */
     val isSwitchingSession = mutableStateOf(false)
 
@@ -68,6 +98,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val availableSessions = mutableStateListOf<String>()
     /** Incremented on every filter change; in-flight loads compare to detect staleness. */
     private var filterGeneration = 0
+
+    /** The session the user is currently viewing (filter takes priority over active). */
+    val effectiveSession: String
+        get() = sessionFilter.value ?: currentSession.value
+
+    /** True when the chat is filtered to a session that differs from the server-side active session. */
+    val isViewingOtherSession: Boolean
+        get() {
+            val filter = sessionFilter.value ?: return false
+            return filter != currentSession.value
+        }
+
+    /** Set filter from Mission Control tap — filters chat, does NOT switch the server session. */
+    fun viewTaskSession(sessionName: String) {
+        setSessionFilter(sessionName)
+    }
+
+    /** Switch server session to match the current filter, then clear the filter. */
+    fun quickSwitchToFilteredSession() {
+        val target = sessionFilter.value ?: return
+        switchSession(target)
+        setSessionFilter(null)
+    }
+
+    /** Clear the session filter and return to the normal (all-sessions) view. */
+    fun clearSessionFilter() {
+        setSessionFilter(null)
+    }
 
     // Paging state
     val isLoadingMore = mutableStateOf(false)
@@ -154,6 +212,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 settings.wsLastState = state.name
                 if (state == ConnectionState.CONNECTED) {
                     settings.wsLastError = ""
+                    fetchActiveTasks()
+                    fetchSessions()
                 }
             }
         },
@@ -162,6 +222,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 isBotBusy.value = false
                 taskStatus.value = TaskStatus()
+                activeTasks.clear()
                 isSwitchingSession.value = false
             }
         },
@@ -317,6 +378,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setSessionFilter(session: String?) {
         sessionFilter.value = session
+        // Update busy state to reflect the newly viewed session
+        val viewing = session ?: currentSession.value
+        isBotBusy.value = viewing.isNotEmpty() && activeTasks.containsKey(viewing)
         filterGeneration++
         val gen = filterGeneration
         messages.clear()
@@ -411,6 +475,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    /** Dismiss the pending action bar without selecting any option. */
+    fun dismissPendingAction() {
+        pendingAction.value = null
     }
 
     fun pressButton(messageId: Int, button: InlineButton) {
@@ -511,9 +580,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             lastCli = s.optString("last_cli", "")
                         ))
                     }
+                    val activeSession = list.firstOrNull { it.isActive }?.name
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
                         sessionList.clear()
                         sessionList.addAll(list)
+                        if (!activeSession.isNullOrEmpty()) {
+                            currentSession.value = activeSession
+                        }
                     }
                 }
             } catch (_: Exception) {}
@@ -522,6 +595,211 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun switchSession(name: String) {
         sendMessage("/switch $name")
+    }
+
+    fun fetchActiveTasks() {
+        Thread {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/active-tasks/0"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@Thread
+                    val json = JSONObject(resp.body?.string() ?: return@Thread)
+                    val arr = json.optJSONArray("tasks") ?: return@Thread
+                    val tasks = mutableMapOf<String, ActiveTask>()
+                    for (i in 0 until arr.length()) {
+                        val t = arr.getJSONObject(i)
+                        val session = t.optString("session", "")
+                        if (session.isNotEmpty()) {
+                            tasks[session] = ActiveTask(
+                                mode = t.optString("mode", ""),
+                                session = session,
+                                task = t.optString("task", ""),
+                                phase = t.optString("phase", ""),
+                                step = t.optInt("step", 0),
+                                started = t.optLong("started", 0),
+                                paused = t.optBoolean("paused", false)
+                            )
+                        }
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        // Merge instead of clear+putAll to avoid overwriting
+                        // more-recent WS updates that arrived during the HTTP call
+                        val stale = activeTasks.keys - tasks.keys
+                        stale.forEach { activeTasks.remove(it) }
+                        activeTasks.putAll(tasks)
+                        // Derive isBotBusy from active tasks for the session being viewed
+                        val viewing = effectiveSession
+                        isBotBusy.value = viewing.isNotEmpty() && tasks.containsKey(viewing)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "fetchActiveTasks failed: ${e.message}")
+            }
+        }.start()
+    }
+
+    fun cancelTask(sessionName: String) {
+        // Optimistic removal for immediate UI feedback
+        activeTasks.remove(sessionName)
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/cancel-task"
+                val json = JSONObject().put("session", sessionName).toString()
+                val body = json.toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "cancelTask failed: ${e.message}")
+            }
+        }
+    }
+
+    fun pauseTask(sessionName: String) {
+        // Optimistic update
+        activeTasks[sessionName]?.let { activeTasks[sessionName] = it.copy(paused = true) }
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/pause-task"
+                val json = JSONObject().put("session", sessionName).toString()
+                val body = json.toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "pauseTask failed: ${e.message}")
+            }
+        }
+    }
+
+    fun resumeTask(sessionName: String) {
+        // Optimistic update
+        activeTasks[sessionName]?.let { activeTasks[sessionName] = it.copy(paused = false) }
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/resume-task"
+                val json = JSONObject().put("session", sessionName).toString()
+                val body = json.toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "resumeTask failed: ${e.message}")
+            }
+        }
+    }
+
+    // --- Scheduled tasks ---
+
+    fun fetchScheduledTasks() {
+        Thread {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/scheduled-tasks/0"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@Thread
+                    val arr = JSONArray(resp.body?.string() ?: return@Thread)
+                    val tasks = mutableListOf<ScheduledTask>()
+                    for (i in 0 until arr.length()) {
+                        val t = arr.getJSONObject(i)
+                        tasks.add(ScheduledTask(
+                            id = t.optString("id"),
+                            sessionName = t.optString("session_name"),
+                            prompt = t.optString("prompt"),
+                            scheduleType = t.optString("schedule_type"),
+                            cronExpr = if (t.has("cron_expr") && !t.isNull("cron_expr")) t.optString("cron_expr") else null,
+                            runAt = if (t.has("run_at") && !t.isNull("run_at")) t.optString("run_at") else null,
+                            mode = t.optString("mode"),
+                            enabled = t.optBoolean("enabled", true),
+                            nextRun = if (t.has("next_run") && !t.isNull("next_run")) t.optLong("next_run") else null,
+                            lastRun = if (t.has("last_run") && !t.isNull("last_run")) t.optLong("last_run") else null,
+                            runCount = t.optInt("run_count", 0),
+                        ))
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        scheduledTasks.clear()
+                        scheduledTasks.addAll(tasks)
+                    }
+                }
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    fun createScheduledTask(
+        sessionName: String, prompt: String, scheduleType: String,
+        cronExpr: String?, runAt: String?, mode: String,
+    ) {
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/schedule-task"
+                val json = JSONObject().apply {
+                    put("session_name", sessionName)
+                    put("prompt", prompt)
+                    put("schedule_type", scheduleType)
+                    if (cronExpr != null) put("cron_expr", cronExpr)
+                    if (runAt != null) put("run_at", runAt)
+                    put("mode", mode)
+                }.toString()
+                val body = json.toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* re-fetch will come via WS */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "createScheduledTask failed: ${e.message}")
+            }
+        }
+    }
+
+    fun toggleScheduledTask(taskId: String, enabled: Boolean) {
+        // Optimistic update
+        val idx = scheduledTasks.indexOfFirst { it.id == taskId }
+        if (idx >= 0) scheduledTasks[idx] = scheduledTasks[idx].copy(enabled = enabled)
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/schedule-task/$taskId"
+                val json = JSONObject().put("enabled", enabled).toString()
+                val body = json.toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).put(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "toggleScheduledTask failed: ${e.message}")
+            }
+        }
+    }
+
+    fun deleteScheduledTask(taskId: String) {
+        // Optimistic removal
+        scheduledTasks.removeAll { it.id == taskId }
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/schedule-task/$taskId"
+                val reqBuilder = Request.Builder().url(url).delete()
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "deleteScheduledTask failed: ${e.message}")
+            }
+        }
     }
 
     private fun sessionNotificationTag(session: String): String {
@@ -606,7 +884,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     if (mid > 0 && msg.isReplay && mid in persistedMessageIds) return@post
                     if (mid > 0 && mid in pendingIncomingMessageIds) return@post
 
-                    if (msg.session.isNotEmpty()) currentSession.value = msg.session
                     val chatMsg = ChatMessage(
                         messageId = mid,
                         text = msg.text,
@@ -659,25 +936,58 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 "status" -> {
+                    // Only show busy/cancel for the session being viewed
+                    val isCurrentSession = msg.session.isEmpty() || msg.session == effectiveSession
                     if (msg.mode == "busy") {
-                        isBotBusy.value = msg.active
+                        if (isCurrentSession) {
+                            isBotBusy.value = msg.active
+                        }
                         updateKeepAlive(msg.active)
+                        // Refresh MC data so CLI runs (Claude/Codex/Gemini) appear
+                        fetchActiveTasks()
                     } else {
-                        taskStatus.value = TaskStatus(
-                            mode = msg.mode,
-                            phase = msg.phase,
-                            step = msg.step,
-                            active = msg.active
-                        )
-                        isBotBusy.value = msg.active
+                        if (isCurrentSession) {
+                            taskStatus.value = TaskStatus(
+                                mode = msg.mode,
+                                phase = msg.phase,
+                                step = msg.step,
+                                active = msg.active
+                            )
+                            isBotBusy.value = msg.active
+                        }
                         updateKeepAlive(msg.active)
+                        // Update Mission Control map
+                        val sessionName = msg.session
+                        if (sessionName.isNotEmpty() && msg.mode in setOf("omni", "justdoit", "deepreview")) {
+                            if (msg.active) {
+                                val existing = activeTasks[sessionName]
+                                activeTasks[sessionName] = ActiveTask(
+                                    mode = msg.mode,
+                                    session = sessionName,
+                                    task = msg.task.ifEmpty { existing?.task ?: "" },
+                                    phase = msg.phase,
+                                    step = msg.step,
+                                    started = if (msg.started > 0) msg.started else (existing?.started ?: 0),
+                                    paused = msg.paused
+                                )
+                            } else {
+                                activeTasks.remove(sessionName)
+                            }
+                        }
                     }
+                }
+                "active_session" -> {
+                    if (msg.session.isNotEmpty()) {
+                        currentSession.value = msg.session
+                    }
+                }
+                "schedule" -> {
+                    fetchScheduledTasks()
                 }
                 "edit" -> {
                     val mid = msg.messageId ?: return@post
                     // Skip legacy "edit" events for stream-tracked messages
                     if (mid in streamingMessageIds) return@post
-                    if (msg.session.isNotEmpty()) currentSession.value = msg.session
                     val idx = findMessageIndex(mid)
                     if (idx != null) {
                         val updated = messages[idx].copy(
@@ -726,8 +1036,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "start" -> {
                 // Mark this message for stream-based updates (skip legacy edit events)
                 streamingMessageIds.add(mid)
-                if (msg.session.isNotEmpty()) currentSession.value = msg.session
-
                 val existing = findMessageIndex(mid)
                 if (existing != null) {
                     if (messages[existing].text.contains("———")) {
@@ -855,7 +1163,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val doneExisting = findMessageIndex(mid)
                 // Skip if already finalized in memory (replay of completed message)
                 if (doneExisting != null && messages[doneExisting].text.contains("———")) return
-                if (msg.session.isNotEmpty()) currentSession.value = msg.session
                 val parsedChanges = msg.fileChanges.map { fc ->
                     FileChange(
                         type = fc["type"] ?: "",

@@ -19,6 +19,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -26,6 +29,8 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import com.claudebot.app.ChatViewModel
 import com.claudebot.app.network.ConnectionState
 import com.claudebot.app.ui.components.InputBar
@@ -48,6 +53,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
     var showSessions by remember { mutableStateOf(false) }
     var showOutline by remember { mutableStateOf(false) }
     var showFilterMenu by remember { mutableStateOf(false) }
+    var showToolsMenu by remember { mutableStateOf(false) }
+    var showMissionControl by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     val searchQuery by viewModel.searchQuery
     val searchResults = viewModel.searchResults
@@ -198,7 +205,9 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 } else {
                     TopAppBar(
                         title = {
-                            val session by viewModel.currentSession
+                            val serverSession by viewModel.currentSession
+                            val filterSession by viewModel.sessionFilter
+                            val session = filterSession ?: serverSession
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.clickable {
@@ -276,14 +285,62 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                     onSelect = { viewModel.setSessionFilter(it); showFilterMenu = false }
                                 )
                             }
-                            IconButton(onClick = { showOutline = true }) {
-                                Text("📑", fontSize = 16.sp)
+                            // Mission Control badge
+                            val activeTaskCount = viewModel.activeTasks.size
+                            Box {
+                                IconButton(onClick = {
+                                    showMissionControl = true
+                                    viewModel.fetchActiveTasks()
+                                }) {
+                                    Text("\u26A1", fontSize = 16.sp)
+                                }
+                                if (activeTaskCount > 0) {
+                                    Surface(
+                                        modifier = Modifier
+                                            .size(16.dp)
+                                            .align(Alignment.TopEnd)
+                                            .offset(x = (-2).dp, y = 6.dp),
+                                        shape = CircleShape,
+                                        color = AccentOrange
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                "$activeTaskCount",
+                                                fontSize = 9.sp,
+                                                color = DarkBg,
+                                                lineHeight = 9.sp,
+                                                modifier = Modifier.offset(y = (-1).dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
-                            IconButton(onClick = { showSearch = true }) {
-                                Text("\uD83D\uDD0D", fontSize = 16.sp)
-                            }
-                            IconButton(onClick = { viewModel.showSettings.value = true }) {
-                                Text("\u2699", fontSize = 20.sp, color = SessionLabel)
+                            Box {
+                                IconButton(onClick = { showToolsMenu = !showToolsMenu }) {
+                                    Text("\u22EF", fontSize = 20.sp, color = SessionLabel)
+                                }
+                                MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(surface = DarkSurface)) {
+                                DropdownMenu(
+                                    expanded = showToolsMenu,
+                                    onDismissRequest = { showToolsMenu = false },
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("Search", fontSize = 13.sp, color = BotText) },
+                                        onClick = { showToolsMenu = false; showSearch = true },
+                                        leadingIcon = { Text("\uD83D\uDD0D", fontSize = 14.sp) }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Outline", fontSize = 13.sp, color = BotText) },
+                                        onClick = { showToolsMenu = false; showOutline = true },
+                                        leadingIcon = { Text("📑", fontSize = 14.sp) }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Settings", fontSize = 13.sp, color = BotText) },
+                                        onClick = { showToolsMenu = false; viewModel.showSettings.value = true },
+                                        leadingIcon = { Text("\u2699", fontSize = 14.sp) }
+                                    )
+                                }
+                                }
                             }
                         }
                     )
@@ -364,7 +421,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 val action by viewModel.pendingAction
                 Column {
                     // Sticky action bar for pending questions/approvals
-                    if (action != null) {
+                    val currentAction = action
+                    if (currentAction != null) {
                         Surface(
                             color = DarkSurface,
                             shadowElevation = 8.dp,
@@ -374,25 +432,37 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                     .fillMaxWidth()
                                     .padding(12.dp)
                             ) {
-                                // "View plan" tap to scroll to the plan message
-                                Text(
-                                    text = "▲ Tap to view full message",
-                                    color = AccentOrangeLight,
-                                    fontSize = 11.sp,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable {
-                                            val mid = action!!.messageId
-                                            val idx = messages.indexOfFirst { it.messageId == mid }
-                                            if (idx >= 0) {
-                                                scope.launch { listState.animateScrollToItem(idx) }
+                                // Top row: "View full message" + Dismiss
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = "▲ Tap to view full message",
+                                        color = AccentOrangeLight,
+                                        fontSize = 11.sp,
+                                        modifier = Modifier
+                                            .clickable {
+                                                val idx = messages.indexOfFirst { it.messageId == currentAction.messageId }
+                                                if (idx >= 0) {
+                                                    scope.launch { listState.animateScrollToItem(idx) }
+                                                }
                                             }
-                                        }
-                                        .padding(bottom = 6.dp)
-                                )
+                                            .padding(bottom = 6.dp)
+                                    )
+                                    Text(
+                                        text = "Dismiss",
+                                        color = Color.Gray,
+                                        fontSize = 11.sp,
+                                        modifier = Modifier
+                                            .clickable { viewModel.dismissPendingAction() }
+                                            .padding(bottom = 6.dp)
+                                    )
+                                }
                                 // Question text — scrollable for long plans
                                 Text(
-                                    text = action!!.text,
+                                    text = currentAction.text,
                                     color = BotText,
                                     fontSize = 13.sp,
                                     modifier = Modifier
@@ -406,12 +476,12 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    action!!.buttons.flatten().forEach { btn ->
+                                    currentAction.buttons.flatten().forEach { btn ->
                                         val isApprove = btn.text.contains("Approve", ignoreCase = true)
                                         val isReject = btn.text.contains("Reject", ignoreCase = true)
                                         if (isApprove) {
                                             Button(
-                                                onClick = { viewModel.pressButton(action!!.messageId, btn) },
+                                                onClick = { viewModel.pressButton(currentAction.messageId, btn) },
                                                 modifier = Modifier.weight(1f),
                                                 colors = ButtonDefaults.buttonColors(
                                                     containerColor = ConnectedGreen,
@@ -423,7 +493,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                             }
                                         } else if (isReject) {
                                             OutlinedButton(
-                                                onClick = { viewModel.pressButton(action!!.messageId, btn) },
+                                                onClick = { viewModel.pressButton(currentAction.messageId, btn) },
                                                 modifier = Modifier.weight(1f),
                                                 border = BorderStroke(1.dp, DisconnectedRed),
                                                 colors = ButtonDefaults.outlinedButtonColors(
@@ -435,7 +505,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                             }
                                         } else {
                                             OutlinedButton(
-                                                onClick = { viewModel.pressButton(action!!.messageId, btn) },
+                                                onClick = { viewModel.pressButton(currentAction.messageId, btn) },
                                                 modifier = Modifier.weight(1f),
                                                 border = BorderStroke(1.dp, AccentOrange),
                                                 colors = ButtonDefaults.outlinedButtonColors(
@@ -508,6 +578,18 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     )
                 }
             } else if (!showSearch) {
+                // Session mismatch banner (viewing another session's chat via MC)
+                val viewingOther = viewModel.isViewingOtherSession
+                if (viewingOther) {
+                    SessionMismatchBanner(
+                        sessionName = viewModel.sessionFilter.value ?: "",
+                        onSwitchHere = { viewModel.quickSwitchToFilteredSession() },
+                        onClear = { viewModel.clearSessionFilter() },
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .zIndex(1f)
+                    )
+                }
                 // Normal chat view
                 if (messages.isEmpty()) {
                     Box(
@@ -523,10 +605,11 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         Text(hint, color = SessionLabel, fontSize = 14.sp)
                     }
                 } else {
+                    val bannerPad = if (viewingOther) 40.dp else 0.dp
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(vertical = 8.dp)
+                        contentPadding = PaddingValues(top = 8.dp + bannerPad, bottom = 8.dp)
                     ) {
                         if (isLoadingMore) {
                             item("loading_top") {
@@ -660,6 +743,403 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 Spacer(Modifier.height(WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()))
             }
         }
+
+        if (showMissionControl) {
+            LaunchedEffect(Unit) { viewModel.fetchScheduledTasks() }
+            var showAddSchedule by remember { mutableStateOf(false) }
+            ModalBottomSheet(
+                onDismissRequest = { showMissionControl = false },
+                sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+                containerColor = DarkSurface
+            ) {
+                MissionControlContent(
+                    activeTasks = viewModel.activeTasks,
+                    scheduledTasks = viewModel.scheduledTasks,
+                    onCancel = { viewModel.cancelTask(it) },
+                    onPause = { viewModel.pauseTask(it) },
+                    onResume = { viewModel.resumeTask(it) },
+                    onJumpToSession = { sessionName ->
+                        showMissionControl = false
+                        viewModel.viewTaskSession(sessionName)
+                    },
+                    onToggleSchedule = { id, enabled -> viewModel.toggleScheduledTask(id, enabled) },
+                    onDeleteSchedule = { viewModel.deleteScheduledTask(it) },
+                    onAddSchedule = { showAddSchedule = true },
+                )
+            }
+            if (showAddSchedule) {
+                AddScheduleDialog(
+                    sessions = viewModel.sessionList.map { it.name },
+                    onDismiss = { showAddSchedule = false },
+                    onCreate = { sessionName, prompt, scheduleType, cronExpr, runAt, mode ->
+                        viewModel.createScheduledTask(sessionName, prompt, scheduleType, cronExpr, runAt, mode)
+                        showAddSchedule = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+// ==================== Session Mismatch Banner ====================
+
+@Composable
+private fun SessionMismatchBanner(
+    sessionName: String,
+    onSwitchHere: () -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = DarkSurfaceVariant,
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "\uD83D\uDC41 Viewing $sessionName",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            TextButton(
+                onClick = onSwitchHere,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+            ) {
+                Text("Switch here", color = AccentOrange, fontSize = 11.sp)
+            }
+            TextButton(
+                onClick = onClear,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+            ) {
+                Text("Clear", color = Color.Gray, fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+// ==================== Mission Control ====================
+
+private val PHASE_MAP = mapOf(
+    "omni" to listOf("architecting", "reviewing", "executing", "auditing"),
+    "justdoit" to listOf("implementing", "reviewing", "testing"),
+    "deepreview" to listOf("claude_self_review", "codex_reviews_claude", "codex_self_review", "claude_reviews_codex"),
+)
+
+private val PHASE_LABELS = mapOf(
+    "architecting" to "Architect",
+    "executing" to "Execute",
+    "auditing" to "Audit",
+    "implementing" to "Implement",
+    "reviewing" to "Review",
+    "testing" to "Test",
+    "starting" to "Starting",
+    "claude_self_review" to "Claude",
+    "codex_reviews_claude" to "Codex Review",
+    "codex_self_review" to "Codex Fix",
+    "claude_reviews_codex" to "Claude Verify",
+)
+
+private fun formatElapsed(seconds: Long): String {
+    if (seconds < 0) return "0s"
+    val h = seconds / 3600
+    val m = (seconds % 3600) / 60
+    val s = seconds % 60
+    return when {
+        h > 0 -> "${h}h ${m}m"
+        m > 0 -> "${m}m ${s}s"
+        else -> "${s}s"
+    }
+}
+
+@Composable
+private fun MissionControlContent(
+    activeTasks: Map<String, ChatViewModel.ActiveTask>,
+    scheduledTasks: List<ChatViewModel.ScheduledTask>,
+    onCancel: (String) -> Unit,
+    onPause: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onJumpToSession: (String) -> Unit,
+    onToggleSchedule: (String, Boolean) -> Unit,
+    onDeleteSchedule: (String) -> Unit,
+    onAddSchedule: () -> Unit,
+) {
+    var selectedTab by remember { mutableIntStateOf(0) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            "Mission Control",
+            style = MaterialTheme.typography.titleMedium,
+            color = TopBarTitle,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+        )
+
+        TabRow(
+            selectedTabIndex = selectedTab,
+            containerColor = Color.Transparent,
+            contentColor = AccentOrange,
+            divider = { HorizontalDivider(color = InputBorder) },
+        ) {
+            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Active", color = if (selectedTab == 0) AccentOrange else SessionLabel)
+                    if (activeTasks.isNotEmpty()) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "${activeTasks.size}",
+                            fontSize = 11.sp,
+                            color = DarkSurface,
+                            modifier = Modifier
+                                .background(AccentOrange, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+            Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Scheduled", color = if (selectedTab == 1) AccentOrange else SessionLabel)
+                    if (scheduledTasks.isNotEmpty()) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "${scheduledTasks.size}",
+                            fontSize = 11.sp,
+                            color = DarkSurface,
+                            modifier = Modifier
+                                .background(AccentOrange, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        when (selectedTab) {
+            0 -> {
+                if (activeTasks.isEmpty()) {
+                    Text(
+                        "No active tasks.",
+                        color = SessionLabel,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 500.dp)
+                    ) {
+                        items(activeTasks.values.toList(), key = { it.session }) { task ->
+                            MissionControlRow(
+                                task = task,
+                                onCancel = { onCancel(task.session) },
+                                onPause = { onPause(task.session) },
+                                onResume = { onResume(task.session) },
+                                onTap = { onJumpToSession(task.session) }
+                            )
+                            HorizontalDivider(color = InputBorder)
+                        }
+                    }
+                }
+            }
+            1 -> {
+                ScheduledTasksTab(
+                    tasks = scheduledTasks,
+                    onToggle = onToggleSchedule,
+                    onDelete = onDeleteSchedule,
+                    onAdd = onAddSchedule,
+                )
+            }
+        }
+
+        Spacer(Modifier.height(WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()))
+    }
+}
+
+@Composable
+private fun MissionControlRow(
+    task: ChatViewModel.ActiveTask,
+    onCancel: () -> Unit,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onTap: () -> Unit,
+) {
+    // Ticking elapsed time (freezes when paused)
+    var elapsed by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(task.started, task.paused) {
+        if (task.started > 0 && !task.paused) {
+            while (true) {
+                elapsed = (System.currentTimeMillis() / 1000) - task.started
+                delay(1000)
+            }
+        }
+    }
+
+    val dimAlpha = if (task.paused) 0.5f else 1f
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onTap() }
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        // Row 1: Session name + mode badge + paused badge + elapsed
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                task.session,
+                color = AccentOrange.copy(alpha = dimAlpha),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (task.paused) {
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = Color(0xFFFFD54F).copy(alpha = 0.2f)
+                ) {
+                    Text(
+                        "PAUSED",
+                        color = Color(0xFFFFD54F),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                Spacer(Modifier.width(4.dp))
+            }
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = AccentOrange.copy(alpha = 0.15f * dimAlpha)
+            ) {
+                Text(
+                    task.mode.uppercase(),
+                    color = AccentOrange.copy(alpha = dimAlpha),
+                    fontSize = 10.sp,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(formatElapsed(elapsed), color = SessionLabel.copy(alpha = dimAlpha), fontSize = 11.sp)
+        }
+
+        // Row 2: Task description
+        if (task.task.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                task.task,
+                color = BotText.copy(alpha = dimAlpha),
+                fontSize = 12.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // Row 3: Phase stepper
+        val phases = PHASE_MAP[task.mode] ?: emptyList()
+        if (phases.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            PhaseStepper(phases = phases, currentPhase = task.phase, dimmed = task.paused)
+        }
+
+        // Row 4: Step count + Pause/Resume + Stop buttons
+        val isAutonomous = task.mode in setOf("omni", "justdoit", "deepreview")
+        Spacer(Modifier.height(4.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                if (!isAutonomous) "Running"
+                else if (task.paused) "Step ${task.step} (paused)"
+                else "Step ${task.step}",
+                color = SessionLabel,
+                fontSize = 11.sp,
+                modifier = Modifier.weight(1f)
+            )
+            if (isAutonomous) {
+                if (task.paused) {
+                    TextButton(
+                        onClick = onResume,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Text("Resume", color = Color(0xFF66BB6A), fontSize = 12.sp)
+                    }
+                } else {
+                    TextButton(
+                        onClick = onPause,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Text("Pause", color = Color(0xFFFFD54F), fontSize = 12.sp)
+                    }
+                }
+            }
+            TextButton(
+                onClick = onCancel,
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+            ) {
+                Text("Stop", color = DisconnectedRed, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhaseStepper(phases: List<String>, currentPhase: String, dimmed: Boolean = false) {
+    val currentIndex = phases.indexOf(currentPhase)
+    val dimAlpha = if (dimmed) 0.4f else 1f
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        phases.forEachIndexed { index, phase ->
+            val isComplete = currentIndex >= 0 && index < currentIndex
+            val isCurrent = index == currentIndex
+            val color = when {
+                isComplete -> ConnectedGreen.copy(alpha = dimAlpha)
+                isCurrent -> AccentOrange.copy(alpha = dimAlpha)
+                else -> SessionLabel.copy(alpha = 0.4f * dimAlpha)
+            }
+            Box(
+                modifier = Modifier
+                    .size(if (isCurrent) 10.dp else 8.dp)
+                    .clip(CircleShape)
+                    .background(color)
+            )
+            Text(
+                PHASE_LABELS[phase] ?: phase,
+                fontSize = 9.sp,
+                color = color,
+                modifier = Modifier.padding(start = 3.dp)
+            )
+            if (index < phases.size - 1) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(1.dp)
+                        .padding(horizontal = 4.dp)
+                        .background(if (isComplete) ConnectedGreen.copy(alpha = 0.5f) else InputBorder)
+                )
+            }
+        }
     }
 }
 
@@ -760,4 +1240,391 @@ private fun TypingIndicator() {
             }
         }
     }
+}
+
+// ==================== Scheduled Tasks ====================
+
+@Composable
+private fun ScheduledTasksTab(
+    tasks: List<ChatViewModel.ScheduledTask>,
+    onToggle: (String, Boolean) -> Unit,
+    onDelete: (String) -> Unit,
+    onAdd: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        if (tasks.isEmpty()) {
+            Text(
+                "No scheduled tasks.",
+                color = SessionLabel,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(16.dp)
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 450.dp)
+            ) {
+                items(tasks, key = { it.id }) { task ->
+                    ScheduledTaskRow(task, onToggle, onDelete)
+                    HorizontalDivider(color = InputBorder)
+                }
+            }
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            OutlinedButton(
+                onClick = onAdd,
+                border = BorderStroke(1.dp, AccentOrange),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentOrange),
+            ) {
+                Text("+ Add Schedule")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScheduledTaskRow(
+    task: ChatViewModel.ScheduledTask,
+    onToggle: (String, Boolean) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    val dimAlpha = if (task.enabled) 1f else 0.5f
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Column(modifier = Modifier.weight(1f).alpha(dimAlpha)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    task.sessionName,
+                    color = AccentOrange,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.width(8.dp))
+                // Mode badge
+                val (modeLabel, modeColor) = if (task.mode == "justdoit") {
+                    "EXECUTE" to AccentOrange
+                } else {
+                    "REMIND" to Color(0xFF64B5F6)
+                }
+                Text(
+                    modeLabel,
+                    fontSize = 9.sp,
+                    color = DarkSurface,
+                    modifier = Modifier
+                        .background(modeColor, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                )
+            }
+
+            Spacer(Modifier.height(3.dp))
+
+            // Schedule description
+            Text(
+                formatScheduleDescription(task),
+                color = SessionLabel,
+                fontSize = 12.sp,
+            )
+
+            Spacer(Modifier.height(2.dp))
+
+            // Prompt preview
+            Text(
+                task.prompt,
+                color = BotText.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+
+            // Next run
+            if (task.nextRun != null) {
+                Spacer(Modifier.height(2.dp))
+                val relTime = formatRelativeTime(task.nextRun)
+                Text(
+                    "Next: $relTime${if (task.runCount > 0) " · ${task.runCount} runs" else ""}",
+                    color = SessionLabel,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Switch(
+                checked = task.enabled,
+                onCheckedChange = { onToggle(task.id, it) },
+                modifier = Modifier.height(28.dp),
+                colors = SwitchDefaults.colors(
+                    checkedTrackColor = AccentOrange,
+                    uncheckedTrackColor = InputBorder,
+                ),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Delete",
+                color = Color(0xFFCF6679),
+                fontSize = 11.sp,
+                modifier = Modifier.clickable { onDelete(task.id) },
+            )
+        }
+    }
+}
+
+private fun formatScheduleDescription(task: ChatViewModel.ScheduledTask): String {
+    if (task.scheduleType == "once") {
+        return "Once: ${task.runAt ?: "?"}"
+    }
+    val expr = task.cronExpr ?: return "?"
+    // Try to give human-readable for common patterns
+    return when {
+        expr == "0 * * * *" -> "Every hour"
+        expr == "0 0 * * *" -> "Daily at midnight"
+        expr == "0 0 * * 0" -> "Weekly on Sunday"
+        expr == "0 0 1 * *" -> "Monthly on the 1st"
+        expr.matches(Regex("""(\d+) (\d+) \* \* \*""")) -> {
+            val (m, h) = expr.split(" ").take(2)
+            "Daily at ${h.padStart(2, '0')}:${m.padStart(2, '0')}"
+        }
+        expr.matches(Regex("""(\d+) (\d+) \* \* \w+""")) -> {
+            val parts = expr.split(" ")
+            val m = parts[0]; val h = parts[1]; val dow = parts[4]
+            "Weekly ${dow.replaceFirstChar { it.uppercase() }} at ${h.padStart(2, '0')}:${m.padStart(2, '0')}"
+        }
+        else -> "cron: $expr"
+    }
+}
+
+private fun formatRelativeTime(epochSecs: Long): String {
+    val now = System.currentTimeMillis() / 1000
+    val diff = epochSecs - now
+    if (diff <= 0) return "now"
+    val minutes = diff / 60
+    val hours = minutes / 60
+    val days = hours / 24
+    return when {
+        days > 0 -> "${days}d ${hours % 24}h"
+        hours > 0 -> "${hours}h ${minutes % 60}m"
+        else -> "${minutes}m"
+    }
+}
+
+private fun Modifier.alpha(a: Float): Modifier = this.graphicsLayer(alpha = a)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddScheduleDialog(
+    sessions: List<String>,
+    onDismiss: () -> Unit,
+    onCreate: (sessionName: String, prompt: String, scheduleType: String, cronExpr: String?, runAt: String?, mode: String) -> Unit,
+) {
+    var selectedSession by remember { mutableStateOf(sessions.firstOrNull() ?: "") }
+    var prompt by remember { mutableStateOf("") }
+    var scheduleType by remember { mutableStateOf("cron") } // "cron" | "once"
+    var cronExpr by remember { mutableStateOf("0 9 * * *") }
+    var runAtDate by remember { mutableStateOf("") }
+    var runAtTime by remember { mutableStateOf("09:00") }
+    var mode by remember { mutableStateOf("justdoit") }
+    var sessionExpanded by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = DarkSurface,
+        titleContentColor = TopBarTitle,
+        textContentColor = BotText,
+        title = { Text("Add Scheduled Task") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                // Session picker
+                Text("Session", color = SessionLabel, fontSize = 12.sp)
+                ExposedDropdownMenuBox(
+                    expanded = sessionExpanded,
+                    onExpandedChange = { sessionExpanded = it },
+                ) {
+                    OutlinedTextField(
+                        value = selectedSession,
+                        onValueChange = {},
+                        readOnly = true,
+                        modifier = Modifier.fillMaxWidth().menuAnchor(),
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sessionExpanded) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                    )
+                    ExposedDropdownMenu(
+                        expanded = sessionExpanded,
+                        onDismissRequest = { sessionExpanded = false },
+                        modifier = Modifier.background(DarkSurface),
+                    ) {
+                        sessions.forEach { name ->
+                            DropdownMenuItem(
+                                text = { Text(name, color = BotText) },
+                                onClick = { selectedSession = name; sessionExpanded = false },
+                            )
+                        }
+                    }
+                }
+
+                // Prompt
+                Text("Task prompt", color = SessionLabel, fontSize = 12.sp)
+                OutlinedTextField(
+                    value = prompt,
+                    onValueChange = { prompt = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AccentOrange,
+                        unfocusedBorderColor = InputBorder,
+                        focusedTextColor = BotText,
+                        unfocusedTextColor = BotText,
+                    ),
+                    placeholder = { Text("Run tests and fix failures", color = SessionLabel) },
+                )
+
+                // Schedule type toggle
+                Text("Schedule", color = SessionLabel, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = scheduleType == "cron",
+                        onClick = { scheduleType = "cron" },
+                        label = { Text("Recurring") },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentOrange,
+                            selectedLabelColor = DarkSurface,
+                            labelColor = SessionLabel,
+                        ),
+                    )
+                    FilterChip(
+                        selected = scheduleType == "once",
+                        onClick = { scheduleType = "once" },
+                        label = { Text("One-time") },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentOrange,
+                            selectedLabelColor = DarkSurface,
+                            labelColor = SessionLabel,
+                        ),
+                    )
+                }
+
+                if (scheduleType == "cron") {
+                    // Preset buttons
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("Daily 9am" to "0 9 * * *", "Hourly" to "0 * * * *", "Weekly Mon" to "0 9 * * mon").forEach { (label, expr) ->
+                            AssistChip(
+                                onClick = { cronExpr = expr },
+                                label = { Text(label, fontSize = 11.sp) },
+                                border = if (cronExpr == expr) BorderStroke(1.dp, AccentOrange) else AssistChipDefaults.assistChipBorder(true),
+                                colors = AssistChipDefaults.assistChipColors(labelColor = BotText),
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = cronExpr,
+                        onValueChange = { cronExpr = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Cron expression", color = SessionLabel) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                        placeholder = { Text("0 9 * * *", color = SessionLabel) },
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = runAtDate,
+                        onValueChange = { runAtDate = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Date (YYYY-MM-DD)", color = SessionLabel) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                        placeholder = { Text("2026-03-15", color = SessionLabel) },
+                    )
+                    OutlinedTextField(
+                        value = runAtTime,
+                        onValueChange = { runAtTime = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Time (HH:MM)", color = SessionLabel) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                        placeholder = { Text("14:00", color = SessionLabel) },
+                    )
+                }
+
+                // Mode selector
+                Text("Execution mode", color = SessionLabel, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = mode == "justdoit",
+                        onClick = { mode = "justdoit" },
+                        label = { Text("Execute") },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = AccentOrange,
+                            selectedLabelColor = DarkSurface,
+                            labelColor = SessionLabel,
+                        ),
+                    )
+                    FilterChip(
+                        selected = mode == "remind",
+                        onClick = { mode = "remind" },
+                        label = { Text("Remind") },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = Color(0xFF64B5F6),
+                            selectedLabelColor = DarkSurface,
+                            labelColor = SessionLabel,
+                        ),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (selectedSession.isNotEmpty() && prompt.isNotEmpty()) {
+                        val finalCronExpr = if (scheduleType == "cron") cronExpr else null
+                        val finalRunAt = if (scheduleType == "once") "${runAtDate}T${runAtTime}" else null
+                        onCreate(selectedSession, prompt, scheduleType, finalCronExpr, finalRunAt, mode)
+                    }
+                },
+                enabled = selectedSession.isNotEmpty() && prompt.isNotEmpty(),
+            ) {
+                Text("Create", color = if (selectedSession.isNotEmpty() && prompt.isNotEmpty()) AccentOrange else SessionLabel)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = SessionLabel)
+            }
+        },
+    )
 }

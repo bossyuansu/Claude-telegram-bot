@@ -32,6 +32,17 @@ _omni_active = None
 _deepreview_active = None
 _send_message = None
 _send_message_no_ws = None
+_cancelled_sessions = None
+_ws_broadcast_status = None
+_save_active_tasks = None
+_user_feedback_queue = None
+_get_active_sessions_data = None
+_scheduled_tasks = None
+_scheduled_tasks_lock = None
+_save_scheduled_tasks = None
+_create_scheduled_task = None
+_next_cron_run_fn = None
+_ws_broadcast_schedule = None
 
 API_SECRET = ""
 _default_chat_id = None
@@ -79,6 +90,8 @@ def init_refs(**kwargs):
     global _user_sessions, _active_processes
     global _justdoit_active, _omni_active, _deepreview_active
     global _send_message, _send_message_no_ws
+    global _cancelled_sessions, _ws_broadcast_status, _save_active_tasks, _user_feedback_queue, _get_active_sessions_data
+    global _scheduled_tasks, _scheduled_tasks_lock, _save_scheduled_tasks, _create_scheduled_task, _next_cron_run_fn, _ws_broadcast_schedule
     global API_SECRET, _default_chat_id
 
     _handle_command = kwargs["handle_command"]
@@ -94,6 +107,17 @@ def init_refs(**kwargs):
     _deepreview_active = kwargs["deepreview_active"]
     _send_message = kwargs.get("send_message")
     _send_message_no_ws = kwargs.get("send_message_no_ws")
+    _cancelled_sessions = kwargs.get("cancelled_sessions")
+    _ws_broadcast_status = kwargs.get("ws_broadcast_status")
+    _save_active_tasks = kwargs.get("save_active_tasks")
+    _user_feedback_queue = kwargs.get("user_feedback_queue")
+    _get_active_sessions_data = kwargs.get("get_active_sessions_data")
+    _scheduled_tasks = kwargs.get("scheduled_tasks")
+    _scheduled_tasks_lock = kwargs.get("scheduled_tasks_lock")
+    _save_scheduled_tasks = kwargs.get("save_scheduled_tasks")
+    _create_scheduled_task = kwargs.get("create_scheduled_task")
+    _next_cron_run_fn = kwargs.get("next_cron_run_fn")
+    _ws_broadcast_schedule = kwargs.get("ws_broadcast_schedule")
     API_SECRET = os.environ.get("API_SECRET", "")
     _default_chat_id = kwargs.get("default_chat_id")
 
@@ -117,6 +141,55 @@ class CallbackRequest(BaseModel):
     chat_id: Optional[int] = None
     data: str
     message_id: int
+
+class TaskActionRequest(BaseModel):
+    chat_id: Optional[int] = None
+    session: str
+
+class ScheduleTaskRequest(BaseModel):
+    chat_id: Optional[int] = None
+    session_name: str
+    prompt: str
+    schedule_type: str  # "cron" | "once"
+    cron_expr: Optional[str] = None
+    run_at: Optional[str] = None
+    mode: str = "justdoit"  # "justdoit" | "remind"
+
+class ScheduleTaskUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    prompt: Optional[str] = None
+    cron_expr: Optional[str] = None
+    run_at: Optional[str] = None
+    mode: Optional[str] = None
+
+
+# --- Task helpers ---
+
+_AUTONOMOUS_MODES = [
+    ("justdoit", "_justdoit_active", "JustDoIt"),
+    ("omni", "_omni_active", "Omni"),
+    ("deepreview", "_deepreview_active", "Deep review"),
+]
+
+def _get_mode_states():
+    """Return [(state_dict, mode_key, label)] resolving current global refs."""
+    return [
+        (_justdoit_active or {}, "justdoit", "JustDoIt"),
+        (_omni_active or {}, "omni", "Omni"),
+        (_deepreview_active or {}, "deepreview", "Deep review"),
+    ]
+
+def _resolve_task_session(req):
+    """Auth + session lookup shared by cancel/pause/resume. Returns (chat_id, target_session, session_id, jdi_key)."""
+    chat_id = req.chat_id or _default_chat_id
+    if not chat_id or not _is_allowed(chat_id):
+        raise HTTPException(status_code=403, detail="Chat ID not allowed")
+    user_data = _user_sessions.get(str(chat_id), {})
+    for s in user_data.get("sessions", []):
+        if s.get("name") == req.session:
+            session_id = _get_session_id(s)
+            return chat_id, s, session_id, f"{chat_id}:{session_id}"
+    raise HTTPException(status_code=404, detail="Session not found")
 
 
 # --- WebSocket broadcast (called from bot.py threads) ---
@@ -300,6 +373,251 @@ def health():
         "ws_clients": len(_ws_clients),
         "threads": threading.active_count(),
     }
+
+
+@app.get("/api/active-tasks/{chat_id}")
+def get_active_tasks(chat_id: int = 0, _=Depends(verify_auth)):
+    """Return all currently active autonomous tasks across all sessions."""
+    chat_id = chat_id or _default_chat_id
+    if not chat_id or not _is_allowed(chat_id):
+        raise HTTPException(status_code=403, detail="Chat ID not allowed")
+
+    tasks = []
+    autonomous_sids = set()
+    for state_dict, mode, _label in _get_mode_states():
+        for key, state in list(state_dict.items()):
+            if state.get("active") and str(state.get("chat_id")) == str(chat_id):
+                tasks.append({
+                    "mode": mode,
+                    "session": state.get("session_name", ""),
+                    "task": (state.get("task", "") or "")[:200],
+                    "phase": state.get("phase", ""),
+                    "step": state.get("step", 0),
+                    "started": state.get("started", 0),
+                    "paused": state.get("paused", False),
+                })
+                # Track session_id to exclude from CLI runs below
+                parts = key.split(":", 1)
+                if len(parts) == 2:
+                    autonomous_sids.add(parts[1])
+
+    # Add active CLI processes (Claude, Codex, Gemini) not already tracked as autonomous tasks
+    active_data = _get_active_sessions_data() if _get_active_sessions_data else {}
+    user_data = _user_sessions.get(str(chat_id), {}) if _user_sessions else {}
+    for s in user_data.get("sessions", []):
+        sid = _get_session_id(s) if _get_session_id else None
+        if sid and sid in (_active_processes or {}) and sid not in autonomous_sids:
+            info = active_data.get(sid, {})
+            cli = s.get("last_cli", "Claude")
+            tasks.append({
+                "mode": cli.lower(),
+                "session": s.get("name", ""),
+                "task": (info.get("prompt", "") or "")[:200],
+                "phase": "",
+                "step": 0,
+                "started": int(info.get("started", 0)),
+                "paused": False,
+            })
+
+    return {"tasks": tasks}
+
+
+@app.post("/api/cancel-task")
+def cancel_task(req: TaskActionRequest, _=Depends(verify_auth)):
+    """Cancel an autonomous task by session name without switching the active session."""
+    import signal as _signal
+
+    chat_id, _target, session_id, jdi_key = _resolve_task_session(req)
+    cancelled_mode = None
+
+    for state_dict_ref, mode, mode_label in _get_mode_states():
+        state = state_dict_ref.get(jdi_key) if state_dict_ref else None
+        if state and state.get("active"):
+            state["active"] = False
+            # Unblock if paused so the loop thread can exit
+            resume_event = state.get("resume_event")
+            if resume_event:
+                resume_event.set()
+            cancelled_mode = mode
+            if _ws_broadcast_status:
+                _ws_broadcast_status(chat_id, mode, "", 0, active=False)
+
+    if _user_feedback_queue:
+        _user_feedback_queue.pop(jdi_key, None)
+    if _save_active_tasks:
+        _save_active_tasks()
+
+    # Kill the process
+    process = _active_processes.get(session_id)
+    if process:
+        if _cancelled_sessions is not None:
+            _cancelled_sessions.add(session_id)
+        try:
+            import os as _os
+            _os.killpg(_os.getpgid(process.pid), _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            # Fallback (e.g. EPERM) — try direct kill
+            try:
+                process.kill()
+            except Exception:
+                pass
+        # Clean up pipes and tracking
+        for pipe in (process.stdout, process.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except Exception:
+                pass
+        _active_processes.pop(session_id, None)
+        broadcast_ws(chat_id, "status", {"mode": "busy", "active": False})
+
+    if cancelled_mode and _send_message:
+        label = dict((m, l) for m, _, l in _AUTONOMOUS_MODES).get(cancelled_mode, cancelled_mode)
+        _send_message(chat_id, f"\u26A0\uFE0F *{label} cancelled* for `{req.session}`.\n_Session preserved._")
+
+    if not cancelled_mode and not process:
+        raise HTTPException(status_code=404, detail="No active task found for this session")
+
+    return {"status": "cancelled", "session": req.session, "mode": cancelled_mode}
+
+
+@app.post("/api/pause-task")
+def pause_task(req: TaskActionRequest, _=Depends(verify_auth)):
+    """Pause an autonomous task. The loop finishes its current step then blocks."""
+    chat_id, _target, _sid, jdi_key = _resolve_task_session(req)
+    paused_mode = None
+
+    for state_dict_ref, mode, _label in _get_mode_states():
+        state = state_dict_ref.get(jdi_key) if state_dict_ref else None
+        if state and state.get("active") and not state.get("paused"):
+            state["paused"] = True
+            resume_event = state.get("resume_event")
+            if resume_event:
+                resume_event.clear()  # Block the loop thread at next checkpoint
+            paused_mode = mode
+            if _ws_broadcast_status:
+                _ws_broadcast_status(chat_id, mode, state.get("phase", ""), state.get("step", 0), paused=True)
+
+    if _save_active_tasks:
+        _save_active_tasks()
+
+    if not paused_mode:
+        raise HTTPException(status_code=404, detail="No active task found for this session")
+
+    return {"status": "paused", "session": req.session, "mode": paused_mode}
+
+
+@app.post("/api/resume-task")
+def resume_task(req: TaskActionRequest, _=Depends(verify_auth)):
+    """Resume a paused autonomous task."""
+    chat_id, _target, _sid, jdi_key = _resolve_task_session(req)
+    resumed_mode = None
+
+    for state_dict_ref, mode, _label in _get_mode_states():
+        state = state_dict_ref.get(jdi_key) if state_dict_ref else None
+        if state and state.get("active") and state.get("paused"):
+            state["paused"] = False
+            resume_event = state.get("resume_event")
+            if resume_event:
+                resume_event.set()  # Unblock the loop thread
+            resumed_mode = mode
+            if _ws_broadcast_status:
+                _ws_broadcast_status(chat_id, mode, state.get("phase", ""), state.get("step", 0), paused=False)
+
+    if _save_active_tasks:
+        _save_active_tasks()
+
+    if not resumed_mode:
+        raise HTTPException(status_code=404, detail="No paused task found for this session")
+
+    return {"status": "resumed", "session": req.session, "mode": resumed_mode}
+
+
+# --- Scheduled tasks endpoints ---
+
+@app.get("/api/scheduled-tasks/{chat_id}")
+def get_scheduled_tasks(chat_id: int = 0, _=Depends(verify_auth)):
+    """List all scheduled tasks for a chat."""
+    chat_id = chat_id or _default_chat_id
+    if not chat_id or not _is_allowed(chat_id):
+        raise HTTPException(status_code=403, detail="Chat ID not allowed")
+    with _scheduled_tasks_lock:
+        tasks = [t for t in (_scheduled_tasks or {}).values()
+                 if str(t.get("chat_id")) == str(chat_id)]
+    return sorted(tasks, key=lambda t: t.get("next_run") or float("inf"))
+
+
+@app.post("/api/schedule-task")
+def api_create_schedule_task(req: ScheduleTaskRequest, _=Depends(verify_auth)):
+    """Create a new scheduled task."""
+    chat_id = req.chat_id or _default_chat_id
+    if not chat_id or not _is_allowed(chat_id):
+        raise HTTPException(status_code=403, detail="Chat ID not allowed")
+    try:
+        task_id, task = _create_scheduled_task(
+            chat_id, req.session_name, req.prompt, req.schedule_type,
+            cron_expr=req.cron_expr, run_at=req.run_at, mode=req.mode,
+        )
+        return {"status": "created", "task_id": task_id, "next_run": task.get("next_run")}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/schedule-task/{task_id}")
+def api_update_schedule_task(task_id: str, req: ScheduleTaskUpdate, _=Depends(verify_auth)):
+    """Update a scheduled task (enable/disable, edit prompt, change schedule)."""
+    try:
+        with _scheduled_tasks_lock:
+            task = (_scheduled_tasks or {}).get(task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            if req.enabled is not None:
+                task["enabled"] = req.enabled
+            if req.prompt is not None:
+                task["prompt"] = req.prompt
+            if req.mode is not None:
+                if req.mode not in ("justdoit", "remind"):
+                    raise HTTPException(status_code=400, detail="Invalid mode")
+                task["mode"] = req.mode
+            if req.cron_expr is not None:
+                task["cron_expr"] = req.cron_expr
+                task["schedule_type"] = "cron"
+                if _next_cron_run_fn:
+                    from datetime import datetime as _dt
+                    nxt = _next_cron_run_fn(req.cron_expr, _dt.now())
+                    task["next_run"] = nxt.timestamp() if nxt else None
+            if req.run_at is not None:
+                task["run_at"] = req.run_at
+                task["schedule_type"] = "once"
+                from datetime import datetime as _dt
+                task["next_run"] = _dt.fromisoformat(req.run_at.replace(" ", "T", 1)).timestamp()
+    except HTTPException:
+        raise
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if _save_scheduled_tasks:
+        _save_scheduled_tasks()
+    chat_id = int(task.get("chat_id", 0))
+    if _ws_broadcast_schedule and chat_id:
+        _ws_broadcast_schedule(chat_id, "updated", task_id, task)
+    return {"status": "updated", "task_id": task_id}
+
+
+@app.delete("/api/schedule-task/{task_id}")
+def api_delete_schedule_task(task_id: str, _=Depends(verify_auth)):
+    """Delete a scheduled task."""
+    with _scheduled_tasks_lock:
+        task = (_scheduled_tasks or {}).pop(task_id, None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if _save_scheduled_tasks:
+        _save_scheduled_tasks()
+    chat_id = int(task.get("chat_id", 0))
+    if _ws_broadcast_schedule and chat_id:
+        _ws_broadcast_schedule(chat_id, "deleted", task_id, task)
+    return {"status": "deleted", "task_id": task_id}
 
 
 # --- WebSocket endpoint ---

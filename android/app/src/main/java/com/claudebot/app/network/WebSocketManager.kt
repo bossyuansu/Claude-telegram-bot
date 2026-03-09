@@ -22,6 +22,9 @@ data class WsMessage(
     val phase: String = "",
     val step: Int = 0,
     val active: Boolean = false,
+    val task: String = "",       // task description (for Mission Control)
+    val started: Long = 0,      // epoch seconds when task started
+    val paused: Boolean = false, // whether the task is paused
     // Stream fields (for type="stream")
     val op: String = "",           // "start", "append", "tool", "done"
     val tool: String = "",         // tool name for op="tool"
@@ -300,6 +303,9 @@ class WebSocketManager(
             phase = json.optString("phase", ""),
             step = json.optInt("step", 0),
             active = json.optBoolean("active", false),
+            task = json.optString("task", ""),
+            started = json.optLong("started", 0),
+            paused = json.optBoolean("paused", false),
             op = json.optString("op", ""),
             tool = json.optString("tool", ""),
             path = json.optString("path", ""),
