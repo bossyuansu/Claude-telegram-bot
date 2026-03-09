@@ -422,6 +422,7 @@ def get_updates(offset=0):
 _api_module = None  # Set in main() after api.py is loaded
 _ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadcasts
 _ws_session_override = threading.local()  # Per-thread session name for WS broadcasts (avoids get_active_session races)
+_active_session_override = threading.local()  # Per-thread session override for scheduled tasks (avoids mutating global active session)
 
 
 def _ws_broadcast(chat_id, event_type, data):
@@ -667,21 +668,16 @@ def _trigger_scheduled_task(task_id, task):
 
     send_message(chat_id, f"⏰ *Scheduled task triggered*\nSession: `{session_name}`\nTask: _{prompt[:200]}_")
 
-    session_id = get_session_id(session)
-
-    # Route exactly like a user message
-    if prompt.startswith("/"):
-        # Commands call get_active_session internally — temporarily switch, then restore
-        chat_key = str(chat_id)
-        prev_active = user_sessions.get(chat_key, {}).get("active")
-        set_active_session(chat_id, session_id)
-        try:
+    # Use thread-local override so get_active_session returns the target session
+    # on this thread without mutating the user's actual active session
+    _active_session_override.session = session
+    try:
+        if prompt.startswith("/"):
             handle_command(chat_id, prompt)
-        finally:
-            if prev_active is not None:
-                set_active_session(chat_id, prev_active)
-    else:
-        handle_message(chat_id, prompt, session=session)
+        else:
+            handle_message(chat_id, prompt, session=session)
+    finally:
+        _active_session_override.session = None
 
 
 def _start_scheduler():
@@ -1812,7 +1808,11 @@ def create_session(chat_id, project_name, cwd):
 
 
 def get_active_session(chat_id):
-    """Get the active session for a user."""
+    """Get the active session for a user. Checks thread-local override first (for scheduled tasks)."""
+    override = getattr(_active_session_override, 'session', None)
+    if override is not None:
+        return override
+
     chat_key = str(chat_id)
     user_data = user_sessions.get(chat_key, {})
     active_id = user_data.get("active")
