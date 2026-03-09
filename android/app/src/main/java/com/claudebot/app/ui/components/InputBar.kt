@@ -11,8 +11,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.*
@@ -67,6 +69,7 @@ fun InputBar(
 ) {
     var text by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
+    var showShortcuts by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
@@ -158,6 +161,35 @@ fun InputBar(
             }
         }
 
+        // Quick message shortcuts
+        AnimatedVisibility(
+            visible = showShortcuts,
+            enter = fadeIn() + slideInVertically { it },
+            exit = fadeOut() + slideOutVertically { it }
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(InputBg)
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                listOf("commit and push", "deploy", "fix it", "run tests", "continue").forEach { shortcut ->
+                    Text(
+                        shortcut,
+                        fontSize = 12.sp,
+                        color = AccentOrange,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, InputBorder, RoundedCornerShape(12.dp))
+                            .clickable { onSend(shortcut); showShortcuts = false }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        }
+
         // Input row
         Surface(
             color = InputBg,
@@ -171,9 +203,9 @@ fun InputBar(
             ) {
                 // Command menu button
                 FilledIconButton(
-                    onClick = { showMenu = !showMenu },
+                    onClick = { showMenu = !showMenu; showShortcuts = false },
                     enabled = enabled,
-                    modifier = Modifier.size(40.dp),
+                    modifier = Modifier.size(36.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = if (showMenu) AccentOrange else DarkSurfaceVariant,
                         contentColor = if (showMenu) UserBubbleText else AccentOrange,
@@ -184,7 +216,16 @@ fun InputBar(
                     Text("/", style = MaterialTheme.typography.titleMedium)
                 }
 
-                Spacer(Modifier.width(4.dp))
+                // Shortcuts toggle
+                IconButton(
+                    onClick = { showShortcuts = !showShortcuts; showMenu = false },
+                    enabled = enabled,
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Text("\u26A1", fontSize = 16.sp)
+                }
+
+                Spacer(Modifier.width(2.dp))
 
                 // Text input with compact padding
                 var focused by remember { mutableStateOf(false) }
