@@ -782,6 +782,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun updateScheduledTask(taskId: String, prompt: String?, cronExpr: String?, runAt: String?) {
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/schedule-task/$taskId"
+                val json = JSONObject().apply {
+                    if (prompt != null) put("prompt", prompt)
+                    if (cronExpr != null) put("cron_expr", cronExpr)
+                    if (runAt != null) put("run_at", runAt)
+                }.toString()
+                val body = json.toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).put(body)
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* WS will refresh */ }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "updateScheduledTask failed: ${e.message}")
+            }
+        }
+        // Re-fetch to get server-computed next_run
+        fetchScheduledTasks()
+    }
+
     fun triggerScheduledTask(taskId: String) {
         sendExecutor.submit {
             try {

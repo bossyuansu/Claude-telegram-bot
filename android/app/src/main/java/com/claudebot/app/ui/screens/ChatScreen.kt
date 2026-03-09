@@ -764,6 +764,9 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     },
                     onToggleSchedule = { id, enabled -> viewModel.toggleScheduledTask(id, enabled) },
                     onTriggerSchedule = { viewModel.triggerScheduledTask(it) },
+                    onEditSchedule = { taskId, prompt, cronExpr, runAt ->
+                        viewModel.updateScheduledTask(taskId, prompt, cronExpr, runAt)
+                    },
                     onDeleteSchedule = { viewModel.deleteScheduledTask(it) },
                     onAddSchedule = { showAddSchedule = true },
                 )
@@ -870,6 +873,7 @@ private fun MissionControlContent(
     onJumpToSession: (String) -> Unit,
     onToggleSchedule: (String, Boolean) -> Unit,
     onTriggerSchedule: (String) -> Unit,
+    onEditSchedule: (taskId: String, prompt: String?, cronExpr: String?, runAt: String?) -> Unit,
     onDeleteSchedule: (String) -> Unit,
     onAddSchedule: () -> Unit,
 ) {
@@ -963,6 +967,7 @@ private fun MissionControlContent(
                     tasks = scheduledTasks,
                     onToggle = onToggleSchedule,
                     onTrigger = onTriggerSchedule,
+                    onEdit = onEditSchedule,
                     onDelete = onDeleteSchedule,
                     onAdd = onAddSchedule,
                 )
@@ -1252,9 +1257,12 @@ private fun ScheduledTasksTab(
     tasks: List<ChatViewModel.ScheduledTask>,
     onToggle: (String, Boolean) -> Unit,
     onTrigger: (String) -> Unit,
+    onEdit: (taskId: String, prompt: String?, cronExpr: String?, runAt: String?) -> Unit,
     onDelete: (String) -> Unit,
     onAdd: () -> Unit,
 ) {
+    var editingTask by remember { mutableStateOf<ChatViewModel.ScheduledTask?>(null) }
+
     Column(modifier = Modifier.fillMaxWidth()) {
         if (tasks.isEmpty()) {
             Text(
@@ -1270,11 +1278,22 @@ private fun ScheduledTasksTab(
                     .heightIn(max = 450.dp)
             ) {
                 items(tasks, key = { it.id }) { task ->
-                    ScheduledTaskRow(task, onToggle, onTrigger, onDelete)
+                    ScheduledTaskRow(task, onToggle, onTrigger, onDelete, onTap = { editingTask = task })
                     HorizontalDivider(color = InputBorder)
                 }
             }
         }
+
+    editingTask?.let { task ->
+        EditScheduleDialog(
+            task = task,
+            onDismiss = { editingTask = null },
+            onSave = { prompt, cronExpr, runAt ->
+                onEdit(task.id, prompt, cronExpr, runAt)
+                editingTask = null
+            },
+        )
+    }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1298,11 +1317,13 @@ private fun ScheduledTaskRow(
     onToggle: (String, Boolean) -> Unit,
     onTrigger: (String) -> Unit,
     onDelete: (String) -> Unit,
+    onTap: () -> Unit = {},
 ) {
     val dimAlpha = if (task.enabled) 1f else 0.5f
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clickable { onTap() }
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.Top,
     ) {
@@ -1594,6 +1615,121 @@ private fun AddScheduleDialog(
                 enabled = selectedSession.isNotEmpty() && prompt.isNotEmpty(),
             ) {
                 Text("Create", color = if (selectedSession.isNotEmpty() && prompt.isNotEmpty()) AccentOrange else SessionLabel)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = SessionLabel)
+            }
+        },
+    )
+}
+
+@Composable
+private fun EditScheduleDialog(
+    task: ChatViewModel.ScheduledTask,
+    onDismiss: () -> Unit,
+    onSave: (prompt: String?, cronExpr: String?, runAt: String?) -> Unit,
+) {
+    var prompt by remember { mutableStateOf(task.prompt) }
+    var cronExpr by remember { mutableStateOf(task.cronExpr ?: "0 9 * * *") }
+    var runAtDate by remember { mutableStateOf(task.runAt?.substringBefore("T") ?: "") }
+    var runAtTime by remember { mutableStateOf(task.runAt?.substringAfter("T")?.take(5) ?: "09:00") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = DarkSurface,
+        titleContentColor = TopBarTitle,
+        textContentColor = BotText,
+        title = { Text("Edit: ${task.sessionName}") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("Task prompt", color = SessionLabel, fontSize = 12.sp)
+                OutlinedTextField(
+                    value = prompt,
+                    onValueChange = { prompt = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = AccentOrange,
+                        unfocusedBorderColor = InputBorder,
+                        focusedTextColor = BotText,
+                        unfocusedTextColor = BotText,
+                    ),
+                )
+
+                if (task.scheduleType == "cron") {
+                    Text("Cron expression", color = SessionLabel, fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("Daily 9am" to "0 9 * * *", "Hourly" to "0 * * * *", "Weekly Mon" to "0 9 * * mon").forEach { (label, expr) ->
+                            AssistChip(
+                                onClick = { cronExpr = expr },
+                                label = { Text(label, fontSize = 11.sp) },
+                                border = if (cronExpr == expr) BorderStroke(1.dp, AccentOrange) else AssistChipDefaults.assistChipBorder(true),
+                                colors = AssistChipDefaults.assistChipColors(labelColor = BotText),
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = cronExpr,
+                        onValueChange = { cronExpr = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                    )
+                } else {
+                    Text("Run at", color = SessionLabel, fontSize = 12.sp)
+                    OutlinedTextField(
+                        value = runAtDate,
+                        onValueChange = { runAtDate = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Date (YYYY-MM-DD)", color = SessionLabel) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = runAtTime,
+                        onValueChange = { runAtTime = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Time (HH:MM)", color = SessionLabel) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AccentOrange,
+                            unfocusedBorderColor = InputBorder,
+                            focusedTextColor = BotText,
+                            unfocusedTextColor = BotText,
+                        ),
+                        singleLine = true,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val newPrompt = if (prompt != task.prompt) prompt else null
+                    val newCron = if (task.scheduleType == "cron" && cronExpr != task.cronExpr) cronExpr else null
+                    val newRunAt = if (task.scheduleType == "once") "${runAtDate}T${runAtTime}" else null
+                    onSave(newPrompt, newCron, newRunAt)
+                },
+                enabled = prompt.isNotEmpty(),
+            ) {
+                Text("Save", color = if (prompt.isNotEmpty()) AccentOrange else SessionLabel)
             }
         },
         dismissButton = {
