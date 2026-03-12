@@ -175,7 +175,7 @@ fun InputBar(
                     .padding(horizontal = 12.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                listOf("commit and push", "deploy", "fix it", "run tests", "continue").forEach { shortcut ->
+                listOf("commit and push", "deploy", "fix it", "run tests", "review", "continue").forEach { shortcut ->
                     Text(
                         shortcut,
                         fontSize = 12.sp,

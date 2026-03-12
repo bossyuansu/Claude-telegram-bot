@@ -727,23 +727,45 @@ async def ws_endpoint(
 
 
 def start(host: str, port: int):
-    """Start the API server in a background daemon thread."""
+    """Start the API server in a background daemon thread.
+    If the host IP isn't available yet (e.g. Tailscale not ready at boot),
+    retries every few seconds until it can bind."""
     global _ws_event_loop
     import uvicorn
+    import socket
+
+    def _wait_for_interface(addr):
+        """Block until the given IP address is bindable. Retries indefinitely."""
+        logged = False
+        while True:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind((addr, 0))
+                s.close()
+                if logged:
+                    print(f"[API] {addr} is now available.", flush=True)
+                return
+            except OSError:
+                if not logged:
+                    print(f"[API] Waiting for {addr} to become available (e.g. Tailscale)...", flush=True)
+                    logged = True
+                time.sleep(3)
 
     def _run():
         global _ws_event_loop
+        # Wait for the host interface before starting uvicorn
+        if host not in ("0.0.0.0", "127.0.0.1", "localhost", ""):
+            _wait_for_interface(host)
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _ws_event_loop = loop
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning", loop="asyncio")
+        config = uvicorn.Config(app, host=effective_host, port=port, log_level="warning", loop="asyncio")
         server = uvicorn.Server(config)
+        print(f"API server listening on http://{effective_host}:{port}", flush=True)
+        print(f"  WebSocket: ws://{effective_host}:{port}/ws", flush=True)
+        print(f"  API docs:  http://{effective_host}:{port}/docs", flush=True)
         loop.run_until_complete(server.serve())
 
     t = threading.Thread(target=_run, daemon=True, name="api-server")
     t.start()
-    # Give uvicorn a moment to create the event loop
-    time.sleep(0.5)
-    print(f"API server listening on http://{host}:{port}", flush=True)
-    print(f"  WebSocket: ws://{host}:{port}/ws", flush=True)
-    print(f"  API docs:  http://{host}:{port}/docs", flush=True)

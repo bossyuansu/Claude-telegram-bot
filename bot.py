@@ -14,6 +14,7 @@ import json
 import threading
 import uuid
 import ctypes
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -423,7 +424,6 @@ _api_module = None  # Set in main() after api.py is loaded
 _ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadcasts
 _ws_session_override = threading.local()  # Per-thread session name for WS broadcasts (avoids get_active_session races)
 _active_session_override = threading.local()  # Per-thread session override for scheduled tasks (avoids mutating global active session)
-_sched_result_capture = threading.local()  # Per-thread list to capture bot responses during scheduled task runs
 
 
 def _ws_broadcast(chat_id, event_type, data):
@@ -636,6 +636,35 @@ def create_scheduled_task(chat_id, prompt, schedule_type, cron_expr=None, run_at
 
 # --- Scheduler thread ---
 
+def _save_sched_result(task_id, result_text):
+    """Save the result of a scheduled task run into last_result. Called from child threads."""
+    if not result_text:
+        return
+    # Truncate to 4000 chars (keep the tail which has the summary/conclusion)
+    result_text = result_text[-4000:]
+    with _scheduled_tasks_lock:
+        task = scheduled_tasks.get(task_id)
+        if task:
+            task["last_result"] = result_text
+            chat_id = int(task["chat_id"])
+        else:
+            return
+    save_scheduled_tasks()
+    _ws_broadcast_schedule(chat_id, "updated", task_id, task)
+
+
+def _finalize_sched_result(result_text, strip_completion=False):
+    """If running inside a scheduled task, save accumulated output as last_result.
+    No-ops for non-scheduled tasks. Called from task runner finally blocks."""
+    sched_name = getattr(_ws_session_override, 'name', None) or ""
+    if sched_name.startswith("sched:"):
+        if strip_completion:
+            result_text = result_text.split("———")[0].strip() if result_text else ""
+        else:
+            result_text = result_text.strip() if result_text else ""
+        _save_sched_result(sched_name[len("sched:"):], result_text)
+
+
 def _trigger_scheduled_task(task_id, task):
     """Execute a due scheduled task. Session-free: uses stored cwd and last_result as context."""
     chat_id = int(task["chat_id"])
@@ -652,11 +681,21 @@ def _trigger_scheduled_task(task_id, task):
 
     # Prepend last run result as context if available
     last_result = task.get("last_result")
-    if last_result and not prompt.startswith("/"):
-        effective_prompt = (
-            f"[Previous run result (for context)]\n{last_result}\n\n"
-            f"[Current task]\n{prompt}"
-        )
+    if last_result:
+        if prompt.startswith("/"):
+            # For /codex etc., inject context into the command args
+            parts = prompt.split(" ", 1)
+            cmd_part = parts[0]
+            args_part = parts[1] if len(parts) > 1 else ""
+            effective_prompt = (
+                f"{cmd_part} [Previous run result (for context — do NOT repeat unchanged items)]\n"
+                f"{last_result}\n\n[Current task]\n{args_part}"
+            )
+        else:
+            effective_prompt = (
+                f"[Previous run result (for context — do NOT repeat unchanged items)]\n{last_result}\n\n"
+                f"[Current task]\n{prompt}"
+            )
     else:
         effective_prompt = prompt
 
@@ -673,14 +712,15 @@ def _trigger_scheduled_task(task_id, task):
     save_scheduled_tasks()
     _ws_broadcast_schedule(chat_id, "triggered", task_id, task)
 
-    cwd_short = os.path.basename(cwd) or cwd
-    send_message(chat_id, f"⏰ *Scheduled task triggered*\nDir: `{cwd_short}`\nTask: _{prompt[:200]}_")
-
-    # Use thread-local overrides for session and WS labeling
+    # Use thread-local overrides for session and WS labeling — set BEFORE sending
+    # the trigger message so it doesn't pollute the active session's messages.
     _active_session_override.session = temp_session
     _ws_session_override.name = f"sched:{task_id}"
-    # Set up result capture
-    _sched_result_capture.messages = []
+
+    cwd_short = os.path.basename(cwd) or cwd
+    send_message(chat_id, f"⏰ *Scheduled task triggered*\nDir: `{cwd_short}`\nTask: _{prompt[:200]}_")
+    # All code paths (handle_command, handle_message) spawn child threads.
+    # The child thread's finally block will call _save_sched_result() with accumulated output.
     try:
         if effective_prompt.startswith("/"):
             handle_command(chat_id, effective_prompt)
@@ -689,17 +729,6 @@ def _trigger_scheduled_task(task_id, task):
     finally:
         _active_session_override.session = None
         _ws_session_override.name = None
-        # Store captured result as last_result (truncate to 4000 chars)
-        captured = getattr(_sched_result_capture, 'messages', [])
-        _sched_result_capture.messages = None
-        if captured:
-            # Skip the trigger notification message itself (first captured message)
-            result_msgs = captured[1:] if len(captured) > 1 else captured
-            result_text = "\n".join(result_msgs)[-4000:]
-            with _scheduled_tasks_lock:
-                task["last_result"] = result_text
-            save_scheduled_tasks()
-            _ws_broadcast_schedule(chat_id, "updated", task_id, task)
 
 
 def _start_scheduler():
@@ -764,11 +793,6 @@ def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown", retrie
     Also broadcasts via WebSocket unless _ws_suppress is set (stream events replace it).
     session_name: if provided, use this as the WS session label instead of get_active_session().
     """
-    # Capture text for scheduled task result tracking
-    _capture = getattr(_sched_result_capture, 'messages', None)
-    if _capture is not None:
-        _capture.append(text)
-
     max_len = 4000
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
     message_id = None
@@ -1054,6 +1078,18 @@ def send_pending_question(chat_id, pending):
 def set_pending_questions(chat_id, questions, session):
     """Set up pending questions state and send the first one."""
     print(f"[DEBUG] set_pending_questions called with {len(questions)} questions", flush=True)
+    # Deduplicate questions by text (Claude sometimes calls AskUserQuestion multiple times
+    # with the same question in a single turn)
+    seen = set()
+    deduped = []
+    for q in questions:
+        key = q.get("question", "")
+        if key not in seen:
+            seen.add(key)
+            deduped.append(q)
+    if len(deduped) < len(questions):
+        print(f"[DEBUG] Deduplicated {len(questions)} → {len(deduped)} questions", flush=True)
+    questions = deduped
     chat_key = str(chat_id)
     pending_questions[chat_key] = {
         "questions": questions,
@@ -1723,6 +1759,10 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                    text=accumulated_text.strip(),
                    cancelled=cancelled,
                    file_changes=file_changes)
+
+        # Re-enable legacy message/edit WS broadcasts so the final send_message/edit_message
+        # calls below also reach the WS buffer (needed for offline app catch-up).
+        _ws_suppress.active = False
 
         # Handle final chunk - may need further splitting if file ops made it too long
         if len(final_chunk) <= 4000:
@@ -2908,6 +2948,9 @@ def run_codex_task(chat_id, task, cwd, session=None):
                        cancelled=cancelled,
                        file_changes=file_changes)
 
+            # Re-enable legacy message/edit WS broadcasts so final messages reach the buffer
+            _ws_suppress.active = False
+
             if len(final_chunk) <= 4000:
                 if message_id:
                     edit_message(chat_id, message_id, final_chunk, force=True)
@@ -2936,6 +2979,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                 send_message(chat_id, error_text[:4000])
         finally:
             _ws_suppress.active = False
+            _finalize_sched_result(accumulated_text)
             _ws_session_override.name = None
             mark_session_done(session_id)
             active_processes.pop(session_id, None)
@@ -3278,6 +3322,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
                 watchdog_stop.set()
             except UnboundLocalError:
                 pass
+            _finalize_sched_result(accumulated_text)
             _ws_session_override.name = None
             mark_session_done(session_id)
             active_processes.pop(session_id, None)
@@ -3724,11 +3769,13 @@ def run_omni_loop(chat_id, task, session):
     preferred_executor = "gemini"  # Default; Codex can override with EXECUTOR: CLAUDE/GEMINI
     # Stale-loop guards: if Codex keeps returning effectively the same rejection,
     # stop Omni instead of thrashing between architect/audit phases forever.
-    plan_reject_streak = 0
-    last_plan_reject_sig = ""
-    audit_reject_streak = 0
-    last_audit_reject_sig = ""
+    # Rolling windows to detect cyclic/alternating feedback patterns
+    # (e.g. A→B→A→B) not just consecutive identical rejections.
+    plan_reject_sigs = deque(maxlen=10)
+    audit_reject_sigs = deque(maxlen=10)
     STALE_REJECT_LIMIT = 4
+    # Feedback history so architect/executor can see they're cycling
+    audit_feedback_history = []
 
     def _feedback_signature(text):
         """Normalize model feedback to detect semantic repeats across timestamps/IDs."""
@@ -3751,6 +3798,20 @@ def run_omni_loop(chat_id, task, session):
         except Exception as e:
             print(f"[Omni] Error checking blockers: {e}", flush=True)
             return []
+
+    def _check_pending_plan_items(cwd):
+        """Return (pending_count, total_count) of checkbox items in PLAN.md."""
+        try:
+            with open(os.path.join(cwd, "PLAN.md"), "r") as f:
+                content = f.read()
+            pending = len(re.findall(r'^- \[ \] ', content, re.MULTILINE))
+            done = len(re.findall(r'^- \[x\] ', content, re.MULTILINE))
+            return pending, pending + done
+        except FileNotFoundError:
+            return 0, 0
+        except Exception as e:
+            print(f"[Omni] Error checking plan items: {e}", flush=True)
+            return 0, 0
 
     try:
         send_message(chat_id, f"""🚀 *Omni Task Started* on `{session.get('name', 'unknown')}`
@@ -3798,7 +3859,21 @@ _Use /cancel to stop at any time._""")
                     f"IMPORTANT: If PLAN.md has a '## Blockers' section, preserve it exactly. Do not remove or uncheck blocker lines."
                 )
                 if audit_feedback:
-                    arch_prompt += f"\n\nPrevious audit feedback to incorporate:\n{audit_feedback}"
+                    if len(audit_feedback_history) > 1:
+                        # Show history so architect can see cycling patterns and break them
+                        history_lines = []
+                        for i, prev in enumerate(audit_feedback_history[:-1], 1):
+                            history_lines.append(f"--- Round {i} feedback ---\n{prev}")
+                        history_block = "\n\n".join(history_lines)
+                        arch_prompt += (
+                            f"\n\n⚠️ FEEDBACK HISTORY (previous rounds — watch for cycling patterns):\n"
+                            f"{history_block}\n\n"
+                            f"--- LATEST feedback to address NOW ---\n{audit_feedback}\n\n"
+                            f"IMPORTANT: If you see the same issues recurring across rounds, you are in a cycle. "
+                            f"Do NOT simply fix the latest issue — find a solution that addresses ALL recurring feedback simultaneously."
+                        )
+                    else:
+                        arch_prompt += f"\n\nPrevious audit feedback to incorporate:\n{audit_feedback}"
 
                 response, questions, _, claude_sid, context_overflow = run_claude_streaming(
                     arch_prompt, chat_id, cwd=cwd, continue_session=True,
@@ -3869,19 +3944,21 @@ _Use /cancel to stop at any time._""")
                 plan_review_prompt = (
                     f"Review PLAN.md against the original task:\n\n{original_task}\n\n"
                     f"Check that the plan is complete, feasible, well-structured, and covers testing.\n\n"
-                    f"BLOCKER LEDGER: Check PLAN.md for a '## Blockers' section. If it exists, review each blocker.\n"
+                    f"BLOCKER LEDGER: Check PLAN.md for a '## Blockers' section. If it exists:\n"
                     f"- If a blocker is already resolved in the code, mark it [x].\n"
-                    f"- If you find new issues with the plan, add them as: - [ ] BLOCKER: <description> (files: <relevant files>)\n"
                     f"- Do NOT remove blocker lines — only check/uncheck them.\n"
-                    f"- You may NOT sign off if any blocker lines show [ ] (unchecked).\n\n"
+                    f"- IMPORTANT: Open blockers about MISSING CODE or MISSING IMPLEMENTATION should NOT prevent plan sign-off.\n"
+                    f"  Those blockers exist to track work for the EXECUTION phase. Your job is to evaluate the PLAN's quality,\n"
+                    f"  not whether code has been written yet. Only reject the plan if the plan itself is flawed\n"
+                    f"  (incomplete strategy, missing steps, bad architecture, untestable approach).\n\n"
                     f"If the plan is solid and ready for execution, respond with:\n"
                     f"SIGN-OFF\n"
-                    f"- Blockers resolved: <count or 'none found'>\n"
+                    f"- Blockers resolved: <count or 'N/A — implementation blockers for execution phase'>\n"
                     f"- Key files: <main files the plan targets>\n"
                     f"EXECUTOR: GEMINI or EXECUTOR: CLAUDE\n\n"
                     f"Choose CLAUDE for complex multi-file refactors, subtle bug fixes, or tasks requiring deep reasoning.\n"
                     f"Choose GEMINI for straightforward implementation, file creation, running tests, or mechanical changes.\n"
-                    f"Otherwise, provide specific feedback on what needs to change."
+                    f"Otherwise, provide specific feedback on what needs to change IN THE PLAN (not in the code)."
                 )
                 if feedback:
                     plan_review_prompt += feedback
@@ -3914,37 +3991,30 @@ _Use /cancel to stop at any time._""")
                                 preferred_executor = "gemini"
                             break
 
-                # Contradiction gate: reject plan sign-off if open blockers remain
-                if has_signoff:
-                    open_blockers = _check_open_blockers(cwd)
-                    if open_blockers:
-                        has_signoff = False
-                        print(f"{log_prefix} Step {step}: Plan sign-off REJECTED — {len(open_blockers)} open blocker(s)", flush=True)
-                        send_message(chat_id, f"🚫 *Plan sign-off rejected* — {len(open_blockers)} open blocker(s) in PLAN.md")
-
+                # Note: no blocker contradiction gate here — plan review evaluates plan quality,
+                # not implementation completeness. Open code blockers are expected at this stage
+                # and will be enforced in the audit phase after execution.
                 if has_signoff:
                     print(f"{log_prefix} Step {step}: Plan approved by Codex, executor={preferred_executor}", flush=True)
                     send_message(chat_id, f"✅ Plan approved by Codex. Executing with *{preferred_executor.capitalize()}*.")
                     audit_feedback = ""  # Clear so execution doesn't inherit stale plan-review feedback
-                    plan_reject_streak = 0
-                    last_plan_reject_sig = ""
+                    plan_reject_sigs.clear()
                     phase = "executing"
                     _ws_broadcast_status(chat_id, "omni", phase, step)
                 else:
                     # Codex rejected the plan — feed back to Claude
                     audit_feedback = plan_review[:6000] if plan_review else "Plan review returned no feedback."
+                    audit_feedback_history.append(f"[PLAN REJECTED] {audit_feedback[:1500]}")
                     sig = _feedback_signature(plan_review)
-                    if sig and sig == last_plan_reject_sig:
-                        plan_reject_streak += 1
-                    else:
-                        plan_reject_streak = 1
-                        last_plan_reject_sig = sig
-                    print(f"{log_prefix} Step {step}: Plan reject streak={plan_reject_streak}", flush=True)
-                    if plan_reject_streak >= STALE_REJECT_LIMIT:
+                    if sig:
+                        plan_reject_sigs.append(sig)
+                    plan_reject_count = plan_reject_sigs.count(sig) if sig else 0
+                    print(f"{log_prefix} Step {step}: Plan reject count={plan_reject_count}/{len(plan_reject_sigs)}", flush=True)
+                    if sig and plan_reject_count >= STALE_REJECT_LIMIT:
                         send_message(chat_id, f"""🛑 *Omni stopped: stale plan-review loop detected* (step {step})
 
-Codex returned effectively the same plan rejection *{plan_reject_streak}* times in a row.
-No new actionable code change was identified, so Omni stopped to prevent churn.
+Codex returned effectively the same plan rejection *{plan_reject_count}* times in the last {len(plan_reject_sigs)} rounds.
+This may indicate a back-and-forth cycle. Omni stopped to prevent churn.
 
 Use `/omni` again with an explicit human override (for example: accept current ops-blocked status, or provide one concrete code change to force).""")
                         notified_exit = True
@@ -3964,7 +4034,22 @@ Use `/omni` again with an explicit human override (for example: accept current o
 
                 exec_prompt = f"Original task:\n{original_task}\n\nReview the current PLAN.md and project state. Implement the next pending step of the plan. Verify your work with tests where applicable."
                 if audit_feedback:
-                    exec_prompt = f"Original task:\n{original_task}\n\nFix the issues identified in the recent audit:\n{audit_feedback}\n\nThen proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
+                    if len(audit_feedback_history) > 1:
+                        history_lines = []
+                        for i, prev in enumerate(audit_feedback_history[:-1], 1):
+                            history_lines.append(f"--- Round {i} ---\n{prev}")
+                        history_block = "\n\n".join(history_lines)
+                        exec_prompt = (
+                            f"Original task:\n{original_task}\n\n"
+                            f"⚠️ FEEDBACK HISTORY (previous audit rounds — watch for cycling):\n"
+                            f"{history_block}\n\n"
+                            f"--- LATEST audit feedback to fix NOW ---\n{audit_feedback}\n\n"
+                            f"IMPORTANT: If you see the same issues alternating across rounds, you are in a cycle. "
+                            f"Find a solution that resolves ALL recurring issues at once, not just the latest one.\n\n"
+                            f"Then proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
+                        )
+                    else:
+                        exec_prompt = f"Original task:\n{original_task}\n\nFix the issues identified in the recent audit:\n{audit_feedback}\n\nThen proceed with the next pending step from PLAN.md. Verify your work with tests where applicable."
 
                 # Use Codex's recommended executor
                 use_executor = preferred_executor
@@ -4058,18 +4143,30 @@ Use `/omni` again with an explicit human override (for example: accept current o
                     f"{original_task}\n"
                     f"{diff_section}\n\n"
                     f"Check for bugs, security issues, or deviations from the plan.\n\n"
+                    f"PLAN COMPLETION CHECK: Review PLAN.md for any unchecked items (- [ ]).\n"
+                    f"- Mark items [x] ONLY if you verify the work is actually done in the code.\n"
+                    f"- If unchecked items represent work that CAN be done here, direct the executor to implement them.\n"
+                    f"- If unchecked items are INFEASIBLE in this environment (e.g. requires real hardware, manual testing,\n"
+                    f"  external deployment, third-party access), you MAY sign off with caveats noting those items.\n\n"
                     f"BLOCKER LEDGER: Maintain a '## Blockers' section at the bottom of PLAN.md.\n"
                     f"- For each issue you find, add: - [ ] BLOCKER: <description> (files: <relevant files>)\n"
                     f"- For issues that are now fixed in the code, mark them: - [x] BLOCKER: <description>\n"
                     f"- Do NOT remove blocker lines — only check/uncheck them.\n"
                     f"- CRITICAL: If you previously raised blockers, you must verify each one is actually fixed\n"
                     f"  in the code before marking [x]. Do not assume they are fixed without checking.\n\n"
-                    f"To sign off, ALL blocker lines must show [x] (or no blockers exist). Use this format:\n"
+                    f"To sign off, these must be true:\n"
+                    f"1. All FEASIBLE plan items in PLAN.md show [x] (implementable work is complete)\n"
+                    f"2. All blocker lines show [x] (or no blockers exist)\n"
+                    f"3. No bugs or security issues found in the changes\n"
+                    f"4. Any remaining unchecked items are genuinely infeasible (hardware, manual, external)\n\n"
+                    f"Sign-off format:\n"
                     f"SIGN-OFF\n"
+                    f"- Plan items completed: <checked>/<total>\n"
                     f"- Blockers resolved: <count>\n"
+                    f"- Caveats: <list any unchecked items that are infeasible and why, or 'none'>\n"
                     f"- Files verified: <list of key files checked>\n"
                     f"- Tests: <test results or 'N/A'>\n\n"
-                    f"If issues remain, provide precise, actionable feedback.\n"
+                    f"If FEASIBLE issues remain, provide precise, actionable feedback.\n"
                     f"Also recommend who should fix it: 'EXECUTOR: GEMINI' or 'EXECUTOR: CLAUDE'.\n"
                     f"Prefer CLAUDE for issues requiring careful reasoning, complex edits, or when repeated attempts have failed."
                 )
@@ -4106,42 +4203,58 @@ Use `/omni` again with an explicit human override (for example: accept current o
                 has_signoff = any(line.strip().upper().startswith("SIGN-OFF") for line in audit_result.strip().split("\n")) if audit_result else False
 
                 # Contradiction gate: reject sign-off if open blockers remain in PLAN.md
+                gate_rejected = False
                 if has_signoff:
+                    # Check 1: open blockers
                     open_blockers = _check_open_blockers(cwd)
                     if open_blockers:
                         has_signoff = False
+                        gate_rejected = True
                         blocker_list = "\n".join(open_blockers[:10])
                         print(f"{log_prefix} Step {step}: Sign-off REJECTED — {len(open_blockers)} open blocker(s)", flush=True)
                         send_message(chat_id, f"🚫 *Sign-off rejected* — {len(open_blockers)} open blocker(s) in PLAN.md:\n```\n{blocker_list}\n```")
                         audit_feedback = (
-                            f"SIGN-OFF REJECTED: {len(open_blockers)} open blocker(s) remain in PLAN.md:\n"
-                            f"{blocker_list}\n\n"
-                            f"You must fix these before sign-off is accepted.\n"
-                            + (audit_result[:4000] if audit_result else "")
+                            f"SIGN-OFF REJECTED by contradiction gate: Codex said SIGN-OFF but {len(open_blockers)} "
+                            f"unchecked blocker(s) remain in PLAN.md:\n{blocker_list}\n\n"
+                            f"The auditor (Codex) did NOT update the blocker checkboxes in PLAN.md before signing off.\n"
+                            f"You must either: (1) resolve the blocker issues in code AND mark them [x] in PLAN.md, "
+                            f"or (2) if the blockers are already resolved, update PLAN.md to mark them [x].\n\n"
+                            f"Codex original verdict:\n{audit_result[:3000] if audit_result else '(empty)'}"
                         )
 
+                    # Check 2: unchecked plan items (soft check — log but don't block)
+                    # Some items may be genuinely infeasible (hardware testing, manual steps, etc.)
+                    # Trust Codex's judgment from the prompt to sign off with caveats when appropriate.
+                    if has_signoff:
+                        pending, total = _check_pending_plan_items(cwd)
+                        if pending > 0:
+                            print(f"{log_prefix} Step {step}: Sign-off with {pending}/{total} plan items still pending (caveats accepted)", flush=True)
+
                 if has_signoff:
+                    caveat_note = ""
+                    if pending > 0:
+                        caveat_note = f"\n\n⚠️ *{pending}/{total} plan items still pending* (accepted with caveats — may require hardware, manual testing, or external resources)"
                     send_message(chat_id, f"""✅ *Omni Task Complete!* (Step {step})
 
-Codex provided final sign-off.
+Codex provided final sign-off.{caveat_note}
 
 _Session preserved. You can continue chatting in this session._""")
                     notified_exit = True
                     break
                 else:
-                    audit_feedback = audit_result[:6000] if audit_result else "Previous audit returned no feedback."
+                    if not gate_rejected:
+                        audit_feedback = audit_result[:6000] if audit_result else "Previous audit returned no feedback."
+                    audit_feedback_history.append(audit_feedback[:1500])
                     sig = _feedback_signature(audit_result)
-                    if sig and sig == last_audit_reject_sig:
-                        audit_reject_streak += 1
-                    else:
-                        audit_reject_streak = 1
-                        last_audit_reject_sig = sig
-                    print(f"{log_prefix} Step {step}: Audit reject streak={audit_reject_streak}", flush=True)
-                    if audit_reject_streak >= STALE_REJECT_LIMIT:
+                    if sig:
+                        audit_reject_sigs.append(sig)
+                    audit_reject_count = audit_reject_sigs.count(sig) if sig else 0
+                    print(f"{log_prefix} Step {step}: Audit reject count={audit_reject_count}/{len(audit_reject_sigs)}", flush=True)
+                    if sig and audit_reject_count >= STALE_REJECT_LIMIT:
                         send_message(chat_id, f"""🛑 *Omni stopped: stale audit loop detected* (step {step})
 
-Codex audit feedback was effectively unchanged for *{audit_reject_streak}* consecutive rounds.
-No new code-level action emerged, so Omni stopped to avoid endless architect/audit cycling.
+Codex audit feedback matched a previous rejection *{audit_reject_count}* times in the last {len(audit_reject_sigs)} rounds.
+This indicates a back-and-forth cycle. Omni stopped to avoid endless architect/audit cycling.
 
 Use `/omni` again with an explicit decision (accept ops-blocked state, or provide one concrete fix target).""")
                         notified_exit = True
@@ -6309,6 +6422,8 @@ def run_claude_in_thread(chat_id, text, session=None):
     session_id = get_session_id(session) if session else None
 
     def claude_task():
+        _ws_session_override.name = session.get("name", "") if session else ""
+        response = ""
         try:
             if session:
                 # Check if proactive compaction is needed BEFORE sending to Claude
@@ -6389,6 +6504,9 @@ Format as a compact bullet list. This will be used to restore context after rese
             if session_id:
                 active_processes.pop(session_id, None)
                 _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+        finally:
+            _finalize_sched_result(response, strip_completion=True)
+            _ws_session_override.name = None
 
     thread = threading.Thread(target=claude_task, daemon=True)
     thread.start()
