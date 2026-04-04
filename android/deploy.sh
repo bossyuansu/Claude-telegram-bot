@@ -18,7 +18,7 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 
 PHONE_IP="100.93.228.102"
 PHONE_PORT="8022"
-ADB="adb -s localhost:5555"
+ADB="adb -s emulator-5554"
 SSH="ssh -p $PHONE_PORT $PHONE_IP"
 PACKAGE="com.claudebot.app"
 

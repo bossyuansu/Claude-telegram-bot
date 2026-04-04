@@ -634,7 +634,13 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                 message = msg,
                                 onButtonClick = { button ->
                                     viewModel.pressButton(msg.messageId, button)
-                                }
+                                },
+                                onDownloadClick = if (msg.fileName.isNotBlank() && msg.localFilePath.isBlank()) {
+                                    { viewModel.downloadFile(i) }
+                                } else null,
+                                onRetryClick = if (msg.sendFailed) {
+                                    { viewModel.retryMessage(i) }
+                                } else null
                             )
                         }
                         // Typing indicator — shown as last item when bot is busy

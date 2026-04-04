@@ -457,21 +457,75 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         // Send via HTTP API (serialized to preserve command order)
         sendExecutor.submit {
-            try {
-                val json = JSONObject()
-                    .put("text", text)
-                    .toString()
-                val body = json.toRequestBody("application/json".toMediaType())
-                val url = "http://${settings.host}:${settings.port}/api/message"
-                val reqBuilder = Request.Builder().url(url).post(body)
-                if (settings.token.isNotBlank()) {
-                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+            var ok = false
+            for (attempt in 1..3) {
+                try {
+                    val json = JSONObject()
+                        .put("text", text)
+                        .toString()
+                    val body = json.toRequestBody("application/json".toMediaType())
+                    val url = "http://${settings.host}:${settings.port}/api/message"
+                    val reqBuilder = Request.Builder().url(url).post(body)
+                    if (settings.token.isNotBlank()) {
+                        reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                    }
+                    httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                        if (resp.isSuccessful) ok = true
+                    }
+                    if (ok) break
+                } catch (_: Exception) {}
+                if (!ok && attempt < 3) Thread.sleep(1000L * attempt)
+            }
+            if (!ok) {
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    val idx = idToIndex[localId]
+                    if (idx != null && idx < messages.size && messages[idx].messageId == localId) {
+                        messages[idx] = messages[idx].copy(sendFailed = true)
+                    }
                 }
-                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
-            } catch (_: Exception) {}
+            }
             if (isSessionCmd) {
                 android.os.Handler(android.os.Looper.getMainLooper()).post {
                     isSwitchingSession.value = false
+                }
+            }
+        }
+    }
+
+    fun retryMessage(index: Int) {
+        val msg = messages.getOrNull(index) ?: return
+        if (!msg.sendFailed) return
+        // Clear failed state
+        messages[index] = msg.copy(sendFailed = false)
+        // Re-send the text
+        val text = msg.text
+        val localId = msg.messageId
+        sendExecutor.submit {
+            var ok = false
+            for (attempt in 1..3) {
+                try {
+                    val json = JSONObject()
+                        .put("text", text)
+                        .toString()
+                    val body = json.toRequestBody("application/json".toMediaType())
+                    val url = "http://${settings.host}:${settings.port}/api/message"
+                    val reqBuilder = Request.Builder().url(url).post(body)
+                    if (settings.token.isNotBlank()) {
+                        reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                    }
+                    httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                        if (resp.isSuccessful) ok = true
+                    }
+                    if (ok) break
+                } catch (_: Exception) {}
+                if (!ok && attempt < 3) Thread.sleep(1000L * attempt)
+            }
+            if (!ok) {
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    val idx = idToIndex[localId]
+                    if (idx != null && idx < messages.size && messages[idx].messageId == localId) {
+                        messages[idx] = messages[idx].copy(sendFailed = true)
+                    }
                 }
             }
         }
@@ -511,6 +565,51 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
             } catch (_: Exception) {}
+        }
+    }
+
+    // --- File download ---
+
+    fun downloadFile(index: Int) {
+        val msg = messages.getOrNull(index) ?: return
+        if (msg.downloadPath.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val encodedPath = java.net.URLEncoder.encode(msg.downloadPath, "UTF-8")
+                val url = "http://${settings.host}:${settings.port}/api/download?path=$encodedPath"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        withContext(Dispatchers.Main) {
+                            if (index < messages.size && messages[index].messageId == msg.messageId) {
+                                messages[index] = msg.copy(text = msg.text + "\n_Download failed_")
+                            }
+                        }
+                        return@use
+                    }
+                    val contentValues = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Downloads.DISPLAY_NAME, msg.fileName)
+                        put(android.provider.MediaStore.Downloads.MIME_TYPE, msg.mimeType.ifBlank { "application/octet-stream" })
+                    }
+                    val resolver = getApplication<Application>().contentResolver
+                    val uri = resolver.insert(
+                        android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues
+                    ) ?: return@use
+                    resolver.openOutputStream(uri)?.use { out ->
+                        response.body?.byteStream()?.copyTo(out)
+                    }
+                    withContext(Dispatchers.Main) {
+                        if (index < messages.size && messages[index].messageId == msg.messageId) {
+                            messages[index] = msg.copy(localFilePath = uri.toString())
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("VM", "Download failed: ${e.message}", e)
+            }
         }
     }
 
@@ -1064,6 +1163,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
+                "file" -> {
+                    val displayText = if (msg.isImage) {
+                        "\uD83D\uDDBC ${msg.fileName}"
+                    } else {
+                        "\uD83D\uDCC4 ${msg.fileName} (${formatFileSize(msg.fileSize)})"
+                    }
+                    val chatMsg = ChatMessage(
+                        messageId = localIdCounter--,
+                        text = displayText,
+                        isFromBot = true,
+                        session = msg.session,
+                        isReplay = msg.isReplay,
+                        timestamp = System.currentTimeMillis(),
+                        fileName = msg.fileName,
+                        fileSize = msg.fileSize,
+                        mimeType = msg.mimeType,
+                        isImage = msg.isImage,
+                        downloadPath = msg.downloadPath
+                    )
+                    if (matchesSessionFilter(msg.session)) {
+                        messages.add(chatMsg)
+                        scrollTrigger.value++
+                    }
+                    if (msg.session.isNotEmpty() && msg.session !in availableSessions) {
+                        availableSessions.add(msg.session)
+                    }
+                    viewModelScope.launch(Dispatchers.IO) {
+                        dao.insert(chatMsg.toEntity())
+                        dbOffset++
+                    }
+                }
             }
         }
     }
@@ -1222,7 +1352,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         text = finalText,
                         session = msg.session.ifEmpty { messages[idx].session },
                         isReplay = messages[idx].isReplay || msg.isReplay,
-                        fileChanges = parsedChanges
+                        fileChanges = parsedChanges,
+                        timestamp = System.currentTimeMillis()
                     )
                     messages[idx] = updated
                     if (idx == messages.lastIndex) scrollTrigger.value++
@@ -1317,6 +1448,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         wsManager.disconnect()
         ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
     }
+}
+
+private fun formatFileSize(bytes: Long): String = when {
+    bytes < 1024 -> "${bytes}B"
+    bytes < 1024 * 1024 -> "${bytes / 1024}KB"
+    else -> "${"%.1f".format(bytes / (1024.0 * 1024.0))}MB"
 }
 
 // --- Conversion helpers ---

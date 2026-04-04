@@ -640,6 +640,22 @@ def api_trigger_schedule_task(task_id: str, _=Depends(verify_auth)):
     return {"status": "triggered", "task_id": task_id}
 
 
+# --- File download endpoint ---
+
+@app.get("/api/download")
+async def download_file(path: str = Query(...), _=Depends(verify_auth)):
+    """Serve a file by absolute path. Used by the Android app to receive /file results."""
+    import mimetypes
+    from fastapi.responses import FileResponse
+
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        raise HTTPException(status_code=404, detail="File not found")
+    mime, _ = mimetypes.guess_type(real)
+    return FileResponse(path=real, filename=os.path.basename(real),
+                        media_type=mime or "application/octet-stream")
+
+
 # --- WebSocket endpoint ---
 
 @app.websocket("/ws")
@@ -760,11 +776,11 @@ def start(host: str, port: int):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _ws_event_loop = loop
-        config = uvicorn.Config(app, host=effective_host, port=port, log_level="warning", loop="asyncio")
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning", loop="asyncio")
         server = uvicorn.Server(config)
-        print(f"API server listening on http://{effective_host}:{port}", flush=True)
-        print(f"  WebSocket: ws://{effective_host}:{port}/ws", flush=True)
-        print(f"  API docs:  http://{effective_host}:{port}/docs", flush=True)
+        print(f"API server listening on http://{host}:{port}", flush=True)
+        print(f"  WebSocket: ws://{host}:{port}/ws", flush=True)
+        print(f"  API docs:  http://{host}:{port}/docs", flush=True)
         loop.run_until_complete(server.serve())
 
     t = threading.Thread(target=_run, daemon=True, name="api-server")

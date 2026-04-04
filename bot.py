@@ -1522,7 +1522,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                 elif not accumulated_text.endswith(' '):
                     spacing = " "
             # WS stream: send the delta to app (no rate limit, no size limit)
-            _ws_stream(chat_id, "append", message_ids[0], text=spacing + text)
+            _ws_stream(chat_id, "append", message_ids[0], session=_stream_session, text=spacing + text)
             if len(accumulated_text) < max_accumulated:
                 accumulated_text += spacing + text
             current_chunk_text += spacing + text
@@ -1760,9 +1760,9 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                    cancelled=cancelled,
                    file_changes=file_changes)
 
-        # Re-enable legacy message/edit WS broadcasts so the final send_message/edit_message
-        # calls below also reach the WS buffer (needed for offline app catch-up).
-        _ws_suppress.active = False
+        # Keep _ws_suppress active — the stream done event above already has the full text
+        # for the app. Re-enabling legacy broadcasts here would cause split TG chunks
+        # to appear as separate messages in the app.
 
         # Handle final chunk - may need further splitting if file ops made it too long
         if len(final_chunk) <= 4000:
@@ -2828,7 +2828,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                                                 spacing = " "
                                     accumulated_text += spacing + new_text
                                     current_chunk_text += spacing + new_text
-                                    _ws_stream(chat_id, "append", message_ids[0], text=spacing + new_text)
+                                    _ws_stream(chat_id, "append", message_ids[0], session=_codex_stream_session, text=spacing + new_text)
 
                         elif itype == "command_execution":
                             cmd_str = item.get("command", "")
@@ -2948,8 +2948,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                        cancelled=cancelled,
                        file_changes=file_changes)
 
-            # Re-enable legacy message/edit WS broadcasts so final messages reach the buffer
-            _ws_suppress.active = False
+            # Keep _ws_suppress active — stream done has the full text for the app
 
             if len(final_chunk) <= 4000:
                 if message_id:
@@ -3823,6 +3822,9 @@ _Claude as fallback if Gemini fails._
 _Use /cancel to stop at any time._""")
 
         while omni_active.get(chat_key, {}).get("active"):
+            # Restore session override — sub-tasks (run_claude_streaming, run_codex_task, etc.)
+            # clear it in their finally blocks, so omni's own send_message calls need it reset.
+            _ws_session_override.name = session.get("name", "")
             step += 1
             omni_active[chat_key]["step"] = step
             omni_active[chat_key]["phase"] = phase
@@ -4379,6 +4381,9 @@ _Use /cancel to stop at any time._""")
         )
 
         while True:
+            # Restore session override — sub-tasks clear it in their finally blocks
+            _ws_session_override.name = session.get("name", "")
+
             # Check cancellation/pause
             if not _check_pause(justdoit_active, chat_key, chat_id, "justdoit", phase, step):
                 send_message(chat_id, f"⚠️ *JustDoIt cancelled* at step {step}.")
@@ -4812,7 +4817,7 @@ This is the final gate. Be thorough but fair."""
             text=True
         )
 
-        stdout, stderr = process.communicate(timeout=600)
+        stdout, stderr = process.communicate(timeout=1800)
         output = (stdout or "").strip()
         error_output = (stderr or "").strip()
 
@@ -4941,7 +4946,7 @@ Focus on correctness, design, and architecture — not cosmetics."""
             text=True
         )
 
-        stdout, stderr = process.communicate(timeout=600)
+        stdout, stderr = process.communicate(timeout=1800)
         output = (stdout or "").strip()
         error_output = (stderr or "").strip()
 
@@ -5027,6 +5032,7 @@ def run_deepreview_loop(chat_id, session):
     _ws_broadcast_status(chat_id, "deepreview", "starting", 0, active=True, task="Deep code review", started=deepreview_active[chat_key]["started"])
 
     step = 0
+    phase = "starting"
     review_history = ""
     all_review_history = ""  # Accumulates everything across all phases
     codex_fail_streak = 0
@@ -6163,8 +6169,8 @@ Send a message to start working!""")
             max_matches = 50
             try:
                 for dirpath, dirnames, filenames in os.walk(search_root):
-                    # Prune junk directories in-place to avoid descending into them
-                    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                    # Prune junk and hidden directories in-place to avoid descending into them
+                    dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
                     # Check if target matches end of any file path in this dir
                     for fname in filenames:
                         rel = os.path.relpath(os.path.join(dirpath, fname), search_root)
@@ -6203,9 +6209,20 @@ Send a message to start working!""")
         if file_size > 50 * 1024 * 1024:
             send_message(chat_id, f"❌ File too large ({file_size // (1024*1024)}MB). Telegram limit is 50MB.")
             return True
-        # Send as photo if it's an image, otherwise as document
+        # Broadcast file event to Android app via WS (before TG send which may be slow)
         image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
         ext = os.path.splitext(file_path)[1].lower()
+        import mimetypes as _mt
+        mime, _ = _mt.guess_type(file_path)
+        _ws_broadcast(chat_id, "file", {
+            "session": get_session_id(session) if session else "",
+            "file_name": os.path.basename(file_path),
+            "file_size": file_size,
+            "mime_type": mime or "application/octet-stream",
+            "is_image": ext in image_exts,
+            "file_path": os.path.realpath(file_path),
+        })
+        # Send to Telegram
         if ext in image_exts and file_size < 10 * 1024 * 1024:
             ok = send_photo(chat_id, file_path)
         else:
@@ -6424,16 +6441,19 @@ def run_claude_in_thread(chat_id, text, session=None):
     def claude_task():
         _ws_session_override.name = session.get("name", "") if session else ""
         response = ""
+        prompt = text
         try:
             if session:
                 # Check if proactive compaction is needed BEFORE sending to Claude
                 needs_compaction = increment_message_count(chat_id, session, "Claude")
 
                 if needs_compaction:
-                    perform_proactive_compaction(chat_id, session, "Claude")
+                    summary = perform_proactive_compaction(chat_id, session, "Claude")
+                    if summary:
+                        prompt = f"[Session compacted - Previous context summary:]\n{summary}\n\n[New request:]\n{text}"
 
                 response, questions, _, claude_sid, context_overflow = run_claude_streaming(
-                    text, chat_id, cwd=session["cwd"], continue_session=True,
+                    prompt, chat_id, cwd=session["cwd"], continue_session=True,
                     session_id=session_id, session=session
                 )
 

@@ -47,7 +47,9 @@ import java.util.Locale
 @Composable
 fun MessageBubble(
     message: ChatMessage,
-    onButtonClick: ((InlineButton) -> Unit)? = null
+    onButtonClick: ((InlineButton) -> Unit)? = null,
+    onDownloadClick: (() -> Unit)? = null,
+    onRetryClick: (() -> Unit)? = null
 ) {
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
@@ -191,6 +193,17 @@ fun MessageBubble(
             }
         }
 
+        // File attachment (from /file command)
+        if (message.fileName.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            FileAttachment(
+                fileName = message.fileName,
+                fileSize = message.fileSize,
+                isDownloaded = message.localFilePath.isNotBlank(),
+                onDownload = onDownloadClick
+            )
+        }
+
         // File changes / diff viewer
         if (message.fileChanges.isNotEmpty()) {
             Spacer(Modifier.height(4.dp))
@@ -232,8 +245,26 @@ fun MessageBubble(
             }
         }
 
-        // Timestamp + copied indicator
+        // Timestamp + copied indicator + send failed
         Row(verticalAlignment = Alignment.CenterVertically) {
+            if (message.sendFailed) {
+                Text(
+                    text = "Failed",
+                    fontSize = 10.sp,
+                    color = DisconnectedRed,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                )
+                if (onRetryClick != null) {
+                    Text(
+                        text = "Retry",
+                        fontSize = 10.sp,
+                        color = AccentOrange,
+                        modifier = Modifier
+                            .clickable { onRetryClick() }
+                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                    )
+                }
+            }
             if (message.isReplay) {
                 Text(
                     text = "replayed",
@@ -454,6 +485,60 @@ private fun NewFileView(content: String) {
                     color = SessionLabel
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun FileAttachment(
+    fileName: String,
+    fileSize: Long,
+    isDownloaded: Boolean,
+    onDownload: (() -> Unit)?
+) {
+    Row(
+        modifier = Modifier
+            .widthIn(max = 320.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .border(1.dp, BotBubbleBorder, RoundedCornerShape(8.dp))
+            .background(DarkSurface)
+            .padding(10.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = fileName,
+                fontSize = 12.sp,
+                color = BotText,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+            )
+            if (fileSize > 0) {
+                val sizeStr = when {
+                    fileSize < 1024 -> "${fileSize}B"
+                    fileSize < 1024 * 1024 -> "${fileSize / 1024}KB"
+                    else -> "${"%.1f".format(fileSize / (1024.0 * 1024.0))}MB"
+                }
+                Text(text = sizeStr, fontSize = 10.sp, color = SessionLabel)
+            }
+        }
+        if (!isDownloaded && onDownload != null) {
+            Text(
+                text = "Download",
+                color = AccentOrange,
+                fontSize = 12.sp,
+                modifier = Modifier
+                    .clickable { onDownload() }
+                    .padding(start = 8.dp)
+            )
+        } else if (isDownloaded) {
+            Text(
+                text = "Saved ✓",
+                color = ConnectedGreen,
+                fontSize = 10.sp,
+                modifier = Modifier.padding(start = 8.dp)
+            )
         }
     }
 }

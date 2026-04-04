@@ -30,7 +30,13 @@ data class WsMessage(
     val tool: String = "",         // tool name for op="tool"
     val path: String = "",         // tool path for op="tool"
     val cancelled: Boolean = false,
-    val fileChanges: List<Map<String, String>> = emptyList()
+    val fileChanges: List<Map<String, String>> = emptyList(),
+    // File fields (for type="file")
+    val fileName: String = "",
+    val fileSize: Long = 0,
+    val mimeType: String = "",
+    val isImage: Boolean = false,
+    val downloadPath: String = ""
 )
 
 class WebSocketManager(
@@ -82,10 +88,10 @@ class WebSocketManager(
 
     fun connect(wsUrl: String) {
         Log.d(TAG, "connect() called url=$wsUrl")
-        // Close any existing connection before opening a new one
+        // Force-close any existing connection before opening a new one
         reconnectThread?.interrupt()
         reconnectThread = null
-        ws?.close(1000, "Reconnecting")
+        ws?.cancel()
         ws = null
         baseUrl = wsUrl
         shouldReconnect = true
@@ -111,6 +117,11 @@ class WebSocketManager(
 
     private fun doConnect() {
         if (!shouldReconnect) return
+        // Force-close any existing connection to prevent dual connections.
+        // cancel() is immediate (unlike close() which waits for handshake).
+        val oldWs = ws
+        ws = null
+        oldWs?.cancel()
         onStateChange(if (reconnectAttempt == 0) ConnectionState.CONNECTING else ConnectionState.RECONNECTING)
 
         // Append last_seq to URL so server replays missed messages
@@ -123,9 +134,12 @@ class WebSocketManager(
 
         Log.d(TAG, "doConnect() url=$connectUrl attempt=$reconnectAttempt")
         val request = Request.Builder().url(connectUrl).build()
-        ws = client.newWebSocket(request, object : WebSocketListener() {
+        val newWs = client.newWebSocket(request, object : WebSocketListener() {
+            /** Guard: ignore callbacks from a replaced/stale WebSocket. */
+            private fun isStale(webSocket: WebSocket) = ws !== webSocket
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (isStale(webSocket)) return
                 Log.d(TAG, "onOpen — connected!")
                 reconnectAttempt = 0
                 pendingBuffer.clear()
@@ -136,6 +150,7 @@ class WebSocketManager(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (isStale(webSocket)) return
                 try {
                     val json = JSONObject(text)
 
@@ -221,12 +236,14 @@ class WebSocketManager(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (isStale(webSocket)) return
                 Log.e(TAG, "onFailure: ${t.message}", t)
                 onError?.invoke(t.message ?: "WebSocket failure")
                 scheduleReconnect()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (isStale(webSocket)) return
                 Log.d(TAG, "onClosed code=$code reason=$reason")
                 if (code != 1000) {
                     val msg = if (reason.isNotBlank()) "Closed ($code): $reason" else "Closed ($code)"
@@ -236,6 +253,7 @@ class WebSocketManager(
                 else onStateChange(ConnectionState.DISCONNECTED)
             }
         })
+        ws = newWs
     }
 
     /** Deliver a message and advance the expected seq. */
@@ -310,7 +328,12 @@ class WebSocketManager(
             tool = json.optString("tool", ""),
             path = json.optString("path", ""),
             cancelled = json.optBoolean("cancelled", false),
-            fileChanges = fileChanges
+            fileChanges = fileChanges,
+            fileName = json.optString("file_name", ""),
+            fileSize = json.optLong("file_size", 0),
+            mimeType = json.optString("mime_type", ""),
+            isImage = json.optBoolean("is_image", false),
+            downloadPath = json.optString("file_path", "")
         )
     }
 

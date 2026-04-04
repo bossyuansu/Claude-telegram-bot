@@ -21,5 +21,13 @@ data class ChatMessage(
     val isReplay: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),
     val buttons: List<List<InlineButton>> = emptyList(), // rows of buttons
-    val fileChanges: List<FileChange> = emptyList()
+    val fileChanges: List<FileChange> = emptyList(),
+    // File attachment (for "file" type messages)
+    val fileName: String = "",
+    val fileSize: Long = 0,
+    val mimeType: String = "",
+    val isImage: Boolean = false,
+    val downloadPath: String = "",
+    val localFilePath: String = "",  // Set after download completes
+    val sendFailed: Boolean = false
 )
