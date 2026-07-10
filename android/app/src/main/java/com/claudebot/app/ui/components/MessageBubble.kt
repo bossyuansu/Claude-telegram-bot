@@ -13,6 +13,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
@@ -24,10 +25,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -49,7 +53,10 @@ fun MessageBubble(
     message: ChatMessage,
     onButtonClick: ((InlineButton) -> Unit)? = null,
     onDownloadClick: (() -> Unit)? = null,
-    onRetryClick: (() -> Unit)? = null
+    onShareClick: (() -> Unit)? = null,
+    onRetryClick: (() -> Unit)? = null,
+    onFilePathClick: (String) -> Unit = {},
+    onUrlClick: (String) -> Unit = {}
 ) {
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
@@ -116,11 +123,11 @@ fun MessageBubble(
                         segments.forEach { segment ->
                             when (segment) {
                                 is MessageSegment.Text -> {
-                                    Text(
+                                    FilePathText(
                                         text = segment.annotated,
                                         color = textColor,
-                                        fontSize = 14.sp,
-                                        lineHeight = 20.sp
+                                        onFilePathClick = onFilePathClick,
+                                        onUrlClick = onUrlClick
                                     )
                                 }
                                 is MessageSegment.CodeBlock -> {
@@ -182,11 +189,11 @@ fun MessageBubble(
                             }
                         }
                     } else {
-                        Text(
-                            text = message.text,
+                        FilePathText(
+                            text = AnnotatedString(message.text),
                             color = textColor,
-                            fontSize = 14.sp,
-                            lineHeight = 20.sp
+                            onFilePathClick = onFilePathClick,
+                            onUrlClick = onUrlClick
                         )
                     }
                 }
@@ -200,14 +207,18 @@ fun MessageBubble(
                 fileName = message.fileName,
                 fileSize = message.fileSize,
                 isDownloaded = message.localFilePath.isNotBlank(),
-                onDownload = onDownloadClick
+                onDownload = onDownloadClick,
+                onShare = onShareClick
             )
         }
 
         // File changes / diff viewer
         if (message.fileChanges.isNotEmpty()) {
             Spacer(Modifier.height(4.dp))
-            FileChangesSection(message.fileChanges)
+            FileChangesSection(
+                changes = message.fileChanges,
+                onFilePathClick = onFilePathClick
+            )
         }
 
         // Inline keyboard buttons
@@ -292,7 +303,291 @@ fun MessageBubble(
 }
 
 @Composable
-private fun FileChangesSection(changes: List<FileChange>) {
+private fun FilePathText(
+    text: AnnotatedString,
+    color: Color,
+    onFilePathClick: (String) -> Unit,
+    onUrlClick: (String) -> Unit
+) {
+    val annotated = remember(text) { text.withFilePathAnnotations() }
+    val hasTapTargets = remember(annotated) { annotated.hasTappableLinkTarget() }
+
+    if (!hasTapTargets) {
+        Text(
+            text = text,
+            color = color,
+            fontSize = 14.sp,
+            lineHeight = 20.sp
+        )
+        return
+    }
+
+    ClickableText(
+        text = annotated,
+        style = TextStyle(
+            color = color,
+            fontSize = 14.sp,
+            lineHeight = 20.sp
+        ),
+        onClick = { offset ->
+            val urlLink = annotated
+                .getStringAnnotations(URL_TAG, offset, offset)
+                .firstOrNull()
+                ?.item
+
+            if (urlLink != null) {
+                when {
+                    isLikelyFilePathTarget(urlLink) -> {
+                        val commandPath = normalizeFilePathForCommand(urlLink)
+                        if (commandPath.isNotEmpty()) onFilePathClick(commandPath)
+                    }
+                    isWebUrlTarget(urlLink) -> {
+                        val url = normalizeUrlForOpen(urlLink)
+                        if (url.isNotEmpty()) onUrlClick(url)
+                    }
+                }
+                return@ClickableText
+            }
+
+            val filePath = annotated
+                .getStringAnnotations(FILE_PATH_TAG, offset, offset)
+                .firstOrNull()
+                ?.item
+
+            if (filePath != null) {
+                val commandPath = normalizeFilePathForCommand(filePath)
+                if (commandPath.isNotEmpty()) onFilePathClick(commandPath)
+            }
+        }
+    )
+}
+
+internal const val FILE_PATH_TAG = "FILE_PATH"
+internal const val URL_TAG = "URL"
+private const val FILE_EXTENSIONS =
+    "kt|kts|java|py|js|jsx|ts|tsx|json|md|yml|yaml|toml|gradle|xml|html|css|scss|sql|sh|bash|zsh|rb|go|rs|c|cc|cpp|h|hpp|swift|php|txt|csv|env|lock|png|jpg|jpeg|webp|gif|pdf|docx|pptx|xlsx|zip|tar|gz|log"
+private const val FILE_NAME_CHARS = """[^\s`"'<>/\\]+"""
+
+private val FILE_PATH_REGEX = Regex(
+    """(?<![A-Za-z0-9_@])(?:(?:~/|/|\./|\../|$FILE_NAME_CHARS/)[^\s`"'<>]+|$FILE_NAME_CHARS\.(?:$FILE_EXTENSIONS)(?::\d+(?::\d+)?)?)""",
+    RegexOption.IGNORE_CASE
+)
+private val SINGLE_FILE_NAME_REGEX = Regex(
+    """^$FILE_NAME_CHARS\.(?:$FILE_EXTENSIONS)(?::\d+(?::\d+)?)?$""",
+    RegexOption.IGNORE_CASE
+)
+private val EXTENSIONLESS_FILE_NAMES = setOf(
+    ".env",
+    ".gitignore",
+    ".npmrc",
+    "brewfile",
+    "containerfile",
+    "dockerfile",
+    "gemfile",
+    "gradlew",
+    "jenkinsfile",
+    "license",
+    "makefile",
+    "notice",
+    "podfile",
+    "procfile",
+    "rakefile",
+    "readme"
+)
+private val URL_SCHEME_REGEX = Regex("""^[A-Za-z][A-Za-z0-9+.-]*://""")
+private val WEB_URL_REGEX = Regex(
+    """(?<![A-Za-z0-9_@])(?:https?://|www\.)[^\s`"'<>]+""",
+    RegexOption.IGNORE_CASE
+)
+private val FILE_LINE_SUFFIX_REGEX = Regex(""":\d+(?::\d+)?$""")
+private val HASH_LINE_SUFFIX_REGEX = Regex("""#L\d+(?:-L?\d+)?$""", RegexOption.IGNORE_CASE)
+
+private data class TextRange(val start: Int, val end: Int)
+
+internal fun AnnotatedString.withFilePathAnnotations(): AnnotatedString {
+    val source = this
+    val builder = AnnotatedString.Builder()
+    builder.append(source)
+    val urlRanges = source.getStringAnnotations(URL_TAG, 0, source.length)
+        .filter { isLikelyFilePathTarget(it.item) || isWebUrlTarget(it.item) }
+        .map { TextRange(it.start, it.end) }
+        .toMutableList()
+
+    WEB_URL_REGEX.findAll(source.text).forEach { match ->
+        val raw = match.value
+        val trimmed = trimUrlCandidate(raw)
+        if (trimmed.isEmpty()) return@forEach
+
+        val start = match.range.first
+        val end = start + trimmed.length
+        if (end > source.text.length) return@forEach
+        if (!isWebUrlTarget(trimmed)) return@forEach
+        if (urlRanges.any { rangesOverlap(start, end, it.start, it.end) }) return@forEach
+
+        builder.addStringAnnotation(URL_TAG, normalizeUrlForOpen(trimmed), start, end)
+        builder.addStyle(
+            SpanStyle(
+                color = AccentOrange,
+                textDecoration = TextDecoration.Underline
+            ),
+            start,
+            end
+        )
+        urlRanges.add(TextRange(start, end))
+    }
+
+    FILE_PATH_REGEX.findAll(source.text).forEach { match ->
+        val raw = match.value
+        val trimmed = trimFilePathCandidate(raw)
+        if (trimmed.isEmpty()) return@forEach
+
+        val start = match.range.first
+        val end = start + trimmed.length
+        if (end > source.text.length) return@forEach
+        if (!isLikelyFilePathTarget(trimmed)) return@forEach
+        if (trimmed.startsWith("//")) return@forEach
+        if (start > 0 && source.text[start - 1] == ':' && trimmed.startsWith("/")) return@forEach
+        if (urlRanges.any { rangesOverlap(start, end, it.start, it.end) }) return@forEach
+
+        builder.addStringAnnotation(FILE_PATH_TAG, trimmed, start, end)
+        builder.addStyle(
+            SpanStyle(
+                color = AccentOrange,
+                textDecoration = TextDecoration.Underline
+            ),
+            start,
+            end
+        )
+    }
+
+    return builder.toAnnotatedString()
+}
+
+internal fun AnnotatedString.hasTappableFilePath(): Boolean {
+    val end = text.length
+    return getStringAnnotations(FILE_PATH_TAG, 0, end).isNotEmpty() ||
+        getStringAnnotations(URL_TAG, 0, end).any { isLikelyFilePathTarget(it.item) }
+}
+
+internal fun AnnotatedString.hasTappableLinkTarget(): Boolean {
+    val end = text.length
+    return hasTappableFilePath() ||
+        getStringAnnotations(URL_TAG, 0, end).any { isWebUrlTarget(it.item) }
+}
+
+internal fun normalizeFilePathForCommand(value: String): String {
+    var path = trimFilePathCandidate(value)
+    if (path.startsWith("file://")) path = path.removePrefix("file://")
+    path = path.trim { it == '<' || it == '>' || it == '`' || it == '"' || it == '\'' }
+    path = path.replace(HASH_LINE_SUFFIX_REGEX, "")
+    path = path.replace(FILE_LINE_SUFFIX_REGEX, "")
+    path = normalizeMiddleEllipsis(path)
+    return path
+}
+
+internal fun normalizeUrlForOpen(value: String): String {
+    val url = trimUrlCandidate(value)
+    return if (url.startsWith("www.", ignoreCase = true)) "https://$url" else url
+}
+
+internal fun isWebUrlTarget(value: String): Boolean {
+    val url = normalizeUrlForOpen(value)
+    val lower = url.lowercase(Locale.ROOT)
+    val scheme = when {
+        lower.startsWith("http://") -> "http://"
+        lower.startsWith("https://") -> "https://"
+        else -> return false
+    }
+    val authority = url.substring(scheme.length)
+        .substringBefore("/")
+        .substringBefore("?")
+        .substringBefore("#")
+    return authority.isNotBlank() && !authority.startsWith(".")
+}
+
+private fun normalizeMiddleEllipsis(path: String): String {
+    if (path.startsWith(".../")) return path
+    val marker = "/.../"
+    val markerIndex = path.indexOf(marker)
+    if (markerIndex < 0) return path
+
+    val suffix = path.substring(markerIndex + marker.length)
+    return if (suffix.isNotBlank()) ".../$suffix" else path
+}
+
+private fun trimFilePathCandidate(value: String): String {
+    var path = value.trim { it == '`' || it == '"' || it == '\'' || it == '<' || it == '>' }
+    while (path.isNotEmpty() && path.last() in listOf('.', ',', ';')) {
+        path = path.dropLast(1)
+    }
+    while (path.isNotEmpty() && path.last() == ':' && !FILE_LINE_SUFFIX_REGEX.containsMatchIn(path)) {
+        path = path.dropLast(1)
+    }
+    path = trimUnbalancedCloser(path, ')', '(')
+    path = trimUnbalancedCloser(path, ']', '[')
+    path = trimUnbalancedCloser(path, '}', '{')
+    return path
+}
+
+private fun trimUrlCandidate(value: String): String {
+    var url = value.trim { it == '`' || it == '"' || it == '\'' || it == '<' || it == '>' }
+    while (url.isNotEmpty() && url.last() in listOf('.', ',', ';')) {
+        url = url.dropLast(1)
+    }
+    url = trimUnbalancedCloser(url, ')', '(')
+    url = trimUnbalancedCloser(url, ']', '[')
+    url = trimUnbalancedCloser(url, '}', '{')
+    return url
+}
+
+private fun rangesOverlap(start: Int, end: Int, otherStart: Int, otherEnd: Int): Boolean {
+    return start < otherEnd && end > otherStart
+}
+
+private fun trimUnbalancedCloser(value: String, close: Char, open: Char): String {
+    var path = value
+    while (path.isNotEmpty() && path.last() == close && path.count { it == close } > path.count { it == open }) {
+        path = path.dropLast(1)
+    }
+    return path
+}
+
+internal fun isLikelyFilePathTarget(value: String): Boolean {
+    val path = normalizeFilePathForCommand(value)
+    if (path.isEmpty()) return false
+    if (path.startsWith("file://")) return true
+    if (URL_SCHEME_REGEX.containsMatchIn(path)) return false
+    if (path.startsWith("//")) return false
+    val hasFileLikeLeaf = hasFileLikeLeaf(path)
+    if (path.startsWith("/") || path.startsWith("./") || path.startsWith("../") || path.startsWith("~/")) {
+        return hasFileLikeLeaf
+    }
+    if (path.contains("/")) {
+        val firstSegment = path.substringBefore("/")
+        return hasFileLikeLeaf && !looksLikeWebHost(firstSegment)
+    }
+    return hasFileLikeLeaf
+}
+
+private fun hasFileLikeLeaf(path: String): Boolean {
+    val leaf = path.substringAfterLast("/")
+    if (leaf.isBlank()) return false
+    return SINGLE_FILE_NAME_REGEX.matches(leaf) ||
+        EXTENSIONLESS_FILE_NAMES.contains(leaf.lowercase(Locale.ROOT))
+}
+
+private fun looksLikeWebHost(firstSegment: String): Boolean {
+    if (firstSegment.startsWith(".")) return false
+    if (!firstSegment.contains(".")) return false
+    val suffix = firstSegment.substringAfterLast(".")
+    return suffix.length in 2..8 && suffix.all { it.isLetter() }
+}
+
+@Composable
+private fun FileChangesSection(
+    changes: List<FileChange>,
+    onFilePathClick: (String) -> Unit
+) {
     var expanded by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
@@ -326,7 +621,10 @@ private fun FileChangesSection(changes: List<FileChange>) {
 
         if (expanded) {
             changes.forEach { change ->
-                FileChangeItem(change)
+                FileChangeItem(
+                    change = change,
+                    onFilePathClick = onFilePathClick
+                )
             }
         }
     }
@@ -334,7 +632,10 @@ private fun FileChangesSection(changes: List<FileChange>) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FileChangeItem(change: FileChange) {
+private fun FileChangeItem(
+    change: FileChange,
+    onFilePathClick: (String) -> Unit
+) {
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
@@ -378,7 +679,7 @@ private fun FileChangeItem(change: FileChange) {
                 modifier = Modifier
                     .weight(1f)
                     .combinedClickable(
-                        onClick = { if (hasDiff) showDiff = !showDiff },
+                        onClick = { onFilePathClick(change.path) },
                         onLongClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             clipboard.setText(AnnotatedString(change.path))
@@ -392,7 +693,10 @@ private fun FileChangeItem(change: FileChange) {
                 Text(
                     text = if (showDiff) "▲" else "▼",
                     fontSize = 9.sp,
-                    color = SessionLabel
+                    color = SessionLabel,
+                    modifier = Modifier
+                        .clickable { showDiff = !showDiff }
+                        .padding(start = 6.dp)
                 )
             }
         }
@@ -494,7 +798,8 @@ private fun FileAttachment(
     fileName: String,
     fileSize: Long,
     isDownloaded: Boolean,
-    onDownload: (() -> Unit)?
+    onDownload: (() -> Unit)?,
+    onShare: (() -> Unit)? = null
 ) {
     Row(
         modifier = Modifier
@@ -533,12 +838,23 @@ private fun FileAttachment(
                     .padding(start = 8.dp)
             )
         } else if (isDownloaded) {
-            Text(
-                text = "Saved ✓",
-                color = ConnectedGreen,
-                fontSize = 10.sp,
-                modifier = Modifier.padding(start = 8.dp)
-            )
+            if (onShare != null) {
+                Text(
+                    text = "Share",
+                    color = AccentOrange,
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .clickable { onShare() }
+                        .padding(start = 8.dp)
+                )
+            } else {
+                Text(
+                    text = "Saved ✓",
+                    color = ConnectedGreen,
+                    fontSize = 10.sp,
+                    modifier = Modifier.padding(start = 8.dp)
+                )
+            }
         }
     }
 }

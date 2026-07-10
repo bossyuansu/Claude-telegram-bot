@@ -42,6 +42,9 @@ android {
     }
 
     testOptions {
+        // JVM unit tests don't have the Android framework — return defaults for stubbed calls
+        // (e.g. android.util.Log) instead of throwing, so logic that logs can still be tested.
+        unitTests.isReturnDefaultValues = true
         managedDevices {
             localDevices {
                 create("pixel2api30") {
@@ -78,6 +81,7 @@ dependencies {
 
     // Unit tests
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 
     // Instrumented / Compose UI tests
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

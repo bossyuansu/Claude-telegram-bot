@@ -22,6 +22,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
@@ -44,7 +46,9 @@ private val COMMANDS = listOf(
     BotCommand("/justdoit", "Autonomous implementation", true),
     BotCommand("/omni", "Multi-agent engineering", true),
     BotCommand("/deepreview", "Multi-phase code review", false),
+    BotCommand("/goal", "Iterative goal mode", true),
     BotCommand("/new", "New session in ~/project", true),
+    BotCommand("/file", "Download file by path", true),
     BotCommand("/resume", "Pick a session to resume", false),
     BotCommand("/sessions", "List all sessions", false),
     BotCommand("/switch", "Switch session by name", true),
@@ -65,7 +69,9 @@ fun InputBar(
     enabled: Boolean = true,
     currentSession: String = "",
     isBusy: Boolean = false,
-    onCancel: () -> Unit = {}
+    onCancel: () -> Unit = {},
+    prefillText: String? = null,
+    onPrefillConsumed: () -> Unit = {}
 ) {
     var text by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
@@ -74,6 +80,17 @@ fun InputBar(
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val sendScale = remember { Animatable(1f) }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(prefillText) {
+        val prefill = prefillText ?: return@LaunchedEffect
+        text = prefill
+        showMenu = false
+        showShortcuts = false
+        focusRequester.requestFocus()
+        keyboard?.show()
+        onPrefillConsumed()
+    }
 
     // Filter commands when user is typing a slash command
     val typedCmd = text.trim()
@@ -175,7 +192,24 @@ fun InputBar(
                     .padding(horizontal = 12.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                listOf("commit and push", "deploy", "fix it", "run tests", "review", "continue").forEach { shortcut ->
+                // Interrupt button — prefixes ! to send immediate feedback to active loop
+                Text(
+                    "⚡interrupt",
+                    fontSize = 12.sp,
+                    color = DisconnectedRed,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.dp, DisconnectedRed.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                        .clickable {
+                            if (text.isNotBlank()) {
+                                onSend("!${text.trimStart('!')}"); text = ""; showShortcuts = false
+                            } else {
+                                text = "!"
+                            }
+                        }
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                )
+                listOf("ship it", "deploy", "fix it", "run tests", "review", "continue", "simplify").forEach { shortcut ->
                     Text(
                         shortcut,
                         fontSize = 12.sp,
@@ -244,6 +278,7 @@ fun InputBar(
                         .background(DarkSurfaceVariant, shape)
                         .border(1.dp, borderColor, shape)
                         .padding(horizontal = 14.dp, vertical = 10.dp)
+                        .focusRequester(focusRequester)
                         .onFocusChanged { focused = it.isFocused },
                     enabled = enabled,
                     textStyle = TextStyle(color = BotText, fontSize = 14.sp),

@@ -82,6 +82,43 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     )
     val scheduledTasks = mutableStateListOf<ScheduledTask>()
 
+    // Cron background jobs (Claude CronCreate sessions)
+    data class CronJob(
+        val key: String,
+        val sessionName: String,
+        val cron: String,
+        val prompt: String,
+        val started: Long,
+        val elapsed: Int,
+        val alive: Boolean,
+    )
+    val cronJobs = mutableStateListOf<CronJob>()
+
+    // Goal mode state
+    data class GoalMilestone(
+        val id: String,
+        val title: String,
+        val status: String,   // pending, in_progress, completed, failed, skipped
+        val order: Int,
+        val attempts: Int,
+        val acceptanceCriteria: List<String> = emptyList()
+    )
+    data class GoalSummary(
+        val id: String,
+        val title: String,
+        val status: String,   // active, paused, completed, failed, abandoned, planning
+        val session: String,
+        val milestonesTotal: Int,
+        val milestonesDone: Int,
+        val currentIteration: Int = 0,
+        val learningsCount: Int = 0,
+        val createdAt: String = "",
+        val milestones: List<GoalMilestone> = emptyList(),
+        val isRunning: Boolean = false,
+        val isPaused: Boolean = false,
+    )
+    val goals = mutableStateListOf<GoalSummary>()
+
     /** True while a session-changing command (/switch, /new, /resume, /end, /delete) is in-flight. */
     val isSwitchingSession = mutableStateOf(false)
 
@@ -90,12 +127,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val pendingAction = mutableStateOf<PendingAction?>(null)
 
     // Session list (from /api/sessions)
-    data class SessionInfo(val name: String, val busy: Boolean, val isActive: Boolean, val lastCli: String)
+    data class SessionInfo(val name: String, val busy: Boolean, val isActive: Boolean, val lastCli: String, val queueCount: Int = 0, val sessionId: String = "")
     val sessionList = mutableStateListOf<SessionInfo>()
 
     // Session filter state
     val sessionFilter = mutableStateOf<String?>(null)
     val availableSessions = mutableStateListOf<String>()
+    val hiddenSessions = mutableStateOf(settings.hiddenSessions)
+    /** Sessions visible in the filter dropdown (availableSessions minus hidden). */
+    val visibleSessions: List<String>
+        get() = availableSessions.filter { it !in hiddenSessions.value }
     /** Incremented on every filter change; in-flight loads compare to detect staleness. */
     private var filterGeneration = 0
 
@@ -127,6 +168,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         setSessionFilter(null)
     }
 
+    fun hideSession(name: String) {
+        settings.hideSession(name)
+        hiddenSessions.value = settings.hiddenSessions
+        if (sessionFilter.value == name) setSessionFilter(null)
+    }
+
+    fun unhideSession(name: String) {
+        settings.unhideSession(name)
+        hiddenSessions.value = settings.hiddenSessions
+    }
+
     // Paging state
     val isLoadingMore = mutableStateOf(false)
     val allLoaded = mutableStateOf(false)
@@ -141,7 +193,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val dao = AppDatabase.get(application).messageDao()
     private val idToIndex = mutableMapOf<Int, Int>()
     private var localIdCounter = -1
-    private val httpClient = OkHttpClient()
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .callTimeout(6, TimeUnit.MINUTES)
+        .build()
     private var dbOffset = 0 // How many messages loaded from DB so far
     private val sendExecutor = Executors.newSingleThreadExecutor() // Serialize outgoing HTTP requests
     @Volatile private var wsStateReady = false
@@ -429,10 +486,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun sendMessage(text: String) {
         if (text.isBlank()) return
         val localId = localIdCounter--
+        val targetSession = effectiveSession
+        val trimmedText = text.trim()
+        val clientRequestId = "android:${System.currentTimeMillis()}:$localId"
         val msg = ChatMessage(
             messageId = localId,
-            text = text,
+            text = trimmedText,
             isFromBot = false,
+            session = targetSession,
             timestamp = System.currentTimeMillis()
         )
         android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -447,8 +508,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             dbOffset++ // We added one more message that's already in-memory
         }
         // Detect session-changing commands
-        val cmd = text.trim().split(" ").first().lowercase()
+        val cmd = trimmedText.split(" ").first().lowercase()
         val isSessionCmd = cmd in setOf("/switch", "/new", "/resume", "/end", "/delete")
+        val isCommandLike = trimmedText.startsWith("/") || trimmedText.startsWith("!")
+        val maxAttempts = if (isCommandLike) 1 else 3
         if (isSessionCmd) {
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 isSwitchingSession.value = true
@@ -458,13 +521,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Send via HTTP API (serialized to preserve command order)
         sendExecutor.submit {
             var ok = false
-            for (attempt in 1..3) {
+            for (attempt in 1..maxAttempts) {
                 try {
                     val json = JSONObject()
-                        .put("text", text)
+                        .put("text", trimmedText)
+                        .put("session", targetSession)
+                        .put("client_request_id", clientRequestId)
                         .toString()
                     val body = json.toRequestBody("application/json".toMediaType())
-                    val url = "http://${settings.host}:${settings.port}/api/message"
+                    val url = "http://${settings.host}:${settings.port}/api/message-targeted"
                     val reqBuilder = Request.Builder().url(url).post(body)
                     if (settings.token.isNotBlank()) {
                         reqBuilder.header("Authorization", "Bearer ${settings.token}")
@@ -474,7 +539,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     if (ok) break
                 } catch (_: Exception) {}
-                if (!ok && attempt < 3) Thread.sleep(1000L * attempt)
+                if (!ok && attempt < maxAttempts) Thread.sleep(1000L * attempt)
             }
             if (!ok) {
                 android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -499,16 +564,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         messages[index] = msg.copy(sendFailed = false)
         // Re-send the text
         val text = msg.text
+        val targetSession = msg.session
         val localId = msg.messageId
+        val trimmedText = text.trim()
+        val clientRequestId = "android-retry:${System.currentTimeMillis()}:$localId"
+        val isCommandLike = trimmedText.startsWith("/") || trimmedText.startsWith("!")
+        val maxAttempts = if (isCommandLike) 1 else 3
         sendExecutor.submit {
             var ok = false
-            for (attempt in 1..3) {
+            for (attempt in 1..maxAttempts) {
                 try {
                     val json = JSONObject()
-                        .put("text", text)
+                        .put("text", trimmedText)
+                        .put("session", targetSession)
+                        .put("client_request_id", clientRequestId)
                         .toString()
                     val body = json.toRequestBody("application/json".toMediaType())
-                    val url = "http://${settings.host}:${settings.port}/api/message"
+                    val url = "http://${settings.host}:${settings.port}/api/message-targeted"
                     val reqBuilder = Request.Builder().url(url).post(body)
                     if (settings.token.isNotBlank()) {
                         reqBuilder.header("Authorization", "Bearer ${settings.token}")
@@ -518,7 +590,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     if (ok) break
                 } catch (_: Exception) {}
-                if (!ok && attempt < 3) Thread.sleep(1000L * attempt)
+                if (!ok && attempt < maxAttempts) Thread.sleep(1000L * attempt)
             }
             if (!ok) {
                 android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -543,10 +615,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             pendingAction.value?.let { if (it.messageId == messageId) pendingAction.value = null }
             val idx = idToIndex[messageId]
             if (idx != null && idx < messages.size && messages[idx].messageId == messageId) {
-                messages[idx] = messages[idx].copy(buttons = emptyList())
+                val cleared = messages[idx].copy(buttons = emptyList())
+                messages[idx] = cleared
                 // Update DB
                 viewModelScope.launch(Dispatchers.IO) {
-                    dao.updateByMessageId(messageId, messages[idx].text, messages[idx].session, "")
+                    dao.upsertByMessageId(cleared.toEntity())
                 }
             }
         }
@@ -601,11 +674,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     resolver.openOutputStream(uri)?.use { out ->
                         response.body?.byteStream()?.copyTo(out)
                     }
+                    val updated = msg.copy(localFilePath = uri.toString())
                     withContext(Dispatchers.Main) {
                         if (index < messages.size && messages[index].messageId == msg.messageId) {
-                            messages[index] = msg.copy(localFilePath = uri.toString())
+                            messages[index] = updated
                         }
                     }
+                    dao.upsertByMessageId(updated.toEntity())
                 }
             } catch (e: Exception) {
                 Log.e("VM", "Download failed: ${e.message}", e)
@@ -676,7 +751,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             name = s.optString("name", ""),
                             busy = s.optBoolean("busy", false),
                             isActive = s.optBoolean("is_active", false),
-                            lastCli = s.optString("last_cli", "")
+                            lastCli = s.optString("last_cli", ""),
+                            queueCount = s.optInt("queue_count", 0),
+                            sessionId = s.optString("id", ""),
                         ))
                     }
                     val activeSession = list.firstOrNull { it.isActive }?.name
@@ -739,6 +816,131 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 Log.w("ChatVM", "fetchActiveTasks failed: ${e.message}")
             }
         }.start()
+    }
+
+    fun fetchGoals() {
+        Thread {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/goals/0"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@Thread
+                    val json = JSONObject(resp.body?.string() ?: return@Thread)
+                    val arr = json.optJSONArray("goals") ?: return@Thread
+                    val parsed = mutableListOf<GoalSummary>()
+                    for (i in 0 until arr.length()) {
+                        val g = arr.getJSONObject(i)
+                        val ms = g.optJSONArray("milestones")
+                        val milestones = mutableListOf<GoalMilestone>()
+                        if (ms != null) {
+                            for (j in 0 until ms.length()) {
+                                val m = ms.getJSONObject(j)
+                                val criteria = mutableListOf<String>()
+                                val ca = m.optJSONArray("acceptance_criteria")
+                                if (ca != null) for (k in 0 until ca.length()) criteria.add(ca.getString(k))
+                                milestones.add(GoalMilestone(
+                                    id = m.optString("id", ""),
+                                    title = m.optString("title", ""),
+                                    status = m.optString("status", "pending"),
+                                    order = m.optInt("order", 0),
+                                    attempts = m.optInt("attempts", 0),
+                                    acceptanceCriteria = criteria
+                                ))
+                            }
+                        }
+                        parsed.add(GoalSummary(
+                            id = g.optString("id", ""),
+                            title = g.optString("title", ""),
+                            status = g.optString("status", ""),
+                            session = g.optString("session", ""),
+                            milestonesTotal = g.optInt("milestones_total", milestones.size),
+                            milestonesDone = g.optInt("milestones_done", 0),
+                            currentIteration = g.optInt("current_iteration", 0),
+                            learningsCount = g.optInt("learnings_count", 0),
+                            createdAt = g.optString("created_at", ""),
+                            milestones = milestones,
+                            isRunning = g.optBoolean("is_running", false),
+                            isPaused = g.optBoolean("is_paused", false),
+                        ))
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        goals.clear()
+                        goals.addAll(parsed)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "fetchGoals failed: ${e.message}")
+            }
+        }.start()
+    }
+
+    fun pauseGoal(goalId: String) {
+        // Optimistic update
+        val idx = goals.indexOfFirst { it.id == goalId }
+        if (idx >= 0) goals[idx] = goals[idx].copy(isPaused = true, status = "paused")
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/goal/$goalId/pause"
+                val body = "{}".toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().close()
+            } catch (e: Exception) {
+                Log.w("ChatVM", "pauseGoal failed: ${e.message}")
+            }
+        }
+    }
+
+    fun resumeGoal(goalId: String) {
+        val idx = goals.indexOfFirst { it.id == goalId }
+        if (idx >= 0) goals[idx] = goals[idx].copy(isPaused = false, status = "active", isRunning = true)
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/goal/$goalId/resume"
+                val body = "{}".toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().close()
+            } catch (e: Exception) {
+                Log.w("ChatVM", "resumeGoal failed: ${e.message}")
+            }
+        }
+    }
+
+    fun cancelGoal(goalId: String) {
+        goals.removeAll { it.id == goalId }
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/goal/$goalId/cancel"
+                val body = "{}".toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).post(body)
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().close()
+            } catch (e: Exception) {
+                Log.w("ChatVM", "cancelGoal failed: ${e.message}")
+            }
+        }
+    }
+
+    fun deleteGoal(goalId: String) {
+        goals.removeAll { it.id == goalId }
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/goal/$goalId"
+                val reqBuilder = Request.Builder().url(url).delete()
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w("ChatVM", "deleteGoal failed: HTTP ${resp.code}")
+                        fetchGoals()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("ChatVM", "deleteGoal failed: ${e.message}")
+                fetchGoals()
+            }
+        }
     }
 
     fun cancelTask(sessionName: String) {
@@ -835,6 +1037,112 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } catch (_: Exception) {}
         }.start()
+    }
+
+    fun fetchCronJobs() {
+        Thread {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/cron-jobs"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@Thread
+                    val obj = JSONObject(resp.body?.string() ?: return@Thread)
+                    val arr = obj.getJSONArray("cron_jobs")
+                    val jobs = mutableListOf<CronJob>()
+                    for (i in 0 until arr.length()) {
+                        val j = arr.getJSONObject(i)
+                        jobs.add(CronJob(
+                            key = j.optString("key"),
+                            sessionName = j.optString("session_name"),
+                            cron = j.optString("cron"),
+                            prompt = j.optString("prompt"),
+                            started = j.optLong("started"),
+                            elapsed = j.optInt("elapsed"),
+                            alive = j.optBoolean("alive", true),
+                        ))
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        cronJobs.clear()
+                        cronJobs.addAll(jobs)
+                    }
+                }
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    fun cancelCronJob(key: String) {
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/cron-jobs/${java.net.URLEncoder.encode(key, "UTF-8")}"
+                val reqBuilder = Request.Builder().url(url).delete()
+                if (settings.token.isNotBlank()) {
+                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+                fetchCronJobs()
+            } catch (_: Exception) {}
+        }
+    }
+
+    // Queue management
+    data class QueueItem(val index: Int, val text: String)
+    val queueItems = mutableStateListOf<QueueItem>()
+    val queueSessionId = mutableStateOf("")
+
+    fun fetchQueue(sessionId: String) {
+        queueSessionId.value = sessionId
+        Thread {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/queue/$sessionId"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@Thread
+                    val obj = JSONObject(resp.body?.string() ?: return@Thread)
+                    val arr = obj.getJSONArray("queue")
+                    val items = mutableListOf<QueueItem>()
+                    for (i in 0 until arr.length()) {
+                        val q = arr.getJSONObject(i)
+                        items.add(QueueItem(q.optInt("index"), q.optString("text")))
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        queueItems.clear()
+                        queueItems.addAll(items)
+                    }
+                }
+            } catch (_: Exception) {}
+        }.start()
+    }
+
+    fun editQueueItem(sessionId: String, index: Int, newText: String) {
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/queue/$sessionId/$index"
+                val body = JSONObject().put("text", newText).toString()
+                    .toRequestBody("application/json".toMediaType())
+                val reqBuilder = Request.Builder().url(url).put(body)
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+                fetchQueue(sessionId)
+                fetchLocalSessions()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun deleteQueueItem(sessionId: String, index: Int) {
+        sendExecutor.submit {
+            try {
+                val url = "http://${settings.host}:${settings.port}/api/queue/$sessionId/$index"
+                val reqBuilder = Request.Builder().url(url).delete()
+                if (settings.token.isNotBlank()) reqBuilder.header("Authorization", "Bearer ${settings.token}")
+                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
+                fetchQueue(sessionId)
+                fetchLocalSessions()
+            } catch (_: Exception) {}
+        }
     }
 
     fun createScheduledTask(
@@ -1095,7 +1403,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         updateKeepAlive(msg.active)
                         // Update Mission Control map
                         val sessionName = msg.session
-                        if (sessionName.isNotEmpty() && msg.mode in setOf("omni", "justdoit", "deepreview")) {
+                        if (sessionName.isNotEmpty() && msg.mode in setOf("omni", "justdoit", "deepreview", "ralph", "goal")) {
                             if (msg.active) {
                                 val existing = activeTasks[sessionName]
                                 activeTasks[sessionName] = ActiveTask(
@@ -1121,10 +1429,78 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "schedule" -> {
                     fetchScheduledTasks()
                 }
+                "goal" -> {
+                    // Update goal state from WS events
+                    when (msg.goalEvent) {
+                        "started" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(
+                                    status = "active", isRunning = true, isPaused = false,
+                                    title = msg.goalTitle.ifEmpty { goals[idx].title },
+                                    milestonesTotal = if (msg.milestonesTotal > 0) msg.milestonesTotal else goals[idx].milestonesTotal,
+                                    milestonesDone = msg.milestonesDone,
+                                )
+                            } else {
+                                fetchGoals()
+                            }
+                        }
+                        "milestone_completed" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(
+                                    milestonesDone = msg.milestonesDone,
+                                    milestonesTotal = if (msg.milestonesTotal > 0) msg.milestonesTotal else goals[idx].milestonesTotal,
+                                    currentIteration = msg.iteration,
+                                )
+                            }
+                        }
+                        "iteration" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(currentIteration = msg.iteration)
+                            }
+                        }
+                        "completed" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(
+                                    status = "completed", isRunning = false, isPaused = false
+                                )
+                            }
+                        }
+                        "paused" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(status = "paused", isPaused = true)
+                            }
+                        }
+                        "cancelled", "failed" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(
+                                    status = if (msg.goalEvent == "cancelled") "abandoned" else "failed",
+                                    isRunning = false, isPaused = false
+                                )
+                            }
+                        }
+                        "replan" -> {
+                            val idx = goals.indexOfFirst { it.id == msg.goalId }
+                            if (idx >= 0) {
+                                goals[idx] = goals[idx].copy(
+                                    milestonesTotal = if (msg.milestonesTotal > 0) msg.milestonesTotal else goals[idx].milestonesTotal
+                                )
+                            }
+                        }
+                        else -> fetchGoals()
+                    }
+                }
                 "edit" -> {
                     val mid = msg.messageId ?: return@post
-                    // Skip legacy "edit" events for stream-tracked messages
-                    if (mid in streamingMessageIds) return@post
+                    // Skip legacy "edit" events for stream-tracked or finalized messages.
+                    // Finalized messages got their authoritative text from the "done" event;
+                    // a subsequent edit (e.g. TG final chunk with file ops) would overwrite it.
+                    if (mid in streamingMessageIds || mid in finalizedMessageIds) return@post
                     val idx = findMessageIndex(mid)
                     if (idx != null) {
                         val updated = messages[idx].copy(
@@ -1135,7 +1511,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         messages[idx] = updated
                         if (idx == messages.lastIndex) scrollTrigger.value++
                         viewModelScope.launch(Dispatchers.IO) {
-                            dao.updateByMessageId(mid, updated.text, updated.session, updated.buttonsToJson())
+                            dao.upsertByMessageId(updated.toEntity())
                         }
                     } else {
                         // Replayed edit for an older, non-loaded message: keep DB as source of truth.
@@ -1280,13 +1656,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     finalizedMessageIds.add(mid)
                     return
                 }
-                // Strip tool status line if present before appending text
-                var currentText = messages[appendIdx].text
-                if (currentText.endsWith("\u200B")) {
-                    // Remove the tool status line (everything from last newline before marker)
-                    val lastNl = currentText.lastIndexOf('\n', currentText.length - 2)
-                    currentText = if (lastNl >= 0) currentText.substring(0, lastNl) else ""
-                }
+                // Strip tool status block if present before appending text
+                val currentText = stripToolStatus(messages[appendIdx].text)
                 val newText = currentText + msg.text
                 messages[appendIdx] = messages[appendIdx].copy(
                     text = newText,
@@ -1313,12 +1684,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "tool" -> {
                 val idx = findMessageIndex(mid)
                 if (idx != null) {
-                    var currentText = messages[idx].text
-                    // Remove existing tool status line if present
-                    if (currentText.endsWith("\u200B")) {
-                        val lastNl = currentText.lastIndexOf('\n', currentText.length - 2)
-                        currentText = if (lastNl >= 0) currentText.substring(0, lastNl) else ""
-                    }
+                    val currentText = stripToolStatus(messages[idx].text)
                     // Append tool status as a replaceable line (marked with zero-width space)
                     val toolLine = formatToolStatus(msg.tool, msg.path)
                     messages[idx] = messages[idx].copy(text = currentText + "\n" + toolLine + "\u200B")
@@ -1408,8 +1774,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Strip a tool status block (🔧/🔍 line + \u200B marker) from the end of text.
+     *  Handles multi-line tool status by finding the \n before the tool emoji, not just
+     *  the \n immediately before the \u200B marker. */
+    private fun stripToolStatus(text: String): String {
+        val markerIdx = text.lastIndexOf("\u200B")
+        if (markerIdx < 0) return text
+        // Find the tool emoji that starts the status block
+        val toolStart = maxOf(
+            text.lastIndexOf("\uD83D\uDD27", markerIdx),  // 🔧
+            text.lastIndexOf("\uD83D\uDD0D", markerIdx)   // 🔍
+        )
+        if (toolStart >= 0) {
+            // Remove from the newline before the emoji to the end
+            val nlBefore = text.lastIndexOf('\n', toolStart - 1)
+            return if (nlBefore >= 0) text.substring(0, nlBefore) else ""
+        }
+        // Fallback: remove from the newline before marker
+        val lastNl = text.lastIndexOf('\n', markerIdx - 1)
+        return if (lastNl >= 0) text.substring(0, lastNl) else ""
+    }
+
     private fun formatToolStatus(tool: String, path: String): String {
-        val shortPath = if (path.length > 60) "..." + path.takeLast(57) else path
+        val cleanPath = path.replace('\n', ' ').replace('\r', ' ')
+        val shortPath = if (cleanPath.length > 60) "..." + cleanPath.takeLast(57) else cleanPath
         return when (tool) {
             "bash" -> "\uD83D\uDD27 Running: `$shortPath`"
             "write" -> "\uD83D\uDD27 Writing: `$shortPath`"
@@ -1464,8 +1852,29 @@ private fun ChatMessage.toEntity() = MessageEntity(
     isFromBot = isFromBot,
     session = session,
     timestamp = timestamp,
-    buttons = buttonsToJson()
+    buttons = buttonsToJson(),
+    fileName = fileName,
+    fileSize = fileSize,
+    mimeType = mimeType,
+    downloadPath = downloadPath,
+    localFilePath = localFilePath,
+    fileChangesJson = fileChangesToJson()
 )
+
+fun ChatMessage.fileChangesToJson(): String {
+    if (fileChanges.isEmpty()) return ""
+    val arr = JSONArray()
+    for (fc in fileChanges) {
+        arr.put(JSONObject().apply {
+            put("type", fc.type)
+            put("path", fc.path)
+            if (fc.old.isNotEmpty()) put("old", fc.old)
+            if (fc.new.isNotEmpty()) put("new", fc.new)
+            if (fc.content.isNotEmpty()) put("content", fc.content)
+        })
+    }
+    return arr.toString()
+}
 
 fun ChatMessage.buttonsToJson(): String {
     if (buttons.isEmpty()) return ""
@@ -1494,12 +1903,34 @@ private fun MessageEntity.toChatMessage(): ChatMessage {
         } catch (_: Exception) { emptyList() }
     } else emptyList()
 
+    val fcs = if (fileChangesJson.isNotEmpty()) {
+        try {
+            val arr = JSONArray(fileChangesJson)
+            (0 until arr.length()).map { i ->
+                val obj = arr.getJSONObject(i)
+                FileChange(
+                    type = obj.optString("type", ""),
+                    path = obj.optString("path", ""),
+                    old = obj.optString("old", ""),
+                    new = obj.optString("new", ""),
+                    content = obj.optString("content", "")
+                )
+            }
+        } catch (_: Exception) { emptyList() }
+    } else emptyList()
+
     return ChatMessage(
         messageId = messageId,
         text = text,
         isFromBot = isFromBot,
         session = session,
         timestamp = timestamp,
-        buttons = btns
+        buttons = btns,
+        fileChanges = fcs,
+        fileName = fileName,
+        fileSize = fileSize,
+        mimeType = mimeType,
+        downloadPath = downloadPath,
+        localFilePath = localFilePath
     )
 }

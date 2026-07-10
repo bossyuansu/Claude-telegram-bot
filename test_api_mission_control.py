@@ -25,6 +25,8 @@ class MCTestBase(unittest.TestCase):
 
     def setUp(self):
         self.justdoit_active = {}
+        self.goal_state = {}
+        self.goal_active = {}
         self.omni_active = {}
         self.deepreview_active = {}
         self.active_processes = {}
@@ -35,14 +37,18 @@ class MCTestBase(unittest.TestCase):
         self.mock_ws_broadcast = MagicMock()
         self.mock_save_tasks = MagicMock()
         self.mock_send_message = MagicMock()
+        self.mock_handle_command = MagicMock()
+        self.mock_handle_command_for_session = MagicMock(return_value=True)
+        self.mock_handle_message = MagicMock()
         self.mock_is_allowed = MagicMock(return_value=True)
         self.mock_get_session_id = MagicMock(side_effect=lambda s: s.get("id", "sid"))
         self.mock_get_active_session = MagicMock(return_value=None)
         self.active_sessions_data = {}
 
         api_server.init_refs(
-            handle_command=MagicMock(),
-            handle_message=MagicMock(),
+            handle_command=self.mock_handle_command,
+            handle_command_for_session=self.mock_handle_command_for_session,
+            handle_message=self.mock_handle_message,
             handle_callback_query=MagicMock(),
             is_allowed=self.mock_is_allowed,
             get_active_session=self.mock_get_active_session,
@@ -50,6 +56,7 @@ class MCTestBase(unittest.TestCase):
             user_sessions=self.user_sessions,
             active_processes=self.active_processes,
             justdoit_active=self.justdoit_active,
+            goal_state=self.goal_state,
             omni_active=self.omni_active,
             deepreview_active=self.deepreview_active,
             send_message=self.mock_send_message,
@@ -59,6 +66,7 @@ class MCTestBase(unittest.TestCase):
             save_active_tasks=self.mock_save_tasks,
             user_feedback_queue=self.user_feedback_queue,
             get_active_sessions_data=lambda: self.active_sessions_data,
+            goal_active=self.goal_active,
         )
 
         self.client = TestClient(api_server.app)
@@ -243,6 +251,92 @@ class TestCancelTaskWSBroadcasts(MCTestBase):
         self.client.post("/api/cancel-task",
             json={"chat_id": 123, "session": "sess"}, headers=self.headers)
         self.assertNotIn("123:sid1", self.user_feedback_queue)
+
+
+class TestMessageSessionTargeting(MCTestBase):
+    """Messages from filtered app views can target a non-active session."""
+
+    def test_non_command_message_routes_to_named_session(self):
+        self._add_session(123, "active-session", "active")
+        self._add_session(123, "target-session", "target")
+
+        resp = self.client.post(
+            "/api/message",
+            json={"chat_id": 123, "session": "target-session", "text": "!use this feedback"},
+            headers=self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.mock_handle_message.assert_called_once()
+        args, kwargs = self.mock_handle_message.call_args
+        self.assertEqual(args[:2], (123, "!use this feedback"))
+        self.assertEqual(kwargs["session"]["name"], "target-session")
+        self.assertEqual(kwargs["session"]["id"], "target")
+
+    @patch("os.killpg")
+    @patch("os.getpgid", return_value=42)
+    def test_cancel_command_routes_to_named_session(self, mock_getpgid, mock_killpg):
+        self._add_session(123, "active-session", "active")
+        self._add_session(123, "target-session", "target")
+        self.deepreview_active["123:target"] = {
+            "active": True,
+            "chat_id": 123,
+            "session_name": "target-session",
+        }
+        proc = MagicMock()
+        proc.pid = 42
+        proc.stdout = MagicMock()
+        proc.stderr = MagicMock()
+        self.active_processes["target"] = proc
+
+        resp = self.client.post(
+            "/api/message",
+            json={"chat_id": 123, "session": "target-session", "text": "/cancel"},
+            headers=self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(self.deepreview_active["123:target"]["active"])
+        mock_killpg.assert_called_once_with(42, signal.SIGKILL)
+        self.mock_handle_command.assert_not_called()
+
+    def test_targeted_file_command_routes_to_named_session(self):
+        self._add_session(123, "active-session", "active")
+        self._add_session(123, "target-session", "target")
+        self.user_sessions["123"]["active"] = "active"
+
+        resp = self.client.post(
+            "/api/message-targeted",
+            json={"chat_id": 123, "session": "target-session", "text": "/file README.md"},
+            headers=self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.mock_handle_command_for_session.assert_called_once()
+        args, _kwargs = self.mock_handle_command_for_session.call_args
+        self.assertEqual(args[0], 123)
+        self.assertEqual(args[1], "/file README.md")
+        self.assertEqual(args[2]["id"], "target")
+        self.mock_handle_command.assert_not_called()
+
+    def test_targeted_goal_command_routes_to_named_session(self):
+        self._add_session(123, "active-session", "active")
+        self._add_session(123, "target-session", "target")
+        self.user_sessions["123"]["active"] = "active"
+
+        resp = self.client.post(
+            "/api/message-targeted",
+            json={"chat_id": 123, "session": "target-session", "text": "/goal Build the widget"},
+            headers=self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.mock_handle_command_for_session.assert_called_once()
+        args, _kwargs = self.mock_handle_command_for_session.call_args
+        self.assertEqual(args[0], 123)
+        self.assertEqual(args[1], "/goal Build the widget")
+        self.assertEqual(args[2]["id"], "target")
+        self.mock_handle_command.assert_not_called()
 
 
 # ──────────────────────────────────────────────────────────

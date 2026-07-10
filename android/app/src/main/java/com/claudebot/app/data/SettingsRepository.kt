@@ -105,6 +105,19 @@ class SettingsRepository(context: Context) {
         }
     }
 
+    /** Sessions hidden from the filter dropdown (persisted as StringSet). */
+    var hiddenSessions: Set<String>
+        get() = prefs.getStringSet("hidden_sessions", emptySet()) ?: emptySet()
+        set(value) = prefs.edit().putStringSet("hidden_sessions", value.toSet()).apply()
+
+    fun hideSession(name: String) {
+        hiddenSessions = hiddenSessions + name
+    }
+
+    fun unhideSession(name: String) {
+        hiddenSessions = hiddenSessions - name
+    }
+
     val isConfigured: Boolean
         get() = host.isNotBlank()
 

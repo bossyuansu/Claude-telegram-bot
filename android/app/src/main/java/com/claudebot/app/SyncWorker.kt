@@ -88,7 +88,7 @@ class SyncWorker(
 
             val collected = mutableListOf<JSONObject>()
             val done = CompletableDeferred<Unit>()
-            var newLastSeq = lastSeq
+            var maxPersistedSeq = lastSeq
             var newServerId = knownServerId
             var syncError = ""
             val abortedByForeground = AtomicBoolean(false)
@@ -126,14 +126,9 @@ class SyncWorker(
                             if (serverId != knownServerId) {
                                 // Server restarted — accept new numbering
                                 newServerId = serverId
-                                newLastSeq = 0
+                                maxPersistedSeq = 0
                             }
                             return
-                        }
-
-                        val seq = json.optInt("seq", 0)
-                        if (seq > newLastSeq) {
-                            newLastSeq = seq
                         }
 
                         // Collect replay frames we can persist and/or notify from.
@@ -182,27 +177,34 @@ class SyncWorker(
             val notificationsBySession = linkedMapOf<String, NotificationCandidate>()
             for (json in collected) {
                 val type = json.optString("type", "")
+                val seq = json.optInt("seq", 0)
                 val messageId = if (json.has("message_id") && !json.isNull("message_id"))
                     json.getInt("message_id") else 0
                 val session = json.optString("session", "")
 
                 if (type == "edit" && messageId > 0) {
                     val text = json.optString("text", "")
-                    // Preserve existing button payload on edit.
+                    // Preserve existing fields on edit.
                     val existing = dao.findByMessageId(messageId)
                     val buttons = existing?.buttons ?: ""
-                    dao.updateByMessageId(messageId, text, session, buttons)
+                    dao.updateByMessageId(messageId, text, session, buttons,
+                        existing?.fileName ?: "", existing?.fileSize ?: 0,
+                        existing?.mimeType ?: "", existing?.downloadPath ?: "",
+                        existing?.localFilePath ?: "", existing?.fileChangesJson ?: "")
                 } else if (type == "message") {
                     val text = json.optString("text", "")
                     val buttonsJson = extractButtonsJson(json)
                     if (messageId > 0) {
+                        // Preserve fileChangesJson if already saved (e.g. from an earlier done event)
+                        val existingFc = dao.findByMessageId(messageId)?.fileChangesJson ?: ""
                         dao.upsertByMessageId(
                             MessageEntity(
                                 messageId = messageId,
                                 text = text,
                                 isFromBot = true,
                                 session = session,
-                                buttons = buttonsJson
+                                buttons = buttonsJson,
+                                fileChangesJson = existingFc
                             )
                         )
                     } else {
@@ -230,13 +232,15 @@ class SyncWorker(
                     }
                 } else if (type == "stream" && json.optString("op") == "done") {
                     val finalText = buildTerminalText(json)
+                    val fcJson = extractFileChangesJson(json)
                     if (messageId > 0) {
                         dao.upsertByMessageId(
                             MessageEntity(
                                 messageId = messageId,
                                 text = finalText,
                                 isFromBot = true,
-                                session = session
+                                session = session,
+                                fileChangesJson = fcJson
                             )
                         )
                     }
@@ -250,12 +254,16 @@ class SyncWorker(
                         )
                     }
                 }
+                if (seq > maxPersistedSeq) {
+                    maxPersistedSeq = seq
+                }
             }
             dao.deleteDuplicateMessageIds()
 
-            // Persist updated seq
-            if (newLastSeq > lastSeq || newServerId != knownServerId) {
-                settings.updateWsState(newLastSeq, newServerId)
+            // Persist seq only for frames saved above. Advancing past unpersisted
+            // stream append/status frames can make foreground reconnect skip visible output.
+            if (maxPersistedSeq > lastSeq || newServerId != knownServerId) {
+                settings.updateWsState(maxPersistedSeq, newServerId)
             } else {
                 // Successful sync window even if no new messages.
                 settings.wsLastSyncAt = System.currentTimeMillis()
@@ -352,6 +360,26 @@ class SyncWorker(
             }
         }
         return actions
+    }
+
+    private fun extractFileChangesJson(event: JSONObject): String {
+        val arr = event.optJSONArray("file_changes") ?: return ""
+        if (arr.length() == 0) return ""
+        val out = JSONArray()
+        for (i in 0 until arr.length()) {
+            val fc = arr.optJSONObject(i) ?: continue
+            val o = JSONObject()
+            o.put("type", fc.optString("type", ""))
+            o.put("path", fc.optString("path", ""))
+            val old = fc.optString("old", "")
+            if (old.isNotEmpty()) o.put("old", old)
+            val new = fc.optString("new", "")
+            if (new.isNotEmpty()) o.put("new", new)
+            val content = fc.optString("content", "")
+            if (content.isNotEmpty()) o.put("content", content)
+            out.put(o)
+        }
+        return if (out.length() > 0) out.toString() else ""
     }
 
     private fun extractButtonsJson(message: JSONObject): String {

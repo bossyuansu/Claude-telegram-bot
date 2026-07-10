@@ -11,8 +11,9 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
 - **Smart compaction** - Auto-summarizes context when hitting limits
 - **Long message chunking** - Splits long responses into multiple messages
 - **Parallel tasks** - Run tasks in different sessions concurrently
+- **Goal Mode** - `/goal` decomposes a larger objective into milestones, iterates with assessment/verification, and records learnings
 - **Question handling** - Interactive buttons for Claude's questions
-- **Photo & file uploads** - Send images and files for Claude to analyze (up to 50MB)
+- **Photo, video & file uploads** - Send images, videos, and files for Claude to analyze (up to 50MB)
 
 ## Commands
 
@@ -26,6 +27,12 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
 | `/delete <name>` | Delete a session |
 | `/status` | Show current session info |
 | `/cancel` | Cancel current task |
+| `/goal <description>` | Start an autonomous goal with milestones, verification, and learning |
+| `/goal status` | Show current goal progress |
+| `/goal plan` | Show milestone plan |
+| `/goal pause` / `/goal resume` | Pause or resume the active goal |
+| `/goal cancel` | Abandon the active goal and stop its subprocess |
+| `/goal journal` | Show goal learnings |
 | `/plan` | Ask Claude to enter plan mode |
 | `/approve` | Approve current plan |
 | `/reject` | Reject current plan |
@@ -78,10 +85,16 @@ sudo systemctl start claude-telegram-bot
 
 ### Claude CLI
 
-The bot uses your system's Claude CLI configuration. Set model with:
+The bot routes Claude CLI calls by task type. General/implementation work uses `CLAUDE_GENERAL_MODEL` (default Opus); planning/decomposition/routing uses `CLAUDE_PLANNING_MODEL` (default Opus; `claude-fable-5` is a supported override). Both are overridable via their env vars.
 ```bash
-claude config set model claude-opus-4-5-20250514
+export CLAUDE_GENERAL_MODEL=opus
+export CLAUDE_PLANNING_MODEL=opus
 ```
+
+## Goal Mode Manual Tests
+
+After automated tests pass, use [GOAL_MODE_MANUAL_TESTS.md](GOAL_MODE_MANUAL_TESTS.md)
+to validate the live `/goal` workflow against a disposable project.
 
 ## License
 

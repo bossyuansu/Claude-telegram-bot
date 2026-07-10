@@ -4,7 +4,9 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.gestures.scrollBy
@@ -30,8 +32,12 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.ui.platform.LocalContext
 import com.claudebot.app.ChatViewModel
 import com.claudebot.app.network.ConnectionState
 import com.claudebot.app.ui.components.InputBar
@@ -49,6 +55,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val connState by viewModel.connectionState
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
 
     var showSearch by remember { mutableStateOf(false) }
     var showSessions by remember { mutableStateOf(false) }
@@ -56,16 +63,34 @@ fun ChatScreen(viewModel: ChatViewModel) {
     var showFilterMenu by remember { mutableStateOf(false) }
     var showToolsMenu by remember { mutableStateOf(false) }
     var showMissionControl by remember { mutableStateOf(false) }
+    var showQueueFor by remember { mutableStateOf<String?>(null) }
+    var inputPrefill by remember { mutableStateOf<String?>(null) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     val searchQuery by viewModel.searchQuery
     val searchResults = viewModel.searchResults
     val isSearching by viewModel.isSearching
     val taskStatus by viewModel.taskStatus
     val isBusy by viewModel.isBotBusy
+    val prefillFileCommand: (String) -> Unit = { path ->
+        val trimmed = path.trim()
+        if (trimmed.isNotEmpty()) inputPrefill = "/file $trimmed"
+    }
 
     // Back-to-exit confirmation: only intercept when NOT already primed
     var backPressedOnce by remember { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val openUrl: (String) -> Unit = { url ->
+        runCatching {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        }.onFailure {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    message = "No app can open this link",
+                    duration = SnackbarDuration.Short
+                )
+            }
+        }
+    }
     BackHandler(enabled = !backPressedOnce) {
         backPressedOnce = true
         scope.launch {
@@ -254,14 +279,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                         maxLines = 1,
                                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                     )
-                                    if (taskStatus.active) {
-                                        Text(
-                                            "${taskStatus.mode} \u2022 ${taskStatus.phase}",
-                                            fontSize = 11.sp,
-                                            color = AccentOrangeLight,
-                                            maxLines = 1
-                                        )
-                                    }
                                 }
                                 Text(if (showSessions) " \u25B2" else " \u25BC", fontSize = 10.sp, color = SessionLabel)
                             }
@@ -274,16 +291,20 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                 }
                             }
                             // Compact session filter dropdown
-                            val availableSessions = viewModel.availableSessions
+                            val visibleSessions = viewModel.visibleSessions
+                            val hiddenSessions by viewModel.hiddenSessions
                             val sessionFilter by viewModel.sessionFilter
-                            if (availableSessions.size > 1) {
+                            if (visibleSessions.size > 1 || hiddenSessions.isNotEmpty()) {
                                 SessionFilterButton(
                                     expanded = showFilterMenu,
                                     onToggle = { showFilterMenu = !showFilterMenu },
                                     onDismiss = { showFilterMenu = false },
-                                    sessions = availableSessions,
+                                    sessions = visibleSessions,
                                     activeFilter = sessionFilter,
-                                    onSelect = { viewModel.setSessionFilter(it); showFilterMenu = false }
+                                    onSelect = { viewModel.setSessionFilter(it); showFilterMenu = false },
+                                    hiddenCount = hiddenSessions.size,
+                                    onHide = { viewModel.hideSession(it); showFilterMenu = false },
+                                    onUnhideAll = { hiddenSessions.forEach { viewModel.unhideSession(it) } }
                                 )
                             }
                             // Mission Control badge
@@ -394,6 +415,21 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                                     fontSize = 14.sp,
                                                     modifier = Modifier.weight(1f)
                                                 )
+                                                if (session.queueCount > 0) {
+                                                    Text(
+                                                        "${session.queueCount}",
+                                                        fontSize = 10.sp,
+                                                        color = DarkSurface,
+                                                        modifier = Modifier
+                                                            .background(Color(0xFFFFD54F), RoundedCornerShape(8.dp))
+                                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                            .clickable {
+                                                                viewModel.fetchQueue(session.sessionId)
+                                                                showQueueFor = session.sessionId
+                                                            }
+                                                    )
+                                                    Spacer(Modifier.width(4.dp))
+                                                }
                                                 if (session.busy) {
                                                     Text("\uD83D\uDD04", fontSize = 12.sp)
                                                     Spacer(Modifier.width(4.dp))
@@ -527,7 +563,9 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         enabled = connState == ConnectionState.CONNECTED && !switching,
                         currentSession = if (switching) "Switching session..." else session,
                         isBusy = isBusy,
-                        onCancel = { viewModel.sendMessage("/cancel") }
+                        onCancel = { viewModel.sendMessage("/cancel") },
+                        prefillText = inputPrefill,
+                        onPrefillConsumed = { inputPrefill = null }
                     )
                 }
             }
@@ -553,7 +591,16 @@ fun ChatScreen(viewModel: ChatViewModel) {
                         contentPadding = PaddingValues(vertical = 8.dp)
                     ) {
                         items(searchResults, key = { "${it.messageId}_${it.timestamp}" }) { msg ->
-                            MessageBubble(message = msg, onButtonClick = {})
+                            MessageBubble(
+                                message = msg,
+                                onButtonClick = {},
+                                onFilePathClick = {
+                                    prefillFileCommand(it)
+                                    showSearch = false
+                                    viewModel.clearSearch()
+                                },
+                                onUrlClick = openUrl
+                            )
                         }
                         if (viewModel.searchHasMore.value) {
                             item {
@@ -638,9 +685,22 @@ fun ChatScreen(viewModel: ChatViewModel) {
                                 onDownloadClick = if (msg.fileName.isNotBlank() && msg.localFilePath.isBlank()) {
                                     { viewModel.downloadFile(i) }
                                 } else null,
+                                onShareClick = if (msg.localFilePath.isNotBlank()) {
+                                    {
+                                        val uri = Uri.parse(msg.localFilePath)
+                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                            type = msg.mimeType.ifBlank { "application/octet-stream" }
+                                            putExtra(Intent.EXTRA_STREAM, uri)
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        context.startActivity(Intent.createChooser(shareIntent, null))
+                                    }
+                                } else null,
                                 onRetryClick = if (msg.sendFailed) {
                                     { viewModel.retryMessage(i) }
-                                } else null
+                                } else null,
+                                onFilePathClick = prefillFileCommand,
+                                onUrlClick = openUrl
                             )
                         }
                         // Typing indicator — shown as last item when bot is busy
@@ -752,7 +812,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
         }
 
         if (showMissionControl) {
-            LaunchedEffect(Unit) { viewModel.fetchScheduledTasks() }
+            LaunchedEffect(Unit) { viewModel.fetchScheduledTasks(); viewModel.fetchCronJobs(); viewModel.fetchGoals() }
             var showAddSchedule by remember { mutableStateOf(false) }
             ModalBottomSheet(
                 onDismissRequest = { showMissionControl = false },
@@ -762,6 +822,8 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 MissionControlContent(
                     activeTasks = viewModel.activeTasks,
                     scheduledTasks = viewModel.scheduledTasks,
+                    cronJobs = viewModel.cronJobs,
+                    goals = viewModel.goals,
                     onCancel = { viewModel.cancelTask(it) },
                     onPause = { viewModel.pauseTask(it) },
                     onResume = { viewModel.resumeTask(it) },
@@ -776,6 +838,11 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     },
                     onDeleteSchedule = { viewModel.deleteScheduledTask(it) },
                     onAddSchedule = { showAddSchedule = true },
+                    onCancelCron = { viewModel.cancelCronJob(it) },
+                    onPauseGoal = { viewModel.pauseGoal(it) },
+                    onResumeGoal = { viewModel.resumeGoal(it) },
+                    onCancelGoal = { viewModel.cancelGoal(it) },
+                    onDeleteGoal = { viewModel.deleteGoal(it) },
                 )
             }
             if (showAddSchedule) {
@@ -789,7 +856,143 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 )
             }
         }
+
+        // Queue management dialog
+        val queueSessionId = showQueueFor
+        if (queueSessionId != null) {
+            QueueDialog(
+                sessionId = queueSessionId,
+                items = viewModel.queueItems,
+                onEdit = { index, text -> viewModel.editQueueItem(queueSessionId, index, text) },
+                onDelete = { index -> viewModel.deleteQueueItem(queueSessionId, index) },
+                onDismiss = { showQueueFor = null }
+            )
+        }
     }
+}
+
+// ==================== Queue Management Dialog ====================
+
+@Composable
+private fun QueueDialog(
+    sessionId: String,
+    items: List<ChatViewModel.QueueItem>,
+    onEdit: (Int, String) -> Unit,
+    onDelete: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var editingIndex by remember { mutableStateOf<Int?>(null) }
+    var editText by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = DarkSurface,
+        title = { Text("Queued Messages", color = TopBarTitle) },
+        text = {
+            if (items.isEmpty()) {
+                Text("No queued messages.", color = SessionLabel)
+            } else {
+                LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
+                    items(items, key = { it.index }) { item ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp)
+                        ) {
+                            if (editingIndex == item.index) {
+                                OutlinedTextField(
+                                    value = editText,
+                                    onValueChange = { editText = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedTextColor = BotText,
+                                        unfocusedTextColor = BotText,
+                                        focusedBorderColor = AccentOrange,
+                                        unfocusedBorderColor = InputBorder,
+                                    ),
+                                    maxLines = 5,
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                    horizontalArrangement = Arrangement.End,
+                                ) {
+                                    Text(
+                                        "Cancel",
+                                        color = SessionLabel,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier
+                                            .clickable { editingIndex = null }
+                                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        "Save",
+                                        color = AccentOrange,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier
+                                            .clickable {
+                                                onEdit(item.index, editText)
+                                                editingIndex = null
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    "#${item.index + 1}",
+                                    color = AccentOrange,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                Text(
+                                    item.text,
+                                    color = BotText,
+                                    fontSize = 13.sp,
+                                    maxLines = 4,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                    horizontalArrangement = Arrangement.End,
+                                ) {
+                                    Text(
+                                        "Edit",
+                                        color = AccentOrange,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier
+                                            .clickable {
+                                                editText = item.text
+                                                editingIndex = item.index
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        "Delete",
+                                        color = Color(0xFFEF5350),
+                                        fontSize = 12.sp,
+                                        modifier = Modifier
+                                            .clickable { onDelete(item.index) }
+                                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                            HorizontalDivider(color = InputBorder, modifier = Modifier.padding(top = 6.dp))
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Text(
+                "Close",
+                color = AccentOrange,
+                modifier = Modifier.clickable { onDismiss() }.padding(8.dp)
+            )
+        }
+    )
 }
 
 // ==================== Session Mismatch Banner ====================
@@ -842,6 +1045,8 @@ private val PHASE_MAP = mapOf(
     "omni" to listOf("architecting", "reviewing", "executing", "auditing"),
     "justdoit" to listOf("implementing", "reviewing", "testing"),
     "deepreview" to listOf("claude_self_review", "codex_reviews_claude", "codex_self_review", "claude_reviews_codex"),
+    "ralph" to listOf("executing"),
+    "goal" to listOf("assessing", "executing", "verifying", "learning"),
 )
 
 private val PHASE_LABELS = mapOf(
@@ -856,6 +1061,9 @@ private val PHASE_LABELS = mapOf(
     "codex_reviews_claude" to "Codex Review",
     "codex_self_review" to "Codex Fix",
     "claude_reviews_codex" to "Claude Verify",
+    "assessing" to "Assess",
+    "verifying" to "Verify",
+    "learning" to "Learn",
 )
 
 private fun formatElapsed(seconds: Long): String {
@@ -874,6 +1082,8 @@ private fun formatElapsed(seconds: Long): String {
 private fun MissionControlContent(
     activeTasks: Map<String, ChatViewModel.ActiveTask>,
     scheduledTasks: List<ChatViewModel.ScheduledTask>,
+    cronJobs: List<ChatViewModel.CronJob>,
+    goals: List<ChatViewModel.GoalSummary>,
     onCancel: (String) -> Unit,
     onPause: (String) -> Unit,
     onResume: (String) -> Unit,
@@ -883,6 +1093,11 @@ private fun MissionControlContent(
     onEditSchedule: (taskId: String, prompt: String?, cronExpr: String?, runAt: String?) -> Unit,
     onDeleteSchedule: (String) -> Unit,
     onAddSchedule: () -> Unit,
+    onCancelCron: (String) -> Unit,
+    onPauseGoal: (String) -> Unit,
+    onResumeGoal: (String) -> Unit,
+    onCancelGoal: (String) -> Unit,
+    onDeleteGoal: (String) -> Unit,
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -893,52 +1108,42 @@ private fun MissionControlContent(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
         )
 
-        TabRow(
+        @Composable
+        fun TabBadge(label: String, count: Int, index: Int) {
+            Tab(selected = selectedTab == index, onClick = { selectedTab = index }) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(label, color = if (selectedTab == index) AccentOrange else SessionLabel, fontSize = 13.sp)
+                    if (count > 0) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "$count",
+                            fontSize = 11.sp,
+                            color = DarkSurface,
+                            modifier = Modifier
+                                .background(AccentOrange, RoundedCornerShape(8.dp))
+                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        val activeGoals = goals.filter { it.status in setOf("active", "paused", "planning") }
+        ScrollableTabRow(
             selectedTabIndex = selectedTab,
             containerColor = Color.Transparent,
             contentColor = AccentOrange,
             divider = { HorizontalDivider(color = InputBorder) },
+            edgePadding = 0.dp,
         ) {
-            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Active", color = if (selectedTab == 0) AccentOrange else SessionLabel)
-                    if (activeTasks.isNotEmpty()) {
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "${activeTasks.size}",
-                            fontSize = 11.sp,
-                            color = DarkSurface,
-                            modifier = Modifier
-                                .background(AccentOrange, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 5.dp, vertical = 1.dp)
-                        )
-                    }
-                }
-            }
-            Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Scheduled", color = if (selectedTab == 1) AccentOrange else SessionLabel)
-                    if (scheduledTasks.isNotEmpty()) {
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "${scheduledTasks.size}",
-                            fontSize = 11.sp,
-                            color = DarkSurface,
-                            modifier = Modifier
-                                .background(AccentOrange, RoundedCornerShape(8.dp))
-                                .padding(horizontal = 5.dp, vertical = 1.dp)
-                        )
-                    }
-                }
-            }
+            TabBadge("Active", activeTasks.size, 0)
+            TabBadge("Goals", activeGoals.size, 1)
+            TabBadge("Scheduled", scheduledTasks.size, 2)
+            TabBadge("Cron", cronJobs.size, 3)
         }
 
         when (selectedTab) {
@@ -970,6 +1175,15 @@ private fun MissionControlContent(
                 }
             }
             1 -> {
+                GoalsTab(
+                    goals = goals,
+                    onPause = onPauseGoal,
+                    onResume = onResumeGoal,
+                    onCancel = onCancelGoal,
+                    onDelete = onDeleteGoal,
+                )
+            }
+            2 -> {
                 ScheduledTasksTab(
                     tasks = scheduledTasks,
                     onToggle = onToggleSchedule,
@@ -978,6 +1192,9 @@ private fun MissionControlContent(
                     onDelete = onDeleteSchedule,
                     onAdd = onAddSchedule,
                 )
+            }
+            3 -> {
+                CronJobsTab(cronJobs = cronJobs, onCancel = onCancelCron)
             }
         }
 
@@ -1076,7 +1293,7 @@ private fun MissionControlRow(
         }
 
         // Row 4: Step count + Pause/Resume + Stop buttons
-        val isAutonomous = task.mode in setOf("omni", "justdoit", "deepreview")
+        val isAutonomous = task.mode in setOf("omni", "justdoit", "deepreview", "goal")
         Spacer(Modifier.height(4.dp))
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1158,7 +1375,8 @@ private fun PhaseStepper(phases: List<String>, currentPhase: String, dimmed: Boo
     }
 }
 
-/** Compact session filter button with dropdown menu. */
+/** Compact session filter button with dropdown menu. Long-press a session to hide it. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun SessionFilterButton(
     expanded: Boolean,
@@ -1167,6 +1385,9 @@ internal fun SessionFilterButton(
     sessions: List<String>,
     activeFilter: String?,
     onSelect: (String?) -> Unit,
+    hiddenCount: Int = 0,
+    onHide: (String) -> Unit = {},
+    onUnhideAll: () -> Unit = {},
 ) {
     Box(modifier = Modifier.testTag("session_filter")) {
         IconButton(onClick = onToggle) {
@@ -1189,12 +1410,26 @@ internal fun SessionFilterButton(
                 }
             )
             sessions.forEach { s ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            onClick = { onSelect(s) },
+                            onLongClick = { onHide(s) }
+                        )
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (activeFilter == s) Text("\u2713", color = AccentOrange, fontSize = 14.sp)
+                    Text(s, fontSize = 13.sp, maxLines = 1, color = if (activeFilter == s) AccentOrange else BotText)
+                }
+            }
+            if (hiddenCount > 0) {
+                HorizontalDivider(color = DarkSurfaceVariant)
                 DropdownMenuItem(
-                    text = { Text(s, fontSize = 13.sp, maxLines = 1, color = if (activeFilter == s) AccentOrange else BotText) },
-                    onClick = { onSelect(s) },
-                    leadingIcon = {
-                        if (activeFilter == s) Text("\u2713", color = AccentOrange, fontSize = 14.sp)
-                    }
+                    text = { Text("Show $hiddenCount hidden", fontSize = 12.sp, color = SessionLabel) },
+                    onClick = { onUnhideAll() }
                 )
             }
         }
@@ -1251,6 +1486,311 @@ private fun TypingIndicator() {
                         .size(7.dp)
                         .clip(CircleShape)
                         .background(AccentOrange.copy(alpha = alpha))
+                )
+            }
+        }
+    }
+}
+
+// ==================== Cron Background Jobs ====================
+
+@Composable
+private fun CronJobsTab(
+    cronJobs: List<ChatViewModel.CronJob>,
+    onCancel: (String) -> Unit,
+) {
+    if (cronJobs.isEmpty()) {
+        Text(
+            "No active cron jobs.\n\nCron jobs are created by Claude using CronCreate during a session (e.g. periodic monitoring).",
+            color = SessionLabel,
+            fontSize = 14.sp,
+            modifier = Modifier.padding(16.dp)
+        )
+    } else {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 500.dp)
+        ) {
+            items(cronJobs, key = { it.key }) { job ->
+                CronJobRow(job = job, onCancel = { onCancel(job.key) })
+                HorizontalDivider(color = InputBorder)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CronJobRow(
+    job: ChatViewModel.CronJob,
+    onCancel: () -> Unit,
+) {
+    val elapsed = formatElapsed(job.elapsed.toLong())
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        // Row 1: Session name + alive badge + elapsed
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                job.sessionName,
+                color = AccentOrange,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = if (job.alive) Color(0xFF4CAF50).copy(alpha = 0.2f) else Color(0xFFEF5350).copy(alpha = 0.2f)
+            ) {
+                Text(
+                    if (job.alive) "ALIVE" else "DEAD",
+                    color = if (job.alive) Color(0xFF4CAF50) else Color(0xFFEF5350),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(elapsed, color = SessionLabel, fontSize = 12.sp)
+        }
+
+        Spacer(Modifier.height(4.dp))
+
+        // Row 2: Cron expression
+        Text(
+            "cron: ${job.cron}",
+            color = SessionLabel,
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace,
+        )
+
+        // Row 3: Prompt (truncated)
+        if (job.prompt.isNotEmpty()) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                job.prompt,
+                color = SessionLabel.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        // Cancel button
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = Color(0xFFEF5350).copy(alpha = 0.15f),
+                modifier = Modifier.clickable { onCancel() }
+            ) {
+                Text(
+                    "Cancel",
+                    color = Color(0xFFEF5350),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+            }
+        }
+    }
+}
+
+// ==================== Goals ====================
+
+@Composable
+private fun GoalsTab(
+    goals: List<ChatViewModel.GoalSummary>,
+    onPause: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onCancel: (String) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    if (goals.isEmpty()) {
+        Text(
+            "No goals. Use /goal <description> to create one.",
+            color = SessionLabel,
+            fontSize = 14.sp,
+            modifier = Modifier.padding(16.dp)
+        )
+    } else {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 500.dp)
+        ) {
+            items(goals, key = { it.id }) { goal ->
+                GoalRow(
+                    goal = goal,
+                    onPause = { onPause(goal.id) },
+                    onResume = { onResume(goal.id) },
+                    onCancel = { onCancel(goal.id) },
+                    onDelete = { onDelete(goal.id) },
+                )
+                HorizontalDivider(color = InputBorder)
+            }
+        }
+    }
+}
+
+@Composable
+private fun GoalRow(
+    goal: ChatViewModel.GoalSummary,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onCancel: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val statusColor = when (goal.status) {
+        "active" -> Color(0xFF4CAF50)
+        "paused" -> AccentOrange
+        "completed" -> Color(0xFF2196F3)
+        "abandoned", "failed" -> Color(0xFFF44336)
+        "planning" -> Color(0xFF9C27B0)
+        else -> SessionLabel
+    }
+    val statusLabel = goal.status.replaceFirstChar { it.uppercase() }
+    val progress = if (goal.milestonesTotal > 0) goal.milestonesDone.toFloat() / goal.milestonesTotal else 0f
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { expanded = !expanded }
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+    ) {
+        // Row 1: Title + status badge
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                goal.title.ifEmpty { "Untitled Goal" },
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                statusLabel,
+                fontSize = 11.sp,
+                color = DarkSurface,
+                modifier = Modifier
+                    .background(statusColor, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+        }
+
+        Spacer(Modifier.height(6.dp))
+
+        // Row 2: Progress bar + milestone count
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp)),
+                color = statusColor,
+                trackColor = InputBorder,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "${goal.milestonesDone}/${goal.milestonesTotal}",
+                color = SessionLabel,
+                fontSize = 12.sp,
+            )
+        }
+
+        // Row 3: Iteration count + session
+        if (goal.currentIteration > 0 || goal.session.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                if (goal.currentIteration > 0) {
+                    Text("Iteration ${goal.currentIteration}", color = SessionLabel, fontSize = 11.sp)
+                }
+                if (goal.session.isNotEmpty()) {
+                    Text(goal.session, color = SessionLabel, fontSize = 11.sp)
+                }
+            }
+        }
+
+        // Row 4: Action buttons
+        val canPauseOrResume = goal.status in setOf("active", "paused")
+        val canDelete = !goal.isRunning
+        if (canPauseOrResume || canDelete) {
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (canPauseOrResume) {
+                    if (goal.isPaused || goal.status == "paused") {
+                        TextButton(
+                            onClick = onResume,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.height(28.dp),
+                        ) { Text("Resume", fontSize = 12.sp, color = Color(0xFF4CAF50)) }
+                    } else {
+                        TextButton(
+                            onClick = onPause,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.height(28.dp),
+                        ) { Text("Pause", fontSize = 12.sp, color = AccentOrange) }
+                    }
+                    TextButton(
+                        onClick = onCancel,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.height(28.dp),
+                    ) { Text("Cancel", fontSize = 12.sp, color = Color(0xFFF44336)) }
+                }
+                TextButton(
+                    onClick = onDelete,
+                    enabled = canDelete,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    modifier = Modifier.height(28.dp),
+                ) {
+                    Text(
+                        "Delete",
+                        fontSize = 12.sp,
+                        color = if (canDelete) Color(0xFFCF6679) else SessionLabel.copy(alpha = 0.45f),
+                    )
+                }
+            }
+        }
+
+        // Expanded: Milestone list
+        if (expanded && goal.milestones.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            goal.milestones.forEach { milestone ->
+                val icon = when (milestone.status) {
+                    "completed" -> "\u2705"
+                    "in_progress" -> "\uD83D\uDD04"
+                    "failed" -> "\u274C"
+                    "skipped" -> "\u23ED\uFE0F"
+                    else -> "\u2B1C"
+                }
+                Text(
+                    "$icon ${milestone.title}" + if (milestone.attempts > 0) " (${milestone.attempts} attempts)" else "",
+                    color = if (milestone.status == "completed") Color(0xFF4CAF50)
+                            else if (milestone.status == "in_progress") AccentOrange
+                            else SessionLabel,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(start = 8.dp, bottom = 2.dp),
                 )
             }
         }

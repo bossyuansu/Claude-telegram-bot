@@ -45,15 +45,16 @@ abstract class MessageDao {
         if (msg.messageId > 0) {
             val existing = findByMessageId(msg.messageId)
             if (existing != null) {
-                updateByMessageId(msg.messageId, msg.text, msg.session, msg.buttons)
+                updateByMessageId(msg.messageId, msg.text, msg.session, msg.buttons,
+                    msg.fileName, msg.fileSize, msg.mimeType, msg.downloadPath, msg.localFilePath, msg.fileChangesJson)
                 return
             }
         }
         insert(msg)
     }
 
-    @Query("UPDATE messages SET text = :text, session = :session, buttons = :buttons WHERE messageId = :messageId AND messageId > 0")
-    abstract suspend fun updateByMessageId(messageId: Int, text: String, session: String, buttons: String)
+    @Query("UPDATE messages SET text = :text, session = :session, buttons = :buttons, fileName = :fileName, fileSize = :fileSize, mimeType = :mimeType, downloadPath = :downloadPath, localFilePath = :localFilePath, fileChangesJson = :fileChangesJson WHERE messageId = :messageId AND messageId > 0")
+    abstract suspend fun updateByMessageId(messageId: Int, text: String, session: String, buttons: String, fileName: String, fileSize: Long, mimeType: String, downloadPath: String, localFilePath: String, fileChangesJson: String)
 
     @Query("SELECT * FROM messages WHERE messageId = :messageId AND messageId > 0 ORDER BY id DESC LIMIT 1")
     abstract suspend fun findByMessageId(messageId: Int): MessageEntity?

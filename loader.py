@@ -27,14 +27,20 @@ _STATE_KEYS = [
     "last_update_id",
     # Session and process state
     "user_sessions", "pending_questions", "active_processes",
-    "message_queue", "cancelled_sessions", "user_feedback_queue",
+    "message_queue", "claude_autocontinue_count", "cancelled_sessions", "user_feedback_queue",
     # Autonomous task state
     "justdoit_active", "deepreview_active", "omni_active",
+    "ralph_active", "go_pending", "cron_bg_sessions",
     # Scheduled tasks
     "scheduled_tasks", "_scheduled_tasks_lock", "_scheduler_generation",
-    # Threading locks (must survive to prevent races)
+    # Goal mode
+    "goal_active", "goal_state", "_goal_lock", "goal_pending",
+    # Threading locks and thread-locals (must survive to prevent races / orphaned state)
     "session_locks", "session_locks_lock",
     "_sessions_file_lock", "_active_sessions_lock",
+    # Thread-local objects — existing threads have attributes set on these;
+    # recreating them orphans those values, causing wrong WS session tags.
+    "_ws_suppress", "_ws_session_override", "_active_session_override",
     # Debounce state
     "_save_sessions_last", "_save_sessions_dirty",
     # Telegram poll backoff
@@ -50,7 +56,19 @@ def _hot_reload(source="SIGHUP"):
 
     # Snapshot state from current bot module
     state = {}
-    for key in _STATE_KEYS:
+    # Also preserve any threading.local objects found on the module
+    # (recreating them orphans thread-level attributes on running threads)
+    import threading as _th
+    _extra_keys = []
+    for _k in dir(bot):
+        if not _k.startswith("__"):
+            try:
+                _v = getattr(bot, _k)
+                if isinstance(_v, _th.local):
+                    _extra_keys.append(_k)
+            except Exception:
+                pass
+    for key in set(list(_STATE_KEYS) + _extra_keys):
         try:
             state[key] = getattr(bot, key)
         except AttributeError:
@@ -124,16 +142,29 @@ def _reload_api():
                 existing.add((path, frozenset(methods) if methods else None))
 
         added = 0
-        for route in new_app.routes:
-            path = getattr(route, "path", None)
-            methods = getattr(route, "methods", None)
+        updated = 0
+        for new_route in new_app.routes:
+            path = getattr(new_route, "path", None)
+            methods = getattr(new_route, "methods", None)
             key = (path, frozenset(methods) if methods else None)
-            if path and key not in existing:
-                live_app.routes.append(route)
+            if not path:
+                continue
+            if key in existing:
+                # Replace existing route with updated handler
+                for i, old_route in enumerate(live_app.routes):
+                    old_path = getattr(old_route, "path", None)
+                    old_methods = getattr(old_route, "methods", None)
+                    old_key = (old_path, frozenset(old_methods) if old_methods else None)
+                    if old_key == key:
+                        live_app.routes[i] = new_route
+                        updated += 1
+                        break
+            else:
+                live_app.routes.append(new_route)
                 added += 1
 
-        if added:
-            print(f"[Loader] Grafted {added} new API route(s).", flush=True)
+        if added or updated:
+            print(f"[Loader] Grafted {added} new, {updated} updated API route(s).", flush=True)
 
         # Put the live app back so everything references the same object
         api_mod.app = live_app
@@ -235,23 +266,55 @@ def main():
                         bot.send_message(chat_id, "❌ Failed to download image.")
                     continue
 
+                # Handle video uploads
+                video = message.get("video") or message.get("video_note") or message.get("animation")
+                if video:
+                    file_id = video.get("file_id")
+                    file_name = bot.telegram_video_filename(video)
+                    file_size = video.get("file_size", 0)
+
+                    if file_size > bot.MAX_TELEGRAM_FILE_BYTES:
+                        bot.send_message(chat_id, "❌ Video too large. Maximum size is 50MB.")
+                        continue
+
+                    bot.send_message(chat_id, f"🎥 _Downloading {file_name}..._")
+                    local_path = bot.download_telegram_file(file_id, file_name)
+                    if local_path:
+                        prompt = bot.build_video_analysis_prompt(local_path, text)
+                        print(f"Received video from {chat_id}: {file_name}, saved to {local_path}")
+                        bot.handle_message(chat_id, prompt)
+                    else:
+                        bot.send_message(chat_id, "❌ Failed to download video.")
+                    continue
+
                 # Handle document/file uploads
                 if message.get("document"):
                     doc = message["document"]
                     file_id = doc.get("file_id")
                     file_name = doc.get("file_name", "file")
                     file_size = doc.get("file_size", 0)
+                    is_video = bot.is_telegram_video_document(doc)
 
-                    if file_size > 50 * 1024 * 1024:
-                        bot.send_message(chat_id, "❌ File too large. Maximum size is 50MB.")
+                    if file_size > bot.MAX_TELEGRAM_FILE_BYTES:
+                        label = "Video" if is_video else "File"
+                        bot.send_message(chat_id, f"❌ {label} too large. Maximum size is 50MB.")
                         continue
 
-                    bot.send_message(chat_id, f"📄 _Downloading {file_name}..._")
+                    if is_video:
+                        file_name = bot.telegram_video_filename(doc)
+                        bot.send_message(chat_id, f"🎥 _Downloading {file_name}..._")
+                    else:
+                        bot.send_message(chat_id, f"📄 _Downloading {file_name}..._")
+
                     local_path = bot.download_telegram_file(file_id, file_name)
                     if local_path:
-                        prompt = f"[User uploaded a file: {local_path}]\n\n"
-                        prompt += text if text else "Please analyze this file."
-                        print(f"Received file from {chat_id}: {file_name}, saved to {local_path}")
+                        if is_video:
+                            prompt = bot.build_video_analysis_prompt(local_path, text)
+                            print(f"Received video document from {chat_id}: {file_name}, saved to {local_path}")
+                        else:
+                            prompt = f"[User uploaded a file: {local_path}]\n\n"
+                            prompt += text if text else "Please analyze this file."
+                            print(f"Received file from {chat_id}: {file_name}, saved to {local_path}")
                         bot.handle_message(chat_id, prompt)
                     else:
                         bot.send_message(chat_id, "❌ Failed to download file.")

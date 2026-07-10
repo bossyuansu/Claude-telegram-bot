@@ -36,7 +36,17 @@ data class WsMessage(
     val fileSize: Long = 0,
     val mimeType: String = "",
     val isImage: Boolean = false,
-    val downloadPath: String = ""
+    val downloadPath: String = "",
+    // Goal fields (for type="goal")
+    val goalEvent: String = "",    // started, milestone_started, milestone_completed, iteration, replan, completed, failed, paused, cancelled, escalation
+    val goalId: String = "",
+    val goalTitle: String = "",
+    val milestonesTotal: Int = 0,
+    val milestonesDone: Int = 0,
+    val milestoneTitle: String = "",
+    val iteration: Int = 0,
+    val outcome: String = "",      // success, failure (for iteration events)
+    val reason: String = "",       // pause/cancel reason
 )
 
 class WebSocketManager(
@@ -48,11 +58,9 @@ class WebSocketManager(
 ) {
     companion object {
         private const val TAG = "WS"
-        // If replay starts far ahead of expected seq, missed frames are likely
-        // outside the server's bounded buffer. Fast-forward to avoid deadlock.
-        private const val REPLAY_GAP_FAST_FORWARD = 200
     }
     private val client = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(30, TimeUnit.SECONDS)
         .build()
@@ -151,88 +159,7 @@ class WebSocketManager(
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (isStale(webSocket)) return
-                try {
-                    val json = JSONObject(text)
-
-                    // Handle server_hello — detect server restarts
-                    if (json.optString("type") == "server_hello") {
-                        val serverId = json.optString("server_id", "")
-                        val changed = knownServerId != serverId
-                        if (changed && knownServerId != null) {
-                            // Server restarted — notify app to clear stale state
-                            onServerRestart?.invoke()
-                        }
-                        // New server (restart or first connect) — accept whatever seq
-                        // the first replayed message has, since old numbering is gone.
-                        if (changed) {
-                            // Reset in-memory seq tracking (0 = accept next seq as starting point)
-                            // and reset persisted seq baseline to this new server instance.
-                            expectedSeq = 0
-                            lastSeq = 0
-                            pendingBuffer.clear()
-                            resendRequested = false
-                            onSeqUpdate?.invoke(0, serverId)
-                        }
-                        knownServerId = serverId
-                        return
-                    }
-
-                    val seq = json.optInt("seq", 0)
-
-                    val msg = parseMessage(json, seq)
-
-                    if (seq == 0) {
-                        // No seq (e.g. error frames) — deliver immediately
-                        onMessage(msg)
-                        return
-                    }
-
-                    // First message after server change — adopt its seq as starting point
-                    if (expectedSeq == 0) {
-                        expectedSeq = seq
-                        lastSeq = seq - 1
-                    }
-
-                    // Detect server restart: seq jumped back to near 1
-                    if (seq < expectedSeq && expectedSeq - seq > 100) {
-                        // Server restarted — reset seq tracking to accept new numbering
-                        pendingBuffer.clear()
-                        resendRequested = false
-                        expectedSeq = seq
-                        lastSeq = seq - 1
-                    }
-
-                    when {
-                        seq < expectedSeq -> {
-                            // Already delivered — discard duplicate
-                        }
-                        seq == expectedSeq -> {
-                            // In order — deliver and flush any consecutive buffered messages
-                            deliver(msg)
-                            flushPending()
-                        }
-                        else -> {
-                            // Out of order — buffer and request resend for the gap
-                            pendingBuffer[seq] = msg
-                            if (!resendRequested) {
-                                resendRequested = true
-                                val resendReq = JSONObject()
-                                    .put("type", "resend")
-                                    .put("from_seq", expectedSeq)
-                                    .toString()
-                                webSocket.send(resendReq)
-                            }
-                            if (msg.isReplay && (seq - expectedSeq) > REPLAY_GAP_FAST_FORWARD) {
-                                val next = pendingBuffer.firstKey()
-                                Log.w(TAG, "Large replay gap (${seq - expectedSeq}); fast-forwarding expectedSeq to $next")
-                                expectedSeq = next
-                                lastSeq = next - 1
-                                resendRequested = false
-                                flushPending()
-                            }
-                        }
-                    }
-                } catch (_: Exception) {}
+                handleIncomingText(text) { webSocket.send(it) }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -254,6 +181,99 @@ class WebSocketManager(
             }
         })
         ws = newWs
+    }
+
+    internal fun handleIncomingText(text: String, sendRaw: (String) -> Boolean = { ws?.send(it) ?: false }) {
+        try {
+            val json = JSONObject(text)
+
+            // Handle server_hello — detect server restarts
+            if (json.optString("type") == "server_hello") {
+                val serverId = json.optString("server_id", "")
+                val changed = knownServerId != serverId
+                if (changed && knownServerId != null) {
+                    // Server restarted — notify app to clear stale state
+                    onServerRestart?.invoke()
+                }
+                // New server (restart or first connect) — accept whatever seq
+                // the first replayed message has, since old numbering is gone.
+                if (changed) {
+                    // Reset in-memory seq tracking (0 = accept next seq as starting point)
+                    // and reset persisted seq baseline to this new server instance.
+                    expectedSeq = 0
+                    lastSeq = 0
+                    pendingBuffer.clear()
+                    resendRequested = false
+                    onSeqUpdate?.invoke(0, serverId)
+                }
+                knownServerId = serverId
+                return
+            }
+
+            val seq = json.optInt("seq", 0)
+
+            val msg = parseMessage(json, seq)
+
+            if (seq == 0) {
+                // No seq (e.g. error frames) — deliver immediately
+                onMessage(msg)
+                return
+            }
+
+            // First message after server change — adopt its seq as starting point
+            if (expectedSeq == 0) {
+                expectedSeq = seq
+                lastSeq = seq - 1
+            }
+
+            // Detect server restart: seq jumped back to near 1
+            if (seq < expectedSeq && expectedSeq - seq > 100) {
+                // Server restarted — reset seq tracking to accept new numbering
+                pendingBuffer.clear()
+                resendRequested = false
+                expectedSeq = seq
+                lastSeq = seq - 1
+            }
+
+            when {
+                seq < expectedSeq -> {
+                    // Already delivered — discard duplicate
+                }
+                seq == expectedSeq -> {
+                    // In order — deliver and flush any consecutive buffered messages
+                    deliver(msg)
+                    flushPending()
+                }
+                else -> {
+                    // Out of order — buffer it.
+                    pendingBuffer[seq] = msg
+                    if (msg.isReplay) {
+                        // A replayed/resent message that still sits ABOVE our gap means the
+                        // server no longer has the missing seqs (evicted from its bounded replay
+                        // buffer) — the gap is UNFILLABLE. Without this, the client waited forever
+                        // for messages that no longer exist and the whole stream froze. Skip it:
+                        // jump to the earliest message we do have and deliver, accepting the
+                        // discontinuity (recent messages beat a permanently-stuck stream).
+                        val skipTo = pendingBuffer.keys.minOrNull() ?: seq
+                        Log.w(TAG, "Unfillable gap [$expectedSeq..${skipTo - 1}] " +
+                                "(${skipTo - expectedSeq} lost msgs) — skipping forward")
+                        expectedSeq = skipTo
+                        resendRequested = false
+                        flushPending()
+                    } else if (!resendRequested) {
+                        // Live message ahead of a gap — ask the server to resend the missing span.
+                        // If the server still has it, the gap fills; if not, the resend response
+                        // comes back marked is_replay and the branch above skips it.
+                        resendRequested = true
+                        val resendReq = JSONObject()
+                            .put("type", "resend")
+                            .put("from_seq", expectedSeq)
+                            .toString()
+                        sendRaw(resendReq)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     /** Deliver a message and advance the expected seq. */
@@ -333,7 +353,16 @@ class WebSocketManager(
             fileSize = json.optLong("file_size", 0),
             mimeType = json.optString("mime_type", ""),
             isImage = json.optBoolean("is_image", false),
-            downloadPath = json.optString("file_path", "")
+            downloadPath = json.optString("file_path", ""),
+            goalEvent = json.optString("event", ""),
+            goalId = json.optString("goal_id", ""),
+            goalTitle = json.optString("title", ""),
+            milestonesTotal = json.optInt("milestones_total", 0),
+            milestonesDone = json.optInt("milestones_done", 0),
+            milestoneTitle = json.optString("milestone_title", ""),
+            iteration = json.optInt("iteration", 0),
+            outcome = json.optString("outcome", ""),
+            reason = json.optString("reason", "")
         )
     }
 
@@ -344,7 +373,8 @@ class WebSocketManager(
         }
         onStateChange(ConnectionState.RECONNECTING)
         reconnectAttempt++
-        val delay = minOf(1000L * (1L shl minOf(reconnectAttempt, 5)), 30_000L)
+        // Fast retries: 500ms, 1s, 2s, 4s, 8s, then cap at 15s
+        val delay = minOf(500L * (1L shl minOf(reconnectAttempt - 1, 4)), 15_000L)
         Log.d(TAG, "scheduleReconnect attempt=$reconnectAttempt delay=${delay}ms")
 
         reconnectThread = Thread {
