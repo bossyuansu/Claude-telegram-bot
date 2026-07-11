@@ -5723,6 +5723,7 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
         process = subprocess.Popen(
             cmd, cwd=cwd or os.getcwd(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdin=subprocess.DEVNULL,  # codex blocks reading stdin if it's a tty/pipe; feed EOF explicitly
             start_new_session=True
         )
         if process_key:
@@ -6408,6 +6409,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
             process = subprocess.Popen(
                 cmd, cwd=cwd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,  # codex blocks reading stdin if it's a tty/pipe; feed EOF explicitly
                 start_new_session=True
             )
 
@@ -7408,7 +7410,8 @@ RESPOND WITH ONE OF:
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            stdin=subprocess.DEVNULL,  # codex blocks reading stdin if it's a tty/pipe; feed EOF explicitly
         )
 
         stdout, stderr = process.communicate(timeout=300)
@@ -8991,7 +8994,8 @@ This is the final gate. Be thorough but fair."""
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            stdin=subprocess.DEVNULL,  # codex blocks reading stdin if it's a tty/pipe; feed EOF explicitly
         )
 
         stdout, stderr = process.communicate(timeout=1800)
@@ -9175,7 +9179,8 @@ Focus on correctness, design, and architecture — not cosmetics."""
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            stdin=subprocess.DEVNULL,  # codex blocks reading stdin if it's a tty/pipe; feed EOF explicitly
         )
 
         stdout, stderr = process.communicate(timeout=1800)
@@ -9277,7 +9282,8 @@ Do not nitpick cosmetics."""
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            stdin=subprocess.DEVNULL,  # codex blocks reading stdin if it's a tty/pipe; feed EOF explicitly
         )
 
         stdout, stderr = process.communicate(timeout=1800)
