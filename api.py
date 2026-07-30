@@ -87,6 +87,15 @@ _WS_BUFFER_MAX = 1500  # replay window; transient stream chunks no longer consum
                        # now holds ~1500 meaningful events (messages/status/goal/start/done)
 _server_id = str(uuid.uuid4())[:8]  # Unique ID per server boot
 
+# In-progress stream snapshots: message_id -> {"chat_id","session","text"}. Transient append
+# chunks aren't buffered (they'd flood the replay window), so a client that drops mid-stream — e.g.
+# a phone on a flaky Tailscale DERP relay — loses every append in the gap and reconnects with
+# nothing to replay, freezing the live view until the far-off 'done'. We keep the running text per
+# active stream (bounded: one entry per stream, popped on 'done') and replay it on reconnect so the
+# app always catches up to the current in-progress content.
+_active_streams: dict[int, dict] = {}
+_ACTIVE_STREAM_TEXT_CAP = 200_000  # guard against unbounded growth on a runaway stream
+
 
 def _with_replay_flag(payload: str, is_replay: bool) -> str:
     """Return payload JSON with explicit replay flag for client-side UX decisions."""
@@ -489,9 +498,34 @@ def broadcast_ws(chat_id, event_type, data):
     """
     global _ws_seq
 
+    # Creation time (epoch ms), stamped into the payload now — this is when the message/event was
+    # created, not when the app receives it. Because the stamped payload is what gets buffered and
+    # later replayed, replayed messages keep their ORIGINAL creation time instead of "now".
+    _created_ms = int(time.time() * 1000)
+
     with _ws_lock:
         clients = list(_ws_clients)
         has_clients = bool(clients)
+
+        # Maintain per-stream running-text snapshots for reconnect catch-up. Done before the
+        # transient/no-clients early-return below so appends are captured even during a client gap.
+        if event_type == "stream":
+            op = str(data.get("op", "")).lower()
+            mid = data.get("message_id")
+            if mid is not None:
+                if op == "start":
+                    _active_streams[mid] = {
+                        "chat_id": int(chat_id),
+                        "session": data.get("session", ""),
+                        "text": "",
+                        "created_at": _created_ms,
+                    }
+                elif op == "append":
+                    snap = _active_streams.get(mid)
+                    if snap is not None and len(snap["text"]) < _ACTIVE_STREAM_TEXT_CAP:
+                        snap["text"] += data.get("text", "")
+                elif op == "done":
+                    _active_streams.pop(mid, None)
 
         # High-volume live-view stream chunks (append/tool/skip) get NO monotonic seq and are
         # never buffered. Otherwise, streaming an autonomous goal's executor token-by-token fills
@@ -508,6 +542,7 @@ def broadcast_ws(chat_id, event_type, data):
                 "type": event_type,
                 "chat_id": int(chat_id),
                 "is_replay": False,
+                "created_at": _created_ms,
                 **data,
             })
         else:
@@ -526,6 +561,7 @@ def broadcast_ws(chat_id, event_type, data):
                 "type": event_type,
                 "chat_id": int(chat_id),
                 "is_replay": False,
+                "created_at": _created_ms,
                 **data,
             })
 
@@ -1644,6 +1680,23 @@ async def ws_endpoint(
             await websocket.send_text(_with_replay_flag(payload, True))
             if (i + 1) % 10 == 0:
                 await asyncio.sleep(0.05)
+        except Exception:
+            break
+
+    # Catch up any in-progress streams whose appends were lost during the client's gap. The
+    # buffered 'start' (above) reset the message text to ""; re-send 'start' (idempotent clear)
+    # then one 'append' carrying the full running text so the live view resumes where it is.
+    with _ws_lock:
+        active_snapshot = [(m, dict(s)) for m, s in _active_streams.items()]
+    for mid, snap in active_snapshot:
+        if not snap["text"]:
+            continue
+        base = {"type": "stream", "chat_id": snap["chat_id"], "message_id": mid,
+                "session": snap["session"], "seq": 0, "is_replay": True,
+                "created_at": snap.get("created_at", 0)}
+        try:
+            await websocket.send_text(json.dumps({**base, "op": "start"}))
+            await websocket.send_text(json.dumps({**base, "op": "append", "text": snap["text"]}))
         except Exception:
             break
 

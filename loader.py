@@ -122,6 +122,11 @@ def _reload_api():
     live_lock = getattr(api_mod, "_ws_lock", None)
     live_buffer = getattr(api_mod, "_ws_buffer", None)
     live_seq = getattr(api_mod, "_ws_seq", None)
+    # Preserve the server identity across hot reload: a reload is NOT a restart, so _server_id
+    # must stay stable. Otherwise the reloaded module regenerates it, the app sees a "new server"
+    # in server_hello, resets its lastSeq, and reconnects with last_seq=0 → full-buffer replay of
+    # old messages to the app.
+    live_server_id = getattr(api_mod, "_server_id", None)
 
     try:
         importlib.reload(api_mod)
@@ -180,6 +185,8 @@ def _reload_api():
         api_mod._ws_buffer = live_buffer
     if live_seq is not None:
         api_mod._ws_seq = live_seq
+    if live_server_id is not None:
+        api_mod._server_id = live_server_id
 
     print("[Loader] api.py reloaded.", flush=True)
 
