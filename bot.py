@@ -4507,31 +4507,6 @@ def run_claude(prompt, cwd=None, continue_session=False, extra_args=None, model=
         return f"Error running Claude: {e}", []
 
 
-def _cron_interval_seconds(cron_expr: str) -> int:
-    """Estimate the interval in seconds from a 5-field cron expression.
-
-    Handles common patterns: */N minutes, hourly, daily. Defaults to 3600 for
-    anything complex. Used to set stale timeouts for CronCreate sessions.
-    """
-    parts = cron_expr.strip().split()
-    if len(parts) < 5:
-        return 3600
-    minute, hour = parts[0], parts[1]
-    # */N in minute field = every N minutes
-    if minute.startswith("*/"):
-        try:
-            return int(minute[2:]) * 60
-        except ValueError:
-            pass
-    # Specific minute + wildcard hour = hourly
-    if hour == "*" and minute.isdigit():
-        return 3600
-    # Specific minute + specific hour = daily
-    if minute.isdigit() and hour.isdigit():
-        return 86400
-    return 3600
-
-
 def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, session_id=None, session=None, stale_timeout=None, model=None):
     """Run Claude CLI with streaming output to Telegram.
 
@@ -4698,30 +4673,6 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                     "content": tool_input.get("content", "")[:3000],
                 })
                 current_tool = tool_name
-            elif tool_name == "CronCreate":
-                # Bump stale timeout so watchdog doesn't kill the session between cron ticks
-                nonlocal _effective_stale_timeout, _cron_bg_key
-                cron_expr = tool_input.get("cron", "")
-                interval_s = _cron_interval_seconds(cron_expr)
-                new_timeout = max(_effective_stale_timeout or 0, interval_s * 3, 900)  # at least 15min
-                if new_timeout != _effective_stale_timeout:
-                    print(f"[STREAM] CronCreate detected (cron={cron_expr!r}, interval~{interval_s}s), "
-                          f"bumping stale_timeout {_effective_stale_timeout} → {new_timeout}s", flush=True)
-                    _effective_stale_timeout = new_timeout
-                # Move process to background slot so session is free for new messages
-                if not _cron_bg_key:
-                    _cron_bg_key = f"cron:{process_key}"
-                    proc = active_processes.pop(process_key, None)
-                    if proc:
-                        active_processes[_cron_bg_key] = proc
-                    cron_bg_sessions[_cron_bg_key] = {
-                        "session_name": _stream_session or process_key,
-                        "cron": cron_expr,
-                        "prompt": tool_input.get("prompt", "")[:200],
-                        "started": time.time(),
-                    }
-                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
-                    print(f"[STREAM] Cron session moved to background slot: {_cron_bg_key}", flush=True)
             elif tool_name in ["Bash", "Read", "Glob", "Grep"]:
                 path = tool_input.get("file_path") or tool_input.get("command") or tool_input.get("pattern") or ""
                 file_changes.append({"type": tool_name.lower(), "path": path[:100]})

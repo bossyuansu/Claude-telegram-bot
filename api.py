@@ -1096,44 +1096,6 @@ def api_trigger_schedule_task(task_id: str, _=Depends(verify_auth)):
 
 # --- Cron background jobs ---
 
-@app.get("/api/cron-jobs")
-def get_cron_jobs(_=Depends(verify_auth)):
-    """List active cron background jobs (Claude CronCreate sessions)."""
-    import time as _time
-    jobs = []
-    for key, info in dict(_cron_bg_sessions).items():
-        alive = key in _active_processes
-        jobs.append({
-            "key": key,
-            "session_name": info.get("session_name", ""),
-            "cron": info.get("cron", ""),
-            "prompt": info.get("prompt", ""),
-            "started": info.get("started", 0),
-            "elapsed": int(_time.time() - info.get("started", _time.time())),
-            "alive": alive,
-        })
-    return {"cron_jobs": jobs}
-
-
-@app.delete("/api/cron-jobs/{key:path}")
-def cancel_cron_job(key: str, _=Depends(verify_auth)):
-    """Cancel a cron background job by its key (e.g. 'cron:session_id')."""
-    import signal as _signal
-    info = _cron_bg_sessions.pop(key, None)
-    if not info:
-        raise HTTPException(status_code=404, detail="Cron job not found")
-    proc = _active_processes.pop(key, None)
-    if proc:
-        try:
-            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    return {"status": "cancelled", "session_name": info.get("session_name", "")}
-
-
 # --- Message queue management ---
 
 @app.get("/api/queue/{session_id}")

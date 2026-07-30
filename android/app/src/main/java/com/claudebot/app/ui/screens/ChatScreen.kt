@@ -812,7 +812,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
         }
 
         if (showMissionControl) {
-            LaunchedEffect(Unit) { viewModel.fetchScheduledTasks(); viewModel.fetchCronJobs(); viewModel.fetchGoals() }
+            LaunchedEffect(Unit) { viewModel.fetchScheduledTasks(); viewModel.fetchGoals() }
             var showAddSchedule by remember { mutableStateOf(false) }
             ModalBottomSheet(
                 onDismissRequest = { showMissionControl = false },
@@ -822,7 +822,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 MissionControlContent(
                     activeTasks = viewModel.activeTasks,
                     scheduledTasks = viewModel.scheduledTasks,
-                    cronJobs = viewModel.cronJobs,
                     goals = viewModel.goals,
                     onCancel = { viewModel.cancelTask(it) },
                     onPause = { viewModel.pauseTask(it) },
@@ -838,7 +837,6 @@ fun ChatScreen(viewModel: ChatViewModel) {
                     },
                     onDeleteSchedule = { viewModel.deleteScheduledTask(it) },
                     onAddSchedule = { showAddSchedule = true },
-                    onCancelCron = { viewModel.cancelCronJob(it) },
                     onPauseGoal = { viewModel.pauseGoal(it) },
                     onResumeGoal = { viewModel.resumeGoal(it) },
                     onCancelGoal = { viewModel.cancelGoal(it) },
@@ -1082,7 +1080,6 @@ private fun formatElapsed(seconds: Long): String {
 private fun MissionControlContent(
     activeTasks: Map<String, ChatViewModel.ActiveTask>,
     scheduledTasks: List<ChatViewModel.ScheduledTask>,
-    cronJobs: List<ChatViewModel.CronJob>,
     goals: List<ChatViewModel.GoalSummary>,
     onCancel: (String) -> Unit,
     onPause: (String) -> Unit,
@@ -1093,7 +1090,6 @@ private fun MissionControlContent(
     onEditSchedule: (taskId: String, prompt: String?, cronExpr: String?, runAt: String?) -> Unit,
     onDeleteSchedule: (String) -> Unit,
     onAddSchedule: () -> Unit,
-    onCancelCron: (String) -> Unit,
     onPauseGoal: (String) -> Unit,
     onResumeGoal: (String) -> Unit,
     onCancelGoal: (String) -> Unit,
@@ -1143,7 +1139,6 @@ private fun MissionControlContent(
             TabBadge("Active", activeTasks.size, 0)
             TabBadge("Goals", activeGoals.size, 1)
             TabBadge("Scheduled", scheduledTasks.size, 2)
-            TabBadge("Cron", cronJobs.size, 3)
         }
 
         when (selectedTab) {
@@ -1192,9 +1187,6 @@ private fun MissionControlContent(
                     onDelete = onDeleteSchedule,
                     onAdd = onAddSchedule,
                 )
-            }
-            3 -> {
-                CronJobsTab(cronJobs = cronJobs, onCancel = onCancelCron)
             }
         }
 
@@ -1486,117 +1478,6 @@ private fun TypingIndicator() {
                         .size(7.dp)
                         .clip(CircleShape)
                         .background(AccentOrange.copy(alpha = alpha))
-                )
-            }
-        }
-    }
-}
-
-// ==================== Cron Background Jobs ====================
-
-@Composable
-private fun CronJobsTab(
-    cronJobs: List<ChatViewModel.CronJob>,
-    onCancel: (String) -> Unit,
-) {
-    if (cronJobs.isEmpty()) {
-        Text(
-            "No active cron jobs.\n\nCron jobs are created by Claude using CronCreate during a session (e.g. periodic monitoring).",
-            color = SessionLabel,
-            fontSize = 14.sp,
-            modifier = Modifier.padding(16.dp)
-        )
-    } else {
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(max = 500.dp)
-        ) {
-            items(cronJobs, key = { it.key }) { job ->
-                CronJobRow(job = job, onCancel = { onCancel(job.key) })
-                HorizontalDivider(color = InputBorder)
-            }
-        }
-    }
-}
-
-@Composable
-private fun CronJobRow(
-    job: ChatViewModel.CronJob,
-    onCancel: () -> Unit,
-) {
-    val elapsed = formatElapsed(job.elapsed.toLong())
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp)
-    ) {
-        // Row 1: Session name + alive badge + elapsed
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(
-                job.sessionName,
-                color = AccentOrange,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Surface(
-                shape = RoundedCornerShape(4.dp),
-                color = if (job.alive) Color(0xFF4CAF50).copy(alpha = 0.2f) else Color(0xFFEF5350).copy(alpha = 0.2f)
-            ) {
-                Text(
-                    if (job.alive) "ALIVE" else "DEAD",
-                    color = if (job.alive) Color(0xFF4CAF50) else Color(0xFFEF5350),
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                )
-            }
-            Spacer(Modifier.width(8.dp))
-            Text(elapsed, color = SessionLabel, fontSize = 12.sp)
-        }
-
-        Spacer(Modifier.height(4.dp))
-
-        // Row 2: Cron expression
-        Text(
-            "cron: ${job.cron}",
-            color = SessionLabel,
-            fontSize = 12.sp,
-            fontFamily = FontFamily.Monospace,
-        )
-
-        // Row 3: Prompt (truncated)
-        if (job.prompt.isNotEmpty()) {
-            Spacer(Modifier.height(2.dp))
-            Text(
-                job.prompt,
-                color = SessionLabel.copy(alpha = 0.7f),
-                fontSize = 12.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-
-        // Cancel button
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-            Surface(
-                shape = RoundedCornerShape(6.dp),
-                color = Color(0xFFEF5350).copy(alpha = 0.15f),
-                modifier = Modifier.clickable { onCancel() }
-            ) {
-                Text(
-                    "Cancel",
-                    color = Color(0xFFEF5350),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                 )
             }
         }

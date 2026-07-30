@@ -83,17 +83,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     )
     val scheduledTasks = mutableStateListOf<ScheduledTask>()
 
-    // Cron background jobs (Claude CronCreate sessions)
-    data class CronJob(
-        val key: String,
-        val sessionName: String,
-        val cron: String,
-        val prompt: String,
-        val started: Long,
-        val elapsed: Int,
-        val alive: Boolean,
-    )
-    val cronJobs = mutableStateListOf<CronJob>()
 
     // Goal mode state
     data class GoalMilestone(
@@ -1038,54 +1027,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } catch (_: Exception) {}
         }.start()
-    }
-
-    fun fetchCronJobs() {
-        Thread {
-            try {
-                val url = "http://${settings.host}:${settings.port}/api/cron-jobs"
-                val reqBuilder = Request.Builder().url(url).get()
-                if (settings.token.isNotBlank()) {
-                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
-                }
-                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-                    if (!resp.isSuccessful) return@Thread
-                    val obj = JSONObject(resp.body?.string() ?: return@Thread)
-                    val arr = obj.getJSONArray("cron_jobs")
-                    val jobs = mutableListOf<CronJob>()
-                    for (i in 0 until arr.length()) {
-                        val j = arr.getJSONObject(i)
-                        jobs.add(CronJob(
-                            key = j.optString("key"),
-                            sessionName = j.optString("session_name"),
-                            cron = j.optString("cron"),
-                            prompt = j.optString("prompt"),
-                            started = j.optLong("started"),
-                            elapsed = j.optInt("elapsed"),
-                            alive = j.optBoolean("alive", true),
-                        ))
-                    }
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        cronJobs.clear()
-                        cronJobs.addAll(jobs)
-                    }
-                }
-            } catch (_: Exception) {}
-        }.start()
-    }
-
-    fun cancelCronJob(key: String) {
-        sendExecutor.submit {
-            try {
-                val url = "http://${settings.host}:${settings.port}/api/cron-jobs/${java.net.URLEncoder.encode(key, "UTF-8")}"
-                val reqBuilder = Request.Builder().url(url).delete()
-                if (settings.token.isNotBlank()) {
-                    reqBuilder.header("Authorization", "Bearer ${settings.token}")
-                }
-                httpClient.newCall(reqBuilder.build()).execute().use { /* ignore */ }
-                fetchCronJobs()
-            } catch (_: Exception) {}
-        }
     }
 
     // Queue management
