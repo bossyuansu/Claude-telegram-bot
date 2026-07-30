@@ -46,7 +46,7 @@ CLAUDE_GENERAL_MODEL = os.environ.get("CLAUDE_GENERAL_MODEL", os.environ.get("CL
 # Planning (decomposition, assessment, verification, /go routing) defaults to Opus. Fable 5
 # (claude-fable-5) was trialed here and works, but reverted to Opus per request; set
 # CLAUDE_PLANNING_MODEL to override (e.g. claude-fable-5).
-CLAUDE_PLANNING_MODEL = os.environ.get("CLAUDE_PLANNING_MODEL", "opus")
+CLAUDE_PLANNING_MODEL = os.environ.get("CLAUDE_PLANNING_MODEL", "claude-fable-5")
 CLAUDE_MODEL = CLAUDE_GENERAL_MODEL  # Backward-compatible alias for general Claude calls.
 # Cheapest/fastest model for trivial binary judgments (e.g. classifying a failed verification
 # command as transient-infra vs real failure). No need for a planning-tier model here.
@@ -593,6 +593,39 @@ def release_goal_session(chat_id, session_id, goal_id=None):
     save_active_tasks()
 
 
+def _terminate_session_process(session_id, reason="cleanup"):
+    """Kill any in-flight CLI subprocess (codex/claude) for this session + its cron slot.
+
+    So an autonomous loop that ends for ANY reason (cancel, complete, abandon, error, crash) never
+    leaves an orphaned subprocess still running against the repo. Idempotent; a no-op when nothing
+    is running. Mirrors the /cancel kill path (killpg the whole process group, close stdout).
+    """
+    import signal
+    killed = False
+    for key in (session_id, f"cron:{session_id}"):
+        process = active_processes.get(key)
+        if not process:
+            continue
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            killed = True
+        except Exception:
+            pass
+        try:
+            if process.stdout:
+                process.stdout.close()
+        except Exception:
+            pass
+        active_processes.pop(key, None)
+        try:
+            cron_bg_sessions.pop(key, None)
+        except Exception:
+            pass
+    if killed:
+        print(f"[cleanup] Terminated in-flight process for session {session_id} ({reason})", flush=True)
+    return killed
+
+
 def cancel_goal_session(chat_id, session_id, goal_id=None, reason="cancelled"):
     """Mark a goal abandoned, unblock its loop, and remove active goal indexes."""
     chat_key = _chat_session_key(chat_id, session_id)
@@ -610,6 +643,12 @@ def cancel_goal_session(chat_id, session_id, goal_id=None, reason="cancelled"):
         active_goal_id = goal_id or active_goal_id or goal_active.get(chat_key)
         if active_goal_id:
             goal_active.pop(chat_key, None)
+
+    # Cleanup: flag the session cancelled so any pending spawn short-circuits, and kill the
+    # in-flight subprocess so cancelling never orphans a running codex/claude (regression: an
+    # old loop kept a codex alive after cancel — goal_7611e829).
+    cancelled_sessions.add(session_id)
+    _terminate_session_process(session_id, reason=f"goal {reason}")
 
     if not active_goal_id:
         return None
@@ -1773,9 +1812,30 @@ def _goal_untrusted_block(label, text, limit=6000):
     )
 
 
+# Genuine rate-limit/quota signals ONLY — either the structured "QUOTA:<n>" marker that
+# run_codex / run_codex_review emit from the real error channel (stderr / non-zero exit), or an
+# actual CLI usage-limit error statement. Deliberately strict: a model's ANSWER that merely
+# discusses rate-limiting/debounce (e.g. a goal to build object-location rate-limit logic writes
+# "we rate-limit ...", "the limit resets after the TTL") must NOT false-fire a spurious pause.
+# The broad QUOTA_REGEX previously scanned model answers here and did exactly that (4th recurrence
+# of the "never pattern-match model output for infra signatures" rule). See goal-transient-regex-split.
+_GOAL_REAL_QUOTA_RE = re.compile(
+    r"^\s*QUOTA:\d+\b"                                   # structured marker from codex paths
+    r"|usage limit (?:reached|exceeded)"
+    r"|\b\d+[ -]hour limit reached"
+    r"|rate limit (?:reached|exceeded)"
+    r"|\btoo many requests\b"
+    r"|\bquota exceeded\b"
+    r"|(?:^|\s)429(?:\s|$|[,.\-:])"
+    r"|you(?:'ve| have) (?:hit|reached|exceeded)[^.\n]{0,40}\blimit"
+    r"|\blimit will reset\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _goal_detect_model_issue(text, context="model call", goal_or_config=None):
     body = text or ""
-    if QUOTA_REGEX.search(body):
+    if _GOAL_REAL_QUOTA_RE.search(body):
         wait_seconds, reset_time = _parse_reset_wait(body)
         if reset_time is None:
             wait_seconds = _goal_rate_limit_max_wait(goal_or_config)
@@ -3154,6 +3214,9 @@ def _run_goal_loop(chat_id, session_id, goal_id):
         "milestones_done": done,
     })
 
+    _send_workspace_preflight(chat_id, goal.get("cwd", os.getcwd()),
+                              goal.get("title") or goal.get("description", ""), "Goal")
+
     config = goal.get("config", {})
     max_iterations = config.get("max_iterations", 50)
     max_consecutive_failures = config.get("max_consecutive_failures", 5)
@@ -3658,6 +3721,10 @@ def _run_goal_loop(chat_id, session_id, goal_id):
                 _schedule_goal_checkin(final_goal)
         except Exception:
             pass
+        # Never leave an orphaned subprocess behind, whatever the exit reason
+        # (complete / abandon / pause / error / crash).
+        _terminate_session_process(session_id, reason="goal loop exit")
+        cancelled_sessions.discard(session_id)
         # Clean up active state
         release_goal_session(chat_id, session_id, goal_id)
         _ws_broadcast_status(chat_id, "goal", "", 0, active=False)
@@ -5913,6 +5980,14 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
                 edit_message(chat_id, ws_msg_id, final_tg[:3950] + "\n\n_(...truncated)_", force=True)
             _ws_suppress.active = False
 
+        # A REAL codex quota/rate-limit lands on stderr as an ERROR: line (the true error channel),
+        # not in the answer prose. Surface it as the structured "QUOTA:<min>" marker so the goal
+        # loop can pause on a genuine signal — never by scanning the model's answer text.
+        if not result:
+            codex_reason = _codex_stderr_reason("\n".join(stderr_lines), getattr(process, "returncode", None))
+            if codex_reason and codex_reason.startswith("QUOTA:"):
+                print(f"[Codex] Quota surfaced from stderr: {codex_reason[:120]}", flush=True)
+                return codex_reason
         if timed_out and not result and stderr_lines:
             print(f"run_codex: stale timeout, stderr: {stderr_lines[-1][:300]}", flush=True)
         if chat_id is not None and session and result:
@@ -7216,6 +7291,143 @@ def drain_user_feedback(chat_key):
     return formatted
 
 
+# === Workspace scope guard =================================================================
+# Anchors autonomous loops (justdoit / deepreview / goal) to a VERIFIED diff-vs-base instead of
+# the ambient working tree. Prevents the wasted-effort class where a loop reviews/fixes a stale,
+# dirty, or wrong-branch checkout — re-litigating already-merged work or stranding fixes on the
+# wrong branch. Two layers: (1) a SCOPE block injected into review prompts so the model can only
+# reason about the real diff and self-corrects if it drifts; (2) a preflight hazard check surfaced
+# to the user at loop start instead of silently burning iterations.
+_WS_BEHIND_HAZARD = 10        # commits behind base => stale checkout; work likely moved/merged
+_WS_SCOPE_BLEED_FILES = 30    # uncommitted files => mixed/shared checkout with unrelated work
+
+
+def _git_out(cwd, *args, timeout=10):
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                           text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _workspace_probe(cwd):
+    """Resolve git work-scope for a loop cwd. Returns a dict, or None if cwd isn't a git repo."""
+    if not cwd:
+        return None
+    root = _git_out(cwd, "rev-parse", "--show-toplevel")
+    if not root:
+        return None
+    branch = _git_out(cwd, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+    head = _git_out(cwd, "rev-parse", "--short", "HEAD") or "?"
+    base = _git_out(cwd, "rev-parse", "--abbrev-ref", "origin/HEAD")
+    if not base:
+        for cand in ("origin/main", "origin/master", "main", "master"):
+            if _git_out(cwd, "rev-parse", "--verify", cand):
+                base = cand
+                break
+    behind = ahead = None
+    if base:
+        lr = _git_out(cwd, "rev-list", "--left-right", "--count", f"{base}...HEAD")
+        if lr and "\t" in lr:
+            try:
+                b, a = lr.split("\t")[:2]
+                behind, ahead = int(b), int(a)
+            except ValueError:
+                pass
+    porcelain = _git_out(cwd, "status", "--porcelain") or ""
+    dirty = [ln[3:] for ln in porcelain.splitlines() if ln.strip()]
+    changed_vs_base = []
+    if base:
+        cvb = _git_out(cwd, "diff", "--name-only", f"{base}...HEAD")
+        changed_vs_base = [x for x in (cvb or "").splitlines() if x]
+    worktrees = []
+    wt = _git_out(cwd, "worktree", "list", "--porcelain") or ""
+    cur_path = None
+    for ln in wt.splitlines():
+        if ln.startswith("worktree "):
+            cur_path = ln[len("worktree "):]
+        elif ln.startswith("branch "):
+            worktrees.append((cur_path, ln[len("branch "):].replace("refs/heads/", "")))
+        elif not ln.strip():
+            cur_path = None
+    return {"root": root, "branch": branch, "head": head, "base": base, "behind": behind,
+            "ahead": ahead, "dirty": dirty, "changed_vs_base": changed_vs_base, "worktrees": worktrees}
+
+
+def _workspace_hazards(p):
+    """Generic, repo-agnostic hazard signals from a probe dict."""
+    hz = []
+    base_short = (p["base"] or "").split("/")[-1]
+    if p["branch"] == "HEAD":
+        hz.append("Detached HEAD — commits/fixes will not land on any PR branch.")
+    elif base_short and p["branch"] == base_short:
+        hz.append(f"On base branch `{p['branch']}` directly — no feature branch for this work.")
+    if p["behind"] is not None and p["behind"] > _WS_BEHIND_HAZARD:
+        hz.append(f"{p['behind']} commits BEHIND base `{p['base']}` — stale checkout; the work may already be merged or moved to another branch.")
+    if p["ahead"] == 0 and base_short and p["branch"] not in ("HEAD", base_short):
+        hz.append(f"Branch `{p['branch']}` has 0 commits beyond base — nothing is committed here (already merged, or fixes are floating uncommitted).")
+    if len(p["dirty"]) > _WS_SCOPE_BLEED_FILES:
+        hz.append(f"{len(p['dirty'])} uncommitted files — large/mixed scope; likely a shared checkout with unrelated work bleeding in.")
+    others = [w for w in p["worktrees"]
+              if os.path.realpath(w[0]) != os.path.realpath(p["root"])]
+    stale_or_dirty = (p["behind"] and p["behind"] > _WS_BEHIND_HAZARD) or len(p["dirty"]) > _WS_SCOPE_BLEED_FILES
+    if others and stale_or_dirty:
+        lst = ", ".join(f"{path} [{br}]" for path, br in others[:6])
+        hz.append(f"{len(others)} other worktree(s) exist — confirm this is the right checkout: {lst}")
+    return hz
+
+
+def _workspace_scope(cwd, task=""):
+    """Return (scope_block_str, hazards_list). ('', []) when cwd isn't a git repo."""
+    p = _workspace_probe(cwd)
+    if not p:
+        return "", []
+    hz = _workspace_hazards(p)
+
+    def _fmt(files, n=25):
+        if not files:
+            return " none"
+        body = "\n  - " + "\n  - ".join(files[:n])
+        return body + (f"\n  … (+{len(files) - n} more)" if len(files) > n else "")
+
+    lines = [
+        "=== WORKSPACE SCOPE (verify before reviewing — do NOT skip) ===",
+        f"Repo: {p['root']}",
+        f"Branch: {p['branch']} @ {p['head']}   Base: {p['base']}"
+        + (f"  (behind {p['behind']}, ahead {p['ahead']})" if p["behind"] is not None else ""),
+        f"Committed diff vs base:{_fmt(p['changed_vs_base'])}",
+        f"Uncommitted in tree ({len(p['dirty'])}):{_fmt(p['dirty'])}",
+    ]
+    others = [(path, br) for path, br in p["worktrees"]
+              if os.path.realpath(path) != os.path.realpath(p["root"])]
+    if others:
+        lines.append("Other worktrees: " + ", ".join(f"{path} [{br}]" for path, br in others[:6]))
+    if hz:
+        lines.append("⚠️ WORKSPACE HAZARDS:")
+        lines += [f"  - {h}" for h in hz]
+    lines += [
+        "REVIEW ONLY the diff above (branch commits vs base + the uncommitted files listed).",
+        "If you catch yourself citing code OUTSIDE this diff, or a bug that is NOT present in it,",
+        "STOP and say so — you are probably on the wrong branch/worktree/checkout and about to waste effort.",
+        "=== END SCOPE ===\n",
+    ]
+    return "\n".join(lines), hz
+
+
+def _send_workspace_preflight(chat_id, cwd, task, label):
+    """Surface workspace hazards to the user at loop start instead of silently burning iterations."""
+    try:
+        _, hz = _workspace_scope(cwd, task)
+        if hz:
+            body = "\n".join(f"• {h}" for h in hz)
+            send_message(chat_id, f"⚠️ *{label}: workspace check*\n\n{body}\n\n"
+                                  f"_The loop will proceed anchored to the diff-vs-base, but verify you're in the intended branch/worktree — these conditions historically waste review iterations._")
+    except Exception as e:
+        print(f"[workspace-preflight] {label}: {e}", flush=True)
+
+
 def run_codex_review(original_task, claude_output, step, history_summary, cwd, phase="implementing", pending_transition=None, stale_warning=None, claude_plan=None, user_feedback="", plan_name="PLAN.md"):
     """Call Codex to review Claude's output and determine next action.
 
@@ -7290,7 +7502,11 @@ If ANY items still show - [ ] (unchecked), implementation is NOT complete.
 
             "reviewing": """CURRENT PHASE: CODE REVIEW
 Claude should be reviewing the code that was implemented. Drive a thorough review.
-Pay special attention to design and architecture flaws:
+This is the phase where CORRECTNESS bugs must be caught (see the CORRECTNESS HUNTER rule below):
+concurrency/ordering races, TOCTOU, swallowed failures/degrading fallbacks, stale/non-idempotent
+state writes, non-atomic multi-step writes, unfixed parallel code paths, and wrong-input data flow.
+A review that only surfaces design/maintainability nits has NOT done its job — dig for the bugs a
+later deep review would find. Also pay attention to design and architecture flaws:
 - Poor separation of concerns, god functions/classes, tight coupling
 - Missing abstractions or wrong abstraction levels
 - Patterns that won't scale or will be hard to maintain/extend
@@ -7377,6 +7593,14 @@ GENERAL RULES:
    the problem, explain why it's wrong, and suggest how to restructure. Catching bad architecture
    early saves expensive rework later.
 8. If Claude entered plan mode or is asking for plan approval, tell it to exit plan mode immediately and just implement directly. Plan mode wastes steps in autonomous execution.
+9. CORRECTNESS HUNTER ROLE: Alongside the design review, hunt as hard for correctness bugs — these are what slip past a design-only pass and get caught later by a deep review, wasting far more effort. On every read of Claude's output, actively look for:
+   - CONCURRENCY & ORDERING: a dependent reader/consumer that can run before the writer it needs has persisted (e.g. work enqueued in the same asyncio.gather / fire-and-forget as the write it depends on); claim-then-act, validate-then-send, or check-then-use gaps where state can change in between (TOCTOU); operations only individually "checked" instead of held together under one lock/transaction.
+   - SWALLOWED FAILURES / DEGRADING FALLBACKS: a broad except/catch that acks or returns success (or silently falls back to a default) when the operation actually FAILED; a persistence/publish/enqueue failure that should retry/DLQ/fail-closed but is counted as done; fallback defaults (timezone, id, config) used silently where the correct value must be required.
+   - STALE / IDEMPOTENCY: state-changing writes not recency-gated (timestamp/version) so a delayed or duplicate event overwrites newer state; last_seen/updated_at/event_id not advanced; unhandled equal-timestamp ties.
+   - ATOMICITY: multi-step writes (e.g. ledger + history + counters) not in one transaction and not conditional on a real accepted state transition, so a stale/no-op first step still fires the side effects.
+   - EVERY PARALLEL PATH: if a bug was fixed in one place, verify the SAME bug isn't still present in a duplicated/parallel writer or path (two services writing the same table, full-tier vs light-tier). A fix that covers one twin and not the other is incomplete.
+   - DATA-FLOW CORRECTNESS: code that gates on aggregate evidence but then acts on a narrower slice (wrong frame/row/record); the wrong input fed to an expensive or irreversible operation.
+   If you spot any of these, do NOT transition — give Claude a specific prompt naming the exact file/function, the concrete failure scenario, and the fix. Treat these with the same "intervene immediately" urgency as architecture flaws.
 
 RESPOND WITH ONE OF:
 - "QUOTA:<wait_minutes>\\n<details>" if Claude's output indicates it hit a rate limit, quota exceeded,
@@ -7388,6 +7612,10 @@ RESPOND WITH ONE OF:
 - "PHASE:<next_phase>\\n<prompt for Claude>" to transition (ONLY when reviewing a verification result)
 - "DONE\\n<summary>" to finish (ONLY when reviewing a verification result where all tests pass)
 - Or the exact next prompt to send to Claude (nothing else, no meta-commentary)"""
+
+    scope_block, _scope_hz = _workspace_scope(cwd, original_task)
+    if scope_block:
+        codex_prompt = scope_block + "\n" + codex_prompt
 
     if stale_warning:
         codex_prompt += f"\n\n⚠️ STALE PROGRESS WARNING:\n{stale_warning}"
@@ -8112,6 +8340,8 @@ Use `/omni` again with an explicit decision (accept ops-blocked state, or provid
             pass
     finally:
         omni_active.pop(chat_key, None)
+        _terminate_session_process(session_id, "omni loop exit")
+        cancelled_sessions.discard(session_id)
         user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "omni", "", 0, active=False)
@@ -8483,6 +8713,8 @@ COMPLETION:
         send_message(chat_id, f"❌ *Ralph error:* {str(e)[:300]}")
     finally:
         ralph_active.pop(chat_key, None)
+        _terminate_session_process(session_id, "ralph loop exit")
+        cancelled_sessions.discard(session_id)
         user_feedback_queue.pop(chat_key, None)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "ralph", "", 0, active=False)
@@ -8535,6 +8767,8 @@ Task: _{task[:200]}_
 
 _Starting autonomous implementation..._
 _Use /cancel to stop at any time._""")
+
+        _send_workspace_preflight(chat_id, cwd, task, "JustDoIt")
 
         # Step 0: Ask Claude to consolidate/create a plan file
         # Claude knows its own session context — it knows if it already created a plan somewhere
@@ -8902,6 +9136,8 @@ _Session preserved. You can continue chatting with Claude in this session._""")
         except Exception:
             pass
         justdoit_active.pop(chat_key, None)
+        _terminate_session_process(session_id, "justdoit loop exit")
+        cancelled_sessions.discard(session_id)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "justdoit", "", 0, active=False)
         _ws_session_override.name = None  # Clear thread-local override
@@ -8980,6 +9216,9 @@ This is the final gate. Be thorough but fair."""
     else:
         return None, False, f"Unknown phase: {phase}"
 
+    _dr_scope, _ = _workspace_scope(cwd)
+    if _dr_scope:
+        codex_prompt = _dr_scope + "\n" + codex_prompt
     print(f"[DeepReview Codex] Step {step}, phase: {phase}, prompt length: {len(codex_prompt)}", flush=True)
 
     try:
@@ -9165,6 +9404,9 @@ ALL_CLEAN
 
 Focus on correctness, design, and architecture — not cosmetics."""
 
+    _dr_scope, _ = _workspace_scope(cwd)
+    if _dr_scope:
+        codex_prompt = _dr_scope + "\n" + codex_prompt
     print(f"[DeepReview Codex Fix] Step {step}, is_followup: {is_followup}, prompt length: {len(codex_prompt)}", flush=True)
 
     try:
@@ -9268,6 +9510,9 @@ ALL_CLEAN
 
 Do not nitpick cosmetics."""
 
+    _dr_scope, _ = _workspace_scope(cwd)
+    if _dr_scope:
+        codex_prompt = _dr_scope + "\n" + codex_prompt
     print(f"[DeepReview Codex Verify] Step {step}, prompt length: {len(codex_prompt)}", flush=True)
 
     try:
@@ -9382,6 +9627,8 @@ _Phases 1+2: Claude fixes ↔ Codex reviews (loop until Codex satisfied)_
 _Phases 3+4: Codex fixes ↔ Claude reviews (loop until Claude satisfied)_
 
 _Use /cancel to stop. Prefix feedback with `!` to interrupt the current step._""")
+
+        _send_workspace_preflight(chat_id, cwd, session.get("name", ""), "DeepReview")
 
         def _deepreview_retry_prompt(original_prompt, feedback):
             return f"""The user interrupted this deepreview step with urgent feedback.
@@ -9970,6 +10217,8 @@ _Session preserved. You can continue chatting._""")
         except Exception:
             pass
         deepreview_active.pop(chat_key, None)
+        _terminate_session_process(session_id, "deepreview loop exit")
+        cancelled_sessions.discard(session_id)
         save_active_tasks()
         _ws_broadcast_status(chat_id, "deepreview", "", 0, active=False)
         _ws_session_override.name = None
@@ -10133,6 +10382,7 @@ Example: `/schedule daily 09:00 | Run tests and fix failures`""")
 • `/reject` - Reject current plan
 • `/cancel` - Cancel current session's task
 • `/claude [task]` - Run Claude task (session persists per project)
+• `/model [fable|opus|sonnet|haiku|default]` - Set/show the model `/claude` uses for this session
 • `/codex [task]` - Run Codex task (session persists per project)
 • `/gemini [task]` - Run Gemini task (session persists per project)
   Uses configured Gemini model (default `gemini-3.1-pro-preview`), auto-resumes previous session
@@ -10618,6 +10868,40 @@ Send a message to start working!""")
             daemon=True
         )
         thread.start()
+        return True
+
+    if cmd == "/model":
+        session = get_active_session(chat_id)
+        if not session:
+            send_message(chat_id, "No active session. Use `/new <project>` first.")
+            return True
+        # Friendly aliases -> the model id passed to `claude --model`.
+        model_aliases = {
+            "fable": "claude-fable-5", "fable5": "claude-fable-5", "claude-fable-5": "claude-fable-5",
+            "opus": "opus", "sonnet": "sonnet", "haiku": "haiku",
+        }
+        arg = (args or "").strip().lower()
+        current = session.get("claude_model_override") or f"{CLAUDE_GENERAL_MODEL} (default)"
+        if not arg:
+            send_message(chat_id,
+                f"*`/claude` model for* `{session.get('name', '')}`*:* `{current}`\n\n"
+                "Set with `/model <fable|opus|sonnet|haiku>` or `/model default` to clear.")
+            return True
+        if arg in ("default", "clear", "reset", "off", "none"):
+            session.pop("claude_model_override", None)
+            save_sessions(force=True)
+            send_message(chat_id, f"✅ Model override cleared — `/claude` uses the default (`{CLAUDE_GENERAL_MODEL}`).")
+            return True
+        if arg not in model_aliases:
+            send_message(chat_id, f"Unknown model `{arg}`. Choose: `fable`, `opus`, `sonnet`, `haiku`, or `default`.")
+            return True
+        chosen = model_aliases[arg]
+        session["claude_model_override"] = chosen
+        save_sessions(force=True)
+        send_message(chat_id,
+            f"✅ `/claude` model for *{session.get('name', '')}* set to `{chosen}`.\n"
+            "_Applies from your next `/claude` turn. Switching models starts a fresh Claude context "
+            "for that model (each model keeps its own resume thread)._")
         return True
 
     if cmd in ("/claude", "/c", "/cl"):
@@ -11887,6 +12171,8 @@ def run_claude_in_thread(chat_id, text, session=None, is_auto_continue=False):
         _ws_session_override.name = session.get("name", "") if session else ""
         response = ""
         prompt = text
+        # Per-session model override (set via /model); None → run_claude_streaming uses CLAUDE_GENERAL_MODEL.
+        claude_model = session.get("claude_model_override") if session else None
         try:
             if session:
                 # Check if proactive compaction is needed BEFORE sending to Claude
@@ -11899,7 +12185,7 @@ def run_claude_in_thread(chat_id, text, session=None, is_auto_continue=False):
 
                 response, questions, _, claude_sid, context_overflow = run_claude_streaming(
                     prompt, chat_id, cwd=session["cwd"], continue_session=True,
-                    session_id=session_id, session=session
+                    session_id=session_id, session=session, model=claude_model
                 )
 
                 # Fallback: Smart compaction on context overflow (if proactive didn't catch it)
@@ -11921,7 +12207,7 @@ Format as a compact bullet list. This will be used to restore context after rese
                     try:
                         summary_response, _, _, _, _ = run_claude_streaming(
                             summary_prompt, chat_id, cwd=session["cwd"], continue_session=True,
-                            session_id=session_id, session=session
+                            session_id=session_id, session=session, model=claude_model
                         )
                         # Extract just the summary text (remove completion indicators)
                         summary = summary_response.split("———")[0].strip() if summary_response else ""
@@ -11952,12 +12238,12 @@ Format as a compact bullet list. This will be used to restore context after rese
 
                     response, questions, _, claude_sid, _ = run_claude_streaming(
                         context_prompt, chat_id, cwd=session["cwd"], continue_session=True,
-                        session_id=session_id, session=session
+                        session_id=session_id, session=session, model=claude_model
                     )
 
-                # Save Claude's session ID for future --resume
+                # Save Claude's session ID for future --resume (keyed to the model actually used)
                 if claude_sid and session:
-                    update_claude_session_id(chat_id, session, claude_sid)
+                    update_claude_session_id(chat_id, session, claude_sid, model=claude_model)
             else:
                 response, questions, _, _, _ = run_claude_streaming(text, chat_id)
 

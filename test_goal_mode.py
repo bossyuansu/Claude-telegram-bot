@@ -1919,6 +1919,28 @@ class TestGoalRateLimitHandling(unittest.TestCase):
         with self.assertRaises(self.bot.GoalModelTimeoutError):
             self.bot._goal_detect_model_issue("Claude process timed out after 900s", context="x")
 
+    def test_model_output_discussing_rate_limiting_not_rate_limited(self):
+        """A goal whose SUBJECT is rate-limiting/debounce writes 'rate-limit', 'limit resets', etc.
+        in its normal answer prose. That must NOT be mistaken for a provider quota error — a broad
+        QUOTA_REGEX on the codex review answer paused goal_e0bc8aa3 spuriously (garbage reset hint
+        'source back to vision …'). 4th recurrence of the 'don't scan model output' rule."""
+        for content in (
+            "I'll re-establish the Row 7a scope, then verify the debounce logic.",
+            "We rate-limit object-location extraction per user with a 300s TTL.",
+            "The debounce limit resets after the TTL window; the limit is reset when a new frame arrives.",
+            "reset source back to vision when they overwrite a user assertion",
+        ):
+            self.bot._goal_detect_model_issue(content, context="goal Codex review")  # must not raise
+
+    def test_structured_codex_quota_marker_is_rate_limit(self):
+        """The structured 'QUOTA:<min>' marker that run_codex surfaces from stderr (the real error
+        channel) IS a genuine rate limit and must still pause the goal."""
+        with self.assertRaises(self.bot.GoalRateLimitError):
+            self.bot._goal_detect_model_issue(
+                "QUOTA:45 Codex error — rate limit reached, try again at 3:45 PM",
+                context="goal Codex review",
+            )
+
     def test_model_content_describing_infra_is_not_transient(self):
         """Decomposition/assessment text that DESCRIBES infra work must not be
         mistaken for a provider failure (regression: broad infra phrases in model
