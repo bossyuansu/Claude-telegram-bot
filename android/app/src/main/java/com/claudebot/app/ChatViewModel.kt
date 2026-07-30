@@ -18,6 +18,7 @@ import com.claudebot.app.data.*
 import com.claudebot.app.network.ConnectionState
 import com.claudebot.app.network.WebSocketManager
 import com.claudebot.app.network.WsMessage
+import com.claudebot.app.network.createdOrNow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -1335,7 +1336,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         isFromBot = true,
                         session = msg.session,
                         isReplay = msg.isReplay,
-                        timestamp = System.currentTimeMillis(),
+                        timestamp = msg.createdOrNow,
                         buttons = msg.buttons
                     )
 
@@ -1523,7 +1524,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             isFromBot = true,
                             session = msg.session,
                             isReplay = msg.isReplay,
-                            timestamp = System.currentTimeMillis()
+                            timestamp = msg.createdOrNow
                         )
                         persistedMessageIds.add(mid)
                         val editShowInUi = matchesSessionFilter(msg.session)
@@ -1551,7 +1552,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         isFromBot = true,
                         session = msg.session,
                         isReplay = msg.isReplay,
-                        timestamp = System.currentTimeMillis(),
+                        timestamp = msg.createdOrNow,
                         fileName = msg.fileName,
                         fileSize = msg.fileSize,
                         mimeType = msg.mimeType,
@@ -1603,7 +1604,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // New stream message
                 val chatMsg = ChatMessage(
                     messageId = mid, text = "", isFromBot = true,
-                    session = msg.session, isReplay = msg.isReplay, timestamp = System.currentTimeMillis()
+                    session = msg.session, isReplay = msg.isReplay, timestamp = msg.createdOrNow
                 )
                 persistedMessageIds.add(mid)
                 if (msg.session.isNotEmpty() && msg.session !in availableSessions) {
@@ -1637,7 +1638,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     if (!matchesSessionFilter(msg.session)) return
                     val chatMsg = ChatMessage(
                         messageId = mid, text = "", isFromBot = true,
-                        session = msg.session, isReplay = msg.isReplay, timestamp = System.currentTimeMillis()
+                        session = msg.session, isReplay = msg.isReplay, timestamp = msg.createdOrNow
                     )
                     val newIdx = messages.size
                     messages.add(chatMsg)
@@ -1719,7 +1720,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         session = msg.session.ifEmpty { messages[idx].session },
                         isReplay = messages[idx].isReplay || msg.isReplay,
                         fileChanges = parsedChanges,
-                        timestamp = System.currentTimeMillis()
+                        timestamp = messages[idx].timestamp  // keep original creation time (set at stream start)
                     )
                     messages[idx] = updated
                     if (idx == messages.lastIndex) scrollTrigger.value++
@@ -1745,7 +1746,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         isFromBot = true,
                         session = msg.session,
                         isReplay = msg.isReplay,
-                        timestamp = System.currentTimeMillis(),
+                        timestamp = msg.createdOrNow,
                         fileChanges = parsedChanges
                     )
                     persistedMessageIds.add(mid)

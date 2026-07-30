@@ -16,6 +16,7 @@ data class WsMessage(
     val session: String,
     val seq: Int = 0,
     val isReplay: Boolean = false,
+    val createdAt: Long = 0L,   // epoch ms when the message was created server-side (not received)
     val buttons: List<List<InlineButton>> = emptyList(),
     // Status fields (for type="status")
     val mode: String = "",
@@ -48,6 +49,10 @@ data class WsMessage(
     val outcome: String = "",      // success, failure (for iteration events)
     val reason: String = "",       // pause/cancel reason
 )
+
+/** Server-side creation time (epoch ms), falling back to now for legacy payloads lacking created_at. */
+val WsMessage.createdOrNow: Long
+    get() = if (createdAt > 0L) createdAt else System.currentTimeMillis()
 
 class WebSocketManager(
     private val onMessage: (WsMessage) -> Unit,
@@ -336,6 +341,7 @@ class WebSocketManager(
             session = json.optString("session", ""),
             seq = seq,
             isReplay = json.optBoolean("is_replay", false),
+            createdAt = json.optLong("created_at", 0L),
             buttons = buttons,
             mode = json.optString("mode", ""),
             phase = json.optString("phase", ""),
