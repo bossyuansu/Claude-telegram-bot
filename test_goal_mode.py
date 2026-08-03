@@ -567,15 +567,20 @@ class TestVerifyMilestone(unittest.TestCase):
 
     @patch("bot.run_claude")
     def test_parse_failure_treats_as_failed(self, mock_claude):
+        """Unparseable verifier output is retried once, then reported as ONE unresolved
+        verification entry — not as an individual failure per criterion (which buried the real
+        cause and made the whole-suite final milestone look catastrophically broken)."""
         mock_claude.return_value = ("I couldn't verify anything", [])
 
         goal = self._make_goal()
-        milestone = {"title": "Test", "acceptance_criteria": ["criterion A"]}
+        milestone = {"title": "Test", "acceptance_criteria": ["criterion A", "criterion B"]}
         result = self.bot._verify_milestone(goal, milestone)
 
         self.assertFalse(result["all_passed"])
-        self.assertEqual(len(result["failed"]), 1)
-        self.assertIn("parse error", result["failed"][0]["evidence"].lower())
+        self.assertEqual(len(result["failed"]), 1)  # aggregated, not one per criterion
+        self.assertIn("parseable", result["failed"][0]["evidence"].lower())
+        # retried once before giving up (2 verifier calls)
+        self.assertEqual(mock_claude.call_count, 2)
 
     @patch("bot.subprocess.run")
     @patch("bot.run_claude")
@@ -648,6 +653,53 @@ class TestVerifyMilestone(unittest.TestCase):
         cmd_failures = [f for f in result["failed"] if f["criterion"].startswith("Command:")]
         self.assertEqual(len(cmd_failures), 1)
         self.assertIn("exit code 1", cmd_failures[0]["evidence"])
+
+    @patch("bot.subprocess.run")
+    @patch("bot.run_claude")
+    def test_verification_uses_configured_timeout_not_hardcoded_120(self, mock_claude, mock_subprocess):
+        """Whole-suite gates (the final milestone) need minutes. The per-command budget must come
+        from config (default 900s), not the old hardcoded 120s that made that milestone
+        structurally unpassable."""
+        mock_subprocess.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        goal = self._make_goal(verification_commands=["npm test"])
+        self.bot._verify_milestone(goal, {"title": "T", "acceptance_criteria": []})
+        self.assertEqual(mock_subprocess.call_args.kwargs["timeout"], 900)
+
+        goal2 = self._make_goal(verification_commands=["npm test"])
+        goal2["config"]["verification_command_timeout"] = 300
+        self.bot._verify_milestone(goal2, {"title": "T", "acceptance_criteria": []})
+        self.assertEqual(mock_subprocess.call_args.kwargs["timeout"], 300)
+
+    @patch("bot.subprocess.run")
+    @patch("bot.run_claude")
+    def test_preexisting_suite_failure_does_not_fail_milestone(self, mock_claude, mock_subprocess):
+        """A red whole-suite gate whose failures are PRE-EXISTING/environmental (e.g. tests gated
+        on a missing API key, in files this goal never touched) must not permanently block the
+        final milestone — the goal cannot fix them, so it would burn every attempt."""
+        mock_subprocess.return_value = MagicMock(
+            returncode=1, stdout="Tests: 5 failed, 5914 passed\nFAIL tests/integration/reminders_production.test.ts", stderr=""
+        )
+        goal = self._make_goal(verification_commands=["npm test"])
+        milestone = {"title": "Integration verification", "acceptance_criteria": []}
+        with patch.object(self.bot, "_goal_command_failure_is_transient", return_value=False):
+            with patch.object(self.bot, "_goal_failure_is_preexisting", return_value=True):
+                result = self.bot._verify_milestone(goal, milestone)
+        self.assertTrue(result["all_passed"])
+        self.assertIn("PRE-EXISTING", result["passed"][0]["evidence"])
+
+    @patch("bot.subprocess.run")
+    @patch("bot.run_claude")
+    def test_goal_caused_suite_failure_still_fails_milestone(self, mock_claude, mock_subprocess):
+        """Fail-closed: if the failures ARE attributable to this goal's changes, the milestone
+        still fails (the pre-existing escape hatch must not swallow real regressions)."""
+        mock_subprocess.return_value = MagicMock(returncode=1, stdout="Tests: 1 failed", stderr="")
+        goal = self._make_goal(verification_commands=["npm test"])
+        milestone = {"title": "Integration verification", "acceptance_criteria": []}
+        with patch.object(self.bot, "_goal_command_failure_is_transient", return_value=False):
+            with patch.object(self.bot, "_goal_failure_is_preexisting", return_value=False):
+                result = self.bot._verify_milestone(goal, milestone)
+        self.assertFalse(result["all_passed"])
+        self.assertEqual(len(result["failed"]), 1)
 
     @patch("bot.subprocess.run")
     @patch("bot.run_claude")
