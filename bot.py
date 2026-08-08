@@ -158,7 +158,12 @@ _USER_QUESTION_RE = re.compile(
 _INCOMPLETE_TAIL_CHARS = 700
 
 # Codex model for JustDoIt orchestration (update when newer models release)
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+# gpt-5.6-sol: adopted for stronger long-horizon agentic work and higher code-review recall
+# (CodeRabbit: +7.4pp pass rate). Trade-off to watch: reported ~8pp lower actionable precision =
+# more nitpicks, which costs iterations in the deepreview loop. Requires codex CLI >= 0.144.1
+# (plain "gpt-5.6"/"gpt-5.6-codex" are rejected on ChatGPT-account auth; the -sol variant works).
+# Revert = set this back to "gpt-5.5" (or export CODEX_MODEL=gpt-5.5).
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 try:
     DEEPREVIEW_MIN_CLEAN_ITERATIONS = max(1, int(os.environ.get("DEEPREVIEW_MIN_CLEAN_ITERATIONS", "2")))
