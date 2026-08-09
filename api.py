@@ -580,7 +580,30 @@ def broadcast_ws(chat_id, event_type, data):
         try:
             loop = _ws_event_loop
             if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+                asyncio.run_coroutine_threadsafe(_send_or_evict(ws, payload, event_type, seq), loop)
+        except Exception:
+            pass
+
+
+async def _send_or_evict(ws, payload: str, event_type: str, seq: int):
+    """Send to one client; on failure evict it so it reconnects and replays.
+
+    Sends were previously fire-and-forget: run_coroutine_threadsafe returns a Future nobody
+    awaits, so a failed send was invisible AND the client stayed registered. If the failed frame
+    was the LAST of a burst (typically stream 'done'), the app never saw a higher seq, so its
+    gap detector never fired, it never reconnected, and it sat on partial text forever. Evicting
+    on failure turns a silent loss into a reconnect, which replays the buffer and the in-flight
+    stream catch-up.
+    """
+    try:
+        await ws.send_text(payload)
+    except Exception as e:
+        with _ws_lock:
+            _ws_clients.discard(ws)
+        print(f"[WS] Send failed (type={event_type} seq={seq}): {type(e).__name__}: {e} "
+              f"— client evicted so it reconnects and replays", flush=True)
+        try:
+            await ws.close()
         except Exception:
             pass
 

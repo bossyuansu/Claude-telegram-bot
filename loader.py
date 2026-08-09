@@ -127,6 +127,10 @@ def _reload_api():
     # in server_hello, resets its lastSeq, and reconnects with last_seq=0 → full-buffer replay of
     # old messages to the app.
     live_server_id = getattr(api_mod, "_server_id", None)
+    # In-flight stream text used for reconnect catch-up. importlib.reload() would reset it to {},
+    # so a stream still streaming during a hot reload would lose its catch-up buffer and the app
+    # would be stuck with whatever partial text it had.
+    live_active_streams = getattr(api_mod, "_active_streams", None)
 
     try:
         importlib.reload(api_mod)
@@ -187,6 +191,8 @@ def _reload_api():
         api_mod._ws_seq = live_seq
     if live_server_id is not None:
         api_mod._server_id = live_server_id
+    if live_active_streams is not None:
+        api_mod._active_streams = live_active_streams
 
     print("[Loader] api.py reloaded.", flush=True)
 
