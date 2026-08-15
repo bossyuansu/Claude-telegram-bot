@@ -109,8 +109,14 @@ _RESUME_DELAY_RE = re.compile(
 )
 # Bounds for a time-based auto-continue wait (seconds). Below the floor there's no point
 # delaying; above the ceiling a task should be handed back to the user, not self-resumed.
+# The ceiling was 3600, which silently clamped any longer request (e.g. "resume in 2h") to an
+# hour. Pending resumes are now persisted and re-armed on boot (see _pending_resumes), so a long
+# wait actually survives reloads/restarts and a larger ceiling is meaningful.
 CLAUDE_RESUME_DELAY_MIN = 15
-CLAUDE_RESUME_DELAY_MAX = 3600
+try:
+    CLAUDE_RESUME_DELAY_MAX = max(60, int(os.environ.get("CLAUDE_RESUME_DELAY_MAX", "14400")))
+except ValueError:
+    CLAUDE_RESUME_DELAY_MAX = 14400
 # Fallback for when the model signals "keep monitoring" without the marker but gives no time.
 CLAUDE_FALLBACK_RESUME_DELAY = 300
 
@@ -178,6 +184,10 @@ API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 ACTIVE_TASKS_FILE = DATA_DIR / "active_tasks.json"  # Track running tasks for crash recovery
+# Pending delayed auto-continues. The wait itself is an in-memory threading.Timer, which a hot
+# reload or restart silently destroys — so a task that said "resume in 30m" would just never come
+# back. Mirroring the schedule here lets _restore_pending_resumes() re-arm it on boot.
+PENDING_RESUMES_FILE = DATA_DIR / "pending_resumes.json"
 ACTIVE_SESSIONS_FILE = DATA_DIR / "active_sessions.json"  # Track running Claude processes for crash recovery
 SCHEDULED_TASKS_FILE = DATA_DIR / "scheduled_tasks.json"
 GOALS_DIR = DATA_DIR / "goals"  # Goal mode state files
@@ -12111,6 +12121,84 @@ def _incomplete_signal(response):
     return (False, 0)
 
 
+def _load_pending_resumes():
+    try:
+        if PENDING_RESUMES_FILE.exists():
+            with open(PENDING_RESUMES_FILE) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[Resume] Could not read pending resumes: {e}", flush=True)
+    return {}
+
+
+def _write_pending_resumes(data):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if data:
+            with open(PENDING_RESUMES_FILE, "w") as f:
+                json.dump(data, f)
+        elif PENDING_RESUMES_FILE.exists():
+            PENDING_RESUMES_FILE.unlink()
+    except Exception as e:
+        print(f"[Resume] Could not persist pending resumes: {e}", flush=True)
+
+
+def _record_pending_resume(chat_id, session_id, resume_at):
+    data = _load_pending_resumes()
+    data[str(session_id)] = {"chat_id": chat_id, "resume_at": resume_at}
+    _write_pending_resumes(data)
+
+
+def _clear_pending_resume(session_id):
+    data = _load_pending_resumes()
+    if data.pop(str(session_id), None) is not None:
+        _write_pending_resumes(data)
+
+
+def _arm_resume_timer(chat_id, session_id, delay):
+    """Arm (and persist) a delayed auto-continue so it survives reload/restart."""
+    _cancel_resume_timer(session_id)
+    timer = threading.Timer(delay, _fire_delayed_resume, args=(chat_id, session_id))
+    timer.daemon = True
+    claude_resume_timers[session_id] = timer
+    _record_pending_resume(chat_id, session_id, time.time() + delay)
+    timer.start()
+
+
+def _restore_pending_resumes():
+    """Re-arm delayed auto-continues after a reload/restart killed their in-memory timers.
+
+    A resume whose deadline already passed while the bot was down fires shortly after boot
+    rather than being lost; the fire-time guards still decide whether it's still appropriate.
+    """
+    data = _load_pending_resumes()
+    if not data:
+        return
+    now = time.time()
+    restored = 0
+    for sid, info in list(data.items()):
+        try:
+            chat_id = info.get("chat_id")
+            resume_at = float(info.get("resume_at", 0))
+            if chat_id is None:
+                continue
+            remaining = resume_at - now
+            # Overdue → give the bot a moment to finish starting before firing.
+            delay = max(15.0, remaining) if remaining > 0 else 30.0
+            if remaining <= 0 and (now - resume_at) > CLAUDE_RESUME_DELAY_MAX:
+                continue  # far too stale to be meaningful — drop it
+            timer = threading.Timer(delay, _fire_delayed_resume, args=(chat_id, sid))
+            timer.daemon = True
+            claude_resume_timers[sid] = timer
+            timer.start()
+            restored += 1
+        except Exception as e:
+            print(f"[Resume] Could not restore pending resume for {sid}: {e}", flush=True)
+    if restored:
+        print(f"[Resume] Re-armed {restored} pending auto-continue(s) after restart.", flush=True)
+
+
 def _cancel_resume_timer(session_id):
     """Cancel any pending delayed auto-continue for a session (user took over / cancelled)."""
     t = claude_resume_timers.pop(session_id, None)
@@ -12119,6 +12207,7 @@ def _cancel_resume_timer(session_id):
             t.cancel()
         except Exception:
             pass
+    _clear_pending_resume(session_id)
 
 
 def _fire_delayed_resume(chat_id, session_id):
@@ -12128,6 +12217,7 @@ def _fire_delayed_resume(chat_id, session_id):
     wait (user messaged, cancelled, an autonomous loop started, budget hit).
     """
     claude_resume_timers.pop(session_id, None)
+    _clear_pending_resume(session_id)
     session = get_session_by_id(chat_id, session_id)
     if not session:
         return
@@ -12204,11 +12294,7 @@ def _maybe_auto_continue_claude(chat_id, session, response):
     if delay > 0:
         if message_queue.get(sid):
             return False
-        _cancel_resume_timer(sid)
-        timer = threading.Timer(delay, _fire_delayed_resume, args=(chat_id, sid))
-        timer.daemon = True
-        claude_resume_timers[sid] = timer
-        timer.start()
+        _arm_resume_timer(chat_id, sid, delay)
         when = f"{delay}s" if delay < 90 else f"~{round(delay / 60)} min"
         send_message(
             chat_id,
@@ -12635,6 +12721,7 @@ def startup():
     GOALS_DIR.mkdir(parents=True, exist_ok=True)
     check_interrupted_sessions()
     check_interrupted_tasks()
+    _restore_pending_resumes()
 
     # Register bot commands for the Telegram menu button
     try:

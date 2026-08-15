@@ -28,6 +28,9 @@ _STATE_KEYS = [
     # Session and process state
     "user_sessions", "pending_questions", "active_processes",
     "message_queue", "claude_autocontinue_count", "cancelled_sessions", "user_feedback_queue",
+    # Live threading.Timer objects for pending auto-continues — dropping these on hot reload
+    # silently cancels a scheduled resume (the on-disk schedule re-arms only on full restart).
+    "claude_resume_timers",
     # Autonomous task state
     "justdoit_active", "deepreview_active", "omni_active",
     "ralph_active", "go_pending", "cron_bg_sessions",
