@@ -110,13 +110,15 @@ _RESUME_DELAY_RE = re.compile(
 # Bounds for a time-based auto-continue wait (seconds). Below the floor there's no point
 # delaying; above the ceiling a task should be handed back to the user, not self-resumed.
 # The ceiling was 3600, which silently clamped any longer request (e.g. "resume in 2h") to an
-# hour. Pending resumes are now persisted and re-armed on boot (see _pending_resumes), so a long
-# wait actually survives reloads/restarts and a larger ceiling is meaningful.
+# hour. Pending resumes are now persisted and re-armed on boot (see PENDING_RESUMES_FILE), so a
+# long wait actually survives reloads/restarts and a larger ceiling is meaningful. Default is 24h
+# so overnight waits (nightly CI, a scheduled run, "check again tomorrow") are expressible;
+# CLAUDE_AUTO_CONTINUE_MAX still bounds how many times a task may self-resume.
 CLAUDE_RESUME_DELAY_MIN = 15
 try:
-    CLAUDE_RESUME_DELAY_MAX = max(60, int(os.environ.get("CLAUDE_RESUME_DELAY_MAX", "14400")))
+    CLAUDE_RESUME_DELAY_MAX = max(60, int(os.environ.get("CLAUDE_RESUME_DELAY_MAX", "86400")))
 except ValueError:
-    CLAUDE_RESUME_DELAY_MAX = 14400
+    CLAUDE_RESUME_DELAY_MAX = 86400
 # Fallback for when the model signals "keep monitoring" without the marker but gives no time.
 CLAUDE_FALLBACK_RESUME_DELAY = 300
 
