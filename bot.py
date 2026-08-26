@@ -11109,6 +11109,11 @@ Send a message to start working!""")
             return True
         session = get_active_session(chat_id)
         file_path = args.strip()
+        # Expand ~ BEFORE the isabs() check below: "~/packs/x.txt" is not an absolute path, so it
+        # would otherwise be joined onto the session cwd ("<cwd>/~/packs/x.txt") and reported as
+        # "File not found" even though the file exists.
+        if file_path.startswith("~"):
+            file_path = os.path.expanduser(file_path)
         # Fuzzy path: .../something searches recursively under session cwd
         if file_path.startswith(".../") and session:
             target = file_path[4:]
