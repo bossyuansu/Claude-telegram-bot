@@ -6,8 +6,10 @@ sharing all in-memory state. Listens on the Tailscale IP.
 WebSocket endpoint at /ws streams all bot messages in real time.
 """
 import asyncio
+import contextlib
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -614,6 +616,28 @@ _ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # --- Routes ---
 
+@contextlib.contextmanager
+def _app_request_origin():
+    """Tag the calling thread as serving an APP (HTTP API) request while a command runs.
+
+    Command handlers in bot.py can then behave differently for app-originated commands — e.g.
+    `/file` skips the Telegram upload, since the app fetches the bytes itself via /api/download
+    and routing sensitive files through Telegram is undesirable. FastAPI runs these sync
+    endpoints on a worker thread and the handler executes inline on that same thread, so a
+    thread-local is visible to it; it is always cleared so a pooled thread can't leak the flag.
+    """
+    bot_mod = sys.modules.get("bot")
+    origin = getattr(bot_mod, "_request_origin", None) if bot_mod else None
+    previous = getattr(origin, "source", None) if origin is not None else None
+    if origin is not None:
+        origin.source = "api"
+    try:
+        yield
+    finally:
+        if origin is not None:
+            origin.source = previous
+
+
 @app.post("/api/crash")
 async def post_crash(request: Request):
     """Receive crash reports from the Android app."""
@@ -653,24 +677,25 @@ def post_message(req: MessageRequest, _=Depends(verify_auth)):
             threading.Thread(target=echo_fn, args=(chat_id, f"\U0001F4F1 {text}"),
                            kwargs={"parse_mode": None}, daemon=True).start()
 
-    if text.startswith("/"):
-        if req.session:
-            if text.strip().lower() == "/cancel":
-                cancel_task(TaskActionRequest(chat_id=chat_id, session=req.session))
-                return {"ok": True, "type": "command", "command": "/cancel", "session": req.session}
-            if _handle_command_for_session:
-                handled = _handle_command_for_session(chat_id, text, target_session)
-                if not handled:
-                    raise HTTPException(status_code=400, detail=f"Unknown command: {text.split()[0]}")
-                return {"ok": True, "type": "command", "command": text.split()[0], "session": req.session}
-            raise HTTPException(status_code=400, detail=f"Targeted command not supported: {text.split()[0]}")
-        handled = _handle_command(chat_id, text)
-        if not handled:
-            raise HTTPException(status_code=400, detail=f"Unknown command: {text.split()[0]}")
-        return {"ok": True, "type": "command", "command": text.split()[0]}
-    else:
-        _handle_message(chat_id, text, session=target_session)
-        return {"ok": True, "type": "message"}
+    with _app_request_origin():
+        if text.startswith("/"):
+            if req.session:
+                if text.strip().lower() == "/cancel":
+                    cancel_task(TaskActionRequest(chat_id=chat_id, session=req.session))
+                    return {"ok": True, "type": "command", "command": "/cancel", "session": req.session}
+                if _handle_command_for_session:
+                    handled = _handle_command_for_session(chat_id, text, target_session)
+                    if not handled:
+                        raise HTTPException(status_code=400, detail=f"Unknown command: {text.split()[0]}")
+                    return {"ok": True, "type": "command", "command": text.split()[0], "session": req.session}
+                raise HTTPException(status_code=400, detail=f"Targeted command not supported: {text.split()[0]}")
+            handled = _handle_command(chat_id, text)
+            if not handled:
+                raise HTTPException(status_code=400, detail=f"Unknown command: {text.split()[0]}")
+            return {"ok": True, "type": "command", "command": text.split()[0]}
+        else:
+            _handle_message(chat_id, text, session=target_session)
+            return {"ok": True, "type": "message"}
 
 
 @app.post("/api/message-targeted")

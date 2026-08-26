@@ -953,6 +953,12 @@ _api_module = None  # Set in main() after api.py is loaded
 _ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadcasts
 _ws_session_override = threading.local()  # Per-thread session name for WS broadcasts (avoids get_active_session races)
 _active_session_override = threading.local()  # Per-thread session override for scheduled tasks (avoids mutating global active session)
+_request_origin = threading.local()  # Per-thread origin of the current command ("api" when it came from the app, else Telegram)
+
+
+def _origin_is_app():
+    """True when the command being handled arrived from the Android app (HTTP API), not Telegram."""
+    return getattr(_request_origin, "source", None) == "api"
 
 
 def _ws_broadcast(chat_id, event_type, data):
@@ -11180,6 +11186,16 @@ Send a message to start working!""")
             "is_image": ext in image_exts,
             "file_path": os.path.realpath(file_path),
         })
+        # When the app asked for the file, it fetches the bytes itself over /api/download using
+        # the WS event above — so skip the Telegram upload. That keeps sensitive files (e.g. a
+        # credential pack containing a passphrase) off Telegram's servers entirely.
+        if _origin_is_app():
+            size_txt = (f"{file_size / (1024 * 1024):.1f} MB" if file_size >= 1024 * 1024
+                        else f"{max(1, file_size // 1024)} KB")
+            send_message(chat_id,
+                         f"📎 `{os.path.basename(file_path)}` ({size_txt}) "
+                         f"sent to the app only — not uploaded to Telegram.")
+            return True
         # Send to Telegram
         if ext in image_exts and file_size < 10 * 1024 * 1024:
             ok = send_photo(chat_id, file_path)
