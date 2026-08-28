@@ -102,11 +102,17 @@ _CLAUDE_INCOMPLETE_RE = re.compile(r"(?:^|\n)\s*(?:⏳\s*)?INCOMPLETE\s*[—–:
 # own sub-agents (a genuine external wait — CI/deploy — never says "agent"); combined with the
 # "no external-state cue" gate this suppresses the misfire without touching real deploy/CI waits.
 _INTURN_AGENT_WAIT_RE = re.compile(r"\bagents?\b", re.IGNORECASE)
-# Optional resume delay in the marker: "resume in 5m" / "resume in 300s" / "resume in 1h".
+# Optional resume delay in the marker: "resume in 5m" / "resume in 300s" / "resume in 1h" /
+# "resume in 5h45m". Compound durations matter: the previous pattern required a \b right after
+# the unit, so "5h45m" failed to match ('h' is followed by '4', not a boundary). That silently
+# yielded delay=0, which takes the IMMEDIATE-resume path — a task that asked to wait ~6h for a
+# deploy window instead resumed seconds later and burned its whole auto-continue budget.
+_DURATION_UNIT = r"seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh]"
 _RESUME_DELAY_RE = re.compile(
-    r"resume\s+in\s+(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])\b",
+    rf"resume\s+in\s+((?:\d+\s*(?:{_DURATION_UNIT})\s*)+)",
     re.IGNORECASE,
 )
+_DURATION_PART_RE = re.compile(rf"(\d+)\s*({_DURATION_UNIT})", re.IGNORECASE)
 # Bounds for a time-based auto-continue wait (seconds). Below the floor there's no point
 # delaying; above the ceiling a task should be handed back to the user, not self-resumed.
 # The ceiling was 3600, which silently clamped any longer request (e.g. "resume in 2h") to an
@@ -12076,6 +12082,7 @@ _AUTO_CONTINUE_PROMPT = (
 def _parse_resume_delay(response):
     """Seconds to wait before auto-continue, parsed from a `resume in <N><unit>` marker.
 
+    Handles compound durations ("5h45m", "1h30m") as well as single units ("15m", "5h").
     Returns 0 when no delay is specified (resume immediately). Otherwise clamped to
     [CLAUDE_RESUME_DELAY_MIN, CLAUDE_RESUME_DELAY_MAX].
     """
@@ -12084,14 +12091,18 @@ def _parse_resume_delay(response):
     m = _RESUME_DELAY_RE.search(response)
     if not m:
         return 0
-    n = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit.startswith("h"):
-        secs = n * 3600
-    elif unit.startswith("m"):
-        secs = n * 60
-    else:
-        secs = n
+    secs = 0
+    for n, unit in _DURATION_PART_RE.findall(m.group(1)):
+        n = int(n)
+        u = unit.lower()
+        if u.startswith("h"):
+            secs += n * 3600
+        elif u.startswith("m"):
+            secs += n * 60
+        else:
+            secs += n
+    if secs <= 0:
+        return 0
     return max(CLAUDE_RESUME_DELAY_MIN, min(secs, CLAUDE_RESUME_DELAY_MAX))
 
 
