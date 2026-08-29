@@ -230,6 +230,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // Foreground owns the live WS. Stop background catch-up worker.
                 if (settings.isConfigured) {
                     cancelSyncWorkers()
+                    // Pick up anything SyncWorker persisted while backgrounded. It advanced the
+                    // shared WS cursor, so the reconnect below will NOT replay those messages —
+                    // without this they'd stay in the DB and never render. Runs before connect()
+                    // so live traffic can't be clobbered by the list swap.
+                    refreshMessagesFromDb()
                     if (wsStateReady) {
                         val (lastSeq, knownServerId) = settings.getWsState()
                         wsManager.restoreState(lastSeq, knownServerId)
@@ -454,6 +459,42 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun matchesSessionFilter(session: String): Boolean {
         val filter = sessionFilter.value ?: return true
         return session == filter
+    }
+
+    /**
+     * Rebuild the visible list from the DB, honouring the active filter.
+     *
+     * Needed on foreground: while backgrounded, SyncWorker writes new messages to the DB only —
+     * it cannot touch this in-memory list — and it ADVANCES the shared WS cursor
+     * (settings.updateWsState). ON_START then reconnects from that advanced cursor, so the server
+     * replays nothing for those messages. Without a DB reload they stay on disk but off screen
+     * until an app restart (or a filter change, previously the only reload path).
+     */
+    private fun refreshMessagesFromDb() {
+        filterGeneration++
+        val gen = filterGeneration
+        val session = sessionFilter.value
+        viewModelScope.launch {
+            val entities = withContext(Dispatchers.IO) {
+                persistedMessageIds.clear()
+                persistedMessageIds.addAll(dao.getPersistedMessageIds())
+                finalizedMessageIds.clear()
+                finalizedMessageIds.addAll(dao.getFinalizedMessageIds("———"))
+                if (session != null) dao.getPageBySession(session, PAGE_SIZE, 0)
+                else dao.getPage(PAGE_SIZE, 0)
+            }
+            // Discard if a filter change raced this load.
+            if (gen != filterGeneration) return@launch
+            // Swap contents only after the IO completes, to minimise flicker.
+            messages.clear()
+            idToIndex.clear()
+            messages.addAll(entities.reversed().map { it.toChatMessage() })
+            rebuildIndex()
+            dbOffset = entities.size
+            allLoaded.value = entities.size < PAGE_SIZE
+            isLoadingMore.value = false
+            if (messages.isNotEmpty()) scrollTrigger.value++
+        }
     }
 
     fun connect() {
