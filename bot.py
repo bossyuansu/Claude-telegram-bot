@@ -10706,12 +10706,25 @@ Send a message to start working!""")
             else:
                 status = "✅ Idle"
 
+            # A session with a pending auto-continue is NOT simply idle — it holds a timer that
+            # will resume it later. Without this, a long hold (e.g. "resume in 17h30m" for a
+            # deploy window) looks indistinguishable from a dead session.
+            waiting_line = ""
+            pending = _load_pending_resumes().get(str(session_id))
+            if pending:
+                remaining = pending.get("resume_at", 0) - time.time()
+                if remaining > 0:
+                    if not (is_busy or g_state.get("active") or jdi_state.get("active")):
+                        status = "⏳ Waiting to auto-continue"
+                    waiting_line = (f"\n• Auto-continue: in {_format_wait(remaining)} "
+                                    f"(at {_resume_clock(remaining)}) — `/cancel` to drop it")
+
             default_cli = session.get("last_cli", "Claude")
             send_message(chat_id, f"""*Current Session:*
 • Project: `{session['name']}`
 • Directory: `{session['cwd']}`
 • Default CLI: `{default_cli}`
-• Status: {status}
+• Status: {status}{waiting_line}
 • Created: {session['created_at'][:16]}""")
         else:
             send_message(chat_id, "No active session. Use `/new <project>` to start one.")
@@ -12155,6 +12168,23 @@ def _incomplete_signal(response):
     return (False, 0)
 
 
+def _format_wait(seconds):
+    """Human-readable wait. '~1050 min' is unreadable for a long hold; say '~17h30m'."""
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"~{round(seconds / 60)} min"
+    h, m = divmod(round(seconds / 60), 60)
+    return f"~{h}h{m:02d}m" if m else f"~{h}h"
+
+
+def _resume_clock(seconds):
+    """Wall-clock time the resume is due, so a long wait is concrete rather than abstract."""
+    due = datetime.now() + timedelta(seconds=int(seconds))
+    return due.strftime("%H:%M") if due.date() == datetime.now().date() else due.strftime("%a %H:%M")
+
+
 def _load_pending_resumes():
     try:
         if PENDING_RESUMES_FILE.exists():
@@ -12329,11 +12359,10 @@ def _maybe_auto_continue_claude(chat_id, session, response):
         if message_queue.get(sid):
             return False
         _arm_resume_timer(chat_id, sid, delay)
-        when = f"{delay}s" if delay < 90 else f"~{round(delay / 60)} min"
         send_message(
             chat_id,
-            f"⏳ _Task waiting on external state — will auto-continue in {when}. "
-            f"Send a message to take over sooner._",
+            f"⏳ _Task waiting on external state — will auto-continue in {_format_wait(delay)} "
+            f"(at {_resume_clock(delay)}). Send a message to take over sooner, or /cancel to drop it._",
         )
         return True
 
