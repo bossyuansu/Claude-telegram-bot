@@ -4656,7 +4656,7 @@ def run_claude(prompt, cwd=None, continue_session=False, extra_args=None, model=
         return f"Error running Claude: {e}", []
 
 
-def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, session_id=None, session=None, stale_timeout=None, model=None):
+def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, session_id=None, session=None, stale_timeout=None, model=None, track_model_switch=False):
     """Run Claude CLI with streaming output to Telegram.
 
     stale_timeout: if set, kills the process if no stdout for this many seconds.
@@ -4679,6 +4679,17 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         sibling_warn = get_sibling_session_warning(chat_id, session)
         if sibling_warn:
             prompt = sibling_warn + prompt
+
+        # Model switch inside Claude: the normal bridge can't see it (it keys on CLI name), so
+        # hand over the previous model's transcript + last response explicitly. Opt-in, so
+        # internal planning calls (which legitimately alternate models) don't inject it.
+        if track_model_switch:
+            switch_bridge = _claude_model_switch_bridge(session, claude_model)
+            if switch_bridge:
+                prompt = switch_bridge + "[NEW REQUEST]\n" + prompt
+                print(f"[Claude] Model-switch bridge injected: "
+                      f"{session.get('claude_last_model')} -> {claude_model} "
+                      f"({len(switch_bridge)} chars)", flush=True)
 
         bridge = get_context_bridge(session, "Claude")
         if bridge:
@@ -5181,6 +5192,14 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
                            "context length" in accumulated_text.lower() or
                            "too much media" in accumulated_text.lower())
 
+        # Remember which model handled this turn and what it said, so a later switch to a
+        # different model can be handed the context (see _claude_model_switch_bridge).
+        if session and track_model_switch:
+            session["claude_last_model"] = claude_model
+            if accumulated_text and accumulated_text.strip():
+                session["claude_last_response"] = accumulated_text.strip()[-6000:]
+            _persist_claude_handoff(chat_id, session)
+
         # Clean up process tracking only after final output is flushed.
         _cleanup_key = _cron_bg_key or process_key
         active_processes.pop(_cleanup_key, None)
@@ -5623,6 +5642,55 @@ def update_cli_session_id(chat_id, session, cli_name, new_sid):
             s[sid_key] = new_sid
             save_sessions(force=True)
             break
+
+
+def _claude_model_switch_bridge(session, new_model):
+    """Context handoff when a session's /claude model changes.
+
+    Each model keeps its OWN Claude CLI thread (claude_session_ids), so switching to a different
+    model starts a conversation that shares none of the previous model's history. The normal
+    context bridge can't cover this: it keys on CLI name ("Claude"), and the previous turn WAS
+    Claude — so it reports no intervening activity and the new model starts blind.
+
+    Hands over the previous model's transcript path (readable) plus its last response.
+    """
+    if not session:
+        return ""
+    prev = session.get("claude_last_model")
+    if not prev or prev == new_model:
+        return ""
+
+    lines = [
+        "[MODEL SWITCH — CONTEXT HANDOFF]",
+        f"Earlier turns in this session ran on Claude `{prev}`. You are `{new_model}` and do NOT "
+        f"share that conversation's history.",
+    ]
+    prev_sid = (session.get("claude_session_ids") or {}).get(prev)
+    cwd = session.get("cwd") or ""
+    if prev_sid and cwd:
+        proj = os.path.abspath(cwd).replace(os.sep, "-")
+        transcript = f"{os.path.expanduser('~')}/.claude/projects/{proj}/{prev_sid}.jsonl"
+        lines.append(f"Full transcript of those turns: {transcript}")
+        lines.append("Read it if you need detail beyond the summary below; don't redo settled work.")
+    last = session.get("claude_last_response")
+    if last:
+        lines.append(f"\nMost recent `{prev}` response (tail):\n{last[-2500:]}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _persist_claude_handoff(chat_id, session):
+    """Mirror the model-handoff fields onto the stored session so they survive a restart."""
+    try:
+        session_id = get_session_id(session)
+        for s in user_sessions.get(str(chat_id), {}).get("sessions", []):
+            if get_session_id(s) == session_id:
+                s["claude_last_model"] = session.get("claude_last_model")
+                if session.get("claude_last_response"):
+                    s["claude_last_response"] = session["claude_last_response"]
+                break
+        save_sessions()
+    except Exception as e:
+        print(f"[Claude] Could not persist model handoff: {e}", flush=True)
 
 
 def get_claude_session_id_for_model(session, model):
@@ -11013,8 +11081,9 @@ Send a message to start working!""")
         save_sessions(force=True)
         send_message(chat_id,
             f"✅ `/claude` model for *{session.get('name', '')}* set to `{chosen}`.\n"
-            "_Applies from your next `/claude` turn. Switching models starts a fresh Claude context "
-            "for that model (each model keeps its own resume thread)._")
+            "_Applies from your next `/claude` turn. Each model keeps its own resume thread, so the "
+            "next turn gets a context handoff — the previous model's transcript path and its last "
+            "response — instead of starting blind._")
         return True
 
     if cmd in ("/claude", "/c", "/cl"):
@@ -12410,7 +12479,8 @@ def run_claude_in_thread(chat_id, text, session=None, is_auto_continue=False):
 
                 response, questions, _, claude_sid, context_overflow = run_claude_streaming(
                     prompt, chat_id, cwd=session["cwd"], continue_session=True,
-                    session_id=session_id, session=session, model=claude_model
+                    session_id=session_id, session=session, model=claude_model,
+                    track_model_switch=True
                 )
 
                 # Fallback: Smart compaction on context overflow (if proactive didn't catch it)
@@ -12463,7 +12533,8 @@ Format as a compact bullet list. This will be used to restore context after rese
 
                     response, questions, _, claude_sid, _ = run_claude_streaming(
                         context_prompt, chat_id, cwd=session["cwd"], continue_session=True,
-                        session_id=session_id, session=session, model=claude_model
+                        session_id=session_id, session=session, model=claude_model,
+                        track_model_switch=True
                     )
 
                 # Save Claude's session ID for future --resume (keyed to the model actually used)
