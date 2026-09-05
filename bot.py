@@ -176,7 +176,7 @@ _INCOMPLETE_TAIL_CHARS = 700
 # (CodeRabbit: +7.4pp pass rate). Trade-off to watch: reported ~8pp lower actionable precision =
 # more nitpicks, which costs iterations in the deepreview loop. Requires codex CLI >= 0.144.1
 # (plain "gpt-5.6"/"gpt-5.6-codex" are rejected on ChatGPT-account auth; the -sol variant works).
-# Revert = set this back to "gpt-5.5" (or export CODEX_MODEL=gpt-5.5).
+# Revert = set this back to "gpt-5.5" (or export CODEX_MODEL=gpt-5.5). Per-session override: /model codex <name>.
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 try:
@@ -960,6 +960,20 @@ _ws_suppress = threading.local()  # Per-thread flag to suppress legacy WS broadc
 _ws_session_override = threading.local()  # Per-thread session name for WS broadcasts (avoids get_active_session races)
 _active_session_override = threading.local()  # Per-thread session override for scheduled tasks (avoids mutating global active session)
 _request_origin = threading.local()  # Per-thread origin of the current command ("api" when it came from the app, else Telegram)
+# Per-thread Codex model for the session being served. The review/deepreview helpers take `cwd`
+# but not `session`, yet always run on the loop's own thread — so the loop sets this once at
+# entry and every nested codex call inherits it.
+_codex_model_ctx = threading.local()
+
+
+def _codex_model():
+    """Codex model for the current thread's session, else the global default."""
+    return getattr(_codex_model_ctx, "model", None) or CODEX_MODEL
+
+
+def _bind_codex_model(session):
+    """Bind this thread to the session's Codex model override (call at loop/command entry)."""
+    _codex_model_ctx.model = (session or {}).get("codex_model_override") or None
 
 
 def _origin_is_app():
@@ -3352,6 +3366,7 @@ def _run_goal_loop(chat_id, session_id, goal_id):
 
     # Set WS session override for correct labeling
     _ws_session_override.name = session.get("name", "")
+    _bind_codex_model(session)
 
     # Broadcast goal started
     total = len(goal.get("milestones", []))
@@ -5909,7 +5924,7 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
     if codex_sid:
         cmd = [
             "codex", "exec",
-            "-m", CODEX_MODEL,
+            "-m", _codex_model(),
             "-c", 'model_reasoning_effort="xhigh"',
             "--dangerously-bypass-approvals-and-sandbox", "--json",
             "resume", codex_sid,
@@ -5918,7 +5933,7 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
     else:
         cmd = [
             "codex", "exec",
-            "-m", CODEX_MODEL,
+            "-m", _codex_model(),
             "-c", 'model_reasoning_effort="xhigh"',
             "--dangerously-bypass-approvals-and-sandbox", "--json",
             prompt
@@ -6594,6 +6609,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
         file_changes = []
         processed_item_ids = set()
         _ws_session_override.name = session.get("name", "") if session else ""
+        _bind_codex_model(session)
         try:
             compaction_summary = None
             if session:
@@ -6628,13 +6644,13 @@ def run_codex_task(chat_id, task, cwd, session=None):
             if session:
                 update_session_state(chat_id, session, task, "Codex")
 
-            send_message(chat_id, f"🔍 *{mode} Codex*\nModel: `{CODEX_MODEL}`\nTask: _{task[:100]}_")
+            send_message(chat_id, f"🔍 *{mode} Codex*\nModel: `{_codex_model()}`\nTask: _{task[:100]}_")
 
             # Build command — resume existing session or start new
             if codex_sid:
                 cmd = [
                     "codex", "exec",
-                    "-m", CODEX_MODEL,
+                    "-m", _codex_model(),
                     "-c", 'model_reasoning_effort="xhigh"',
                     "--dangerously-bypass-approvals-and-sandbox", "--json",
                     "resume", codex_sid,
@@ -6643,7 +6659,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
             else:
                 cmd = [
                     "codex", "exec",
-                    "-m", CODEX_MODEL,
+                    "-m", _codex_model(),
                     "-c", 'model_reasoning_effort="xhigh"',
                     "--dangerously-bypass-approvals-and-sandbox", "--json",
                     current_task
@@ -7798,7 +7814,7 @@ RESPOND WITH ONE OF:
         process = subprocess.Popen(
             [
                 "codex", "exec",
-                "-m", CODEX_MODEL,
+                "-m", _codex_model(),
                 "-c", 'model_reasoning_effort="xhigh"',
                 "--dangerously-bypass-approvals-and-sandbox",
                 codex_prompt
@@ -8895,6 +8911,7 @@ def run_justdoit_loop(chat_id, task, session):
     chat_key = f"{chat_id}:{session_id}"
     cwd = session["cwd"]
     log_prefix = f"[JustDoIt {chat_id}:{session.get('name', 'unknown')}]"
+    _bind_codex_model(session)
     # Pin WS session label to the originating session for all send_message calls on this thread
     _ws_session_override.name = session.get("name", "")
 
@@ -9393,7 +9410,7 @@ This is the final gate. Be thorough but fair."""
         process = subprocess.Popen(
             [
                 "codex", "exec",
-                "-m", CODEX_MODEL,
+                "-m", _codex_model(),
                 "-c", 'model_reasoning_effort="xhigh"',
                 "--dangerously-bypass-approvals-and-sandbox",
                 codex_prompt
@@ -9581,7 +9598,7 @@ Focus on correctness, design, and architecture — not cosmetics."""
         process = subprocess.Popen(
             [
                 "codex", "exec",
-                "-m", CODEX_MODEL,
+                "-m", _codex_model(),
                 "-c", 'model_reasoning_effort="xhigh"',
                 "--dangerously-bypass-approvals-and-sandbox",
                 codex_prompt
@@ -9687,7 +9704,7 @@ Do not nitpick cosmetics."""
         process = subprocess.Popen(
             [
                 "codex", "-a", "never", "exec",
-                "-m", CODEX_MODEL,
+                "-m", _codex_model(),
                 "-c", 'model_reasoning_effort="xhigh"',
                 "-s", "read-only",
                 codex_prompt
@@ -9763,6 +9780,7 @@ def run_deepreview_loop(chat_id, session):
     chat_key = f"{chat_id}:{session_id}"
     cwd = session["cwd"]
     log_prefix = f"[DeepReview {chat_id}:{session.get('name', 'unknown')}]"
+    _bind_codex_model(session)
     _ws_session_override.name = session.get("name", "")
 
     print(f"{log_prefix} Starting deep review", flush=True)
@@ -10551,6 +10569,7 @@ Example: `/schedule daily 09:00 | Run tests and fix failures`""")
 • `/cancel` - Cancel current session's task
 • `/claude [task]` - Run Claude task (session persists per project)
 • `/model [fable|opus|sonnet|haiku|default]` - Set/show the model `/claude` uses for this session
+• `/model codex [astra|sol|gpt-5.5|default]` - Set/show the Codex model (also used by justdoit/deepreview/goal reviewers)
 • `/codex [task]` - Run Codex task (session persists per project)
 • `/gemini [task]` - Run Gemini task (session persists per project)
   Uses configured Gemini model (default `gemini-3.1-pro-preview`), auto-resumes previous session
@@ -11061,12 +11080,53 @@ Send a message to start working!""")
             "fable": "claude-fable-5", "fable5": "claude-fable-5", "claude-fable-5": "claude-fable-5",
             "opus": "opus", "sonnet": "sonnet", "haiku": "haiku",
         }
+        # Codex aliases -> the model id passed to `codex exec -m`.
+        codex_aliases = {
+            "astra": "gpt-6-astra", "gpt-6-astra": "gpt-6-astra", "gpt6": "gpt-6-astra",
+            "sol": "gpt-5.6-sol", "gpt-5.6-sol": "gpt-5.6-sol",
+            "gpt-5.5": "gpt-5.5", "5.5": "gpt-5.5",
+        }
         arg = (args or "").strip().lower()
         current = session.get("claude_model_override") or f"{CLAUDE_GENERAL_MODEL} (default)"
+        current_codex = session.get("codex_model_override") or f"{CODEX_MODEL} (default)"
+
+        # `/model codex <name>` — set/clear the Codex model for this session.
+        if arg.startswith("codex"):
+            carg = arg[len("codex"):].strip()
+            if not carg:
+                send_message(chat_id,
+                    f"*Codex model for* `{session.get('name', '')}`*:* `{current_codex}`\n\n"
+                    "Set with `/model codex <astra|sol|gpt-5.5>` or `/model codex default` to clear.")
+                return True
+            if carg in ("default", "clear", "reset", "off", "none"):
+                session.pop("codex_model_override", None)
+                save_sessions(force=True)
+                _bind_codex_model(session)
+                send_message(chat_id, f"✅ Codex override cleared — uses the default (`{CODEX_MODEL}`).")
+                return True
+            if carg not in codex_aliases:
+                send_message(chat_id,
+                    f"Unknown Codex model `{carg}`. Choose: `astra` (gpt-6-astra), `sol` (gpt-5.6-sol), "
+                    "`gpt-5.5`, or `default`.")
+                return True
+            chosen_cx = codex_aliases[carg]
+            session["codex_model_override"] = chosen_cx
+            save_sessions(force=True)
+            _bind_codex_model(session)
+            send_message(chat_id,
+                f"✅ Codex model for *{session.get('name', '')}* set to `{chosen_cx}`.\n"
+                "_Applies to `/codex` and to the codex reviewer in justdoit/deepreview/goal on this "
+                "session, from their next run._")
+            return True
+
         if not arg:
             send_message(chat_id,
-                f"*`/claude` model for* `{session.get('name', '')}`*:* `{current}`\n\n"
-                "Set with `/model <fable|opus|sonnet|haiku>` or `/model default` to clear.")
+                f"*Models for* `{session.get('name', '')}`\n"
+                f"• `/claude`: `{current}`\n"
+                f"• Codex: `{current_codex}`\n\n"
+                "Set Claude: `/model <fable|opus|sonnet|haiku>`\n"
+                "Set Codex: `/model codex <astra|sol|gpt-5.5>`\n"
+                "Clear either with `default` (e.g. `/model default`, `/model codex default`).")
             return True
         if arg in ("default", "clear", "reset", "off", "none"):
             session.pop("claude_model_override", None)
