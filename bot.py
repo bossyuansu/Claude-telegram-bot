@@ -172,12 +172,20 @@ _USER_QUESTION_RE = re.compile(
 _INCOMPLETE_TAIL_CHARS = 700
 
 # Codex model for JustDoIt orchestration (update when newer models release)
-# gpt-5.6-sol: adopted for stronger long-horizon agentic work and higher code-review recall
-# (CodeRabbit: +7.4pp pass rate). Trade-off to watch: reported ~8pp lower actionable precision =
-# more nitpicks, which costs iterations in the deepreview loop. Requires codex CLI >= 0.144.1
-# (plain "gpt-5.6"/"gpt-5.6-codex" are rejected on ChatGPT-account auth; the -sol variant works).
-# Revert = set this back to "gpt-5.5" (or export CODEX_MODEL=gpt-5.5). Per-session override: /model codex <name>.
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
+# gpt-6-astra: promoted to default after a blind integration-defect benchmark (missing wiring /
+# wrong protocol / logic mismatch) where it caught 3/3 vs gpt-5.6-sol's 2/3 — sol missed the
+# missing-wiring defect entirely, which is the class that costs the most deepreview iterations.
+# Requires codex CLI >= 0.153.4. Astra costs materially more per token, hence the quota-aware
+# fallback below. Revert = export CODEX_MODEL=gpt-5.6-sol. Per-session override: /model codex <name>.
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6-astra")
+# Premium models get de-escalated to the fallback as the account's Codex quota window fills, so a
+# long autonomous loop degrades to a cheaper model instead of dying on a hard rate limit mid-run.
+CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.6-sol")
+CODEX_PREMIUM_MODELS = {"gpt-6-astra"}
+try:
+    CODEX_USAGE_FALLBACK_PERCENT = float(os.environ.get("CODEX_USAGE_FALLBACK_PERCENT", "80"))
+except ValueError:
+    CODEX_USAGE_FALLBACK_PERCENT = 80.0
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 try:
     DEEPREVIEW_MIN_CLEAN_ITERATIONS = max(1, int(os.environ.get("DEEPREVIEW_MIN_CLEAN_ITERATIONS", "2")))
@@ -966,9 +974,99 @@ _request_origin = threading.local()  # Per-thread origin of the current command 
 _codex_model_ctx = threading.local()
 
 
+def _codex_usage(max_age=90):
+    """Latest Codex rate-limit snapshot, or None.
+
+    The CLI exposes no usage command, but every session rollout records a `rate_limits` payload
+    (used_percent / window_minutes / resets_at / plan_type / rate_limit_reached_type). We read the
+    newest rollout's last snapshot. It is therefore only as fresh as the most recent codex run —
+    treat it as a floor on usage, not a live meter.
+    """
+    now = time.time()
+    cached = getattr(_codex_model_ctx, "_usage_cache", None)
+    if cached and now - cached[0] < max_age:
+        return cached[1]
+    snap = None
+    try:
+        base = os.path.expanduser("~/.codex/sessions")
+        newest, newest_mt = None, 0
+        for root, _dirs, files in os.walk(base):
+            for fn in files:
+                if fn.startswith("rollout-") and fn.endswith(".jsonl"):
+                    p = os.path.join(root, fn)
+                    mt = os.path.getmtime(p)
+                    if mt > newest_mt:
+                        newest, newest_mt = p, mt
+        if newest:
+            # Tail the file — rollouts get large and the newest snapshot is at the end.
+            with open(newest, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 400_000))
+                tail = f.read().decode("utf-8", "replace")
+            for line in reversed(tail.split("\n")):
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    payload = json.loads(line).get("payload", {})
+                except Exception:
+                    continue
+                if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
+                    snap = payload["rate_limits"]
+                    break
+    except Exception as e:
+        print(f"[Codex] usage probe failed: {e}", flush=True)
+    _codex_model_ctx._usage_cache = (now, snap)
+    return snap
+
+
+def _codex_usage_percent(snap=None):
+    """Highest used_percent across the rate-limit windows, or None if unknown."""
+    snap = snap if snap is not None else _codex_usage()
+    if not isinstance(snap, dict):
+        return None
+    pcts = [w.get("used_percent") for w in (snap.get("primary"), snap.get("secondary"))
+            if isinstance(w, dict) and isinstance(w.get("used_percent"), (int, float))]
+    return max(pcts) if pcts else None
+
+
+def _codex_usage_line():
+    """One-line Codex quota summary for /model and /status, or '' if unknown."""
+    snap = _codex_usage()
+    pct = _codex_usage_percent(snap)
+    if pct is None:
+        return ""
+    win = (snap.get("primary") or {}) if isinstance(snap, dict) else {}
+    resets = ""
+    if isinstance(win.get("resets_at"), (int, float)):
+        left = win["resets_at"] - time.time()
+        if left > 0:
+            resets = f", resets in {_format_wait(int(left))}"
+    plan = snap.get("plan_type") or "?"
+    flag = " ⚠️ _falling back to " + CODEX_FALLBACK_MODEL + "_" if pct >= CODEX_USAGE_FALLBACK_PERCENT else ""
+    return f"• Codex quota: `{pct:.0f}%` used ({plan} plan{resets}){flag}"
+
+
 def _codex_model():
-    """Codex model for the current thread's session, else the global default."""
-    return getattr(_codex_model_ctx, "model", None) or CODEX_MODEL
+    """Codex model for the current thread's session, with quota-aware fallback.
+
+    The premium model is materially costlier per token, so when the account's Codex usage is near
+    its window limit we drop to the cheaper fallback rather than burn the remaining budget (or hit
+    a hard rate limit mid-loop).
+    """
+    chosen = getattr(_codex_model_ctx, "model", None) or CODEX_MODEL
+    if chosen not in CODEX_PREMIUM_MODELS or chosen == CODEX_FALLBACK_MODEL:
+        return chosen
+    snap = _codex_usage()
+    if isinstance(snap, dict) and snap.get("rate_limit_reached_type"):
+        print(f"[Codex] rate limit reached ({snap.get('rate_limit_reached_type')}) — "
+              f"falling back {chosen} -> {CODEX_FALLBACK_MODEL}", flush=True)
+        return CODEX_FALLBACK_MODEL
+    pct = _codex_usage_percent(snap)
+    if pct is not None and pct >= CODEX_USAGE_FALLBACK_PERCENT:
+        print(f"[Codex] usage {pct:.0f}% >= {CODEX_USAGE_FALLBACK_PERCENT}% — "
+              f"falling back {chosen} -> {CODEX_FALLBACK_MODEL}", flush=True)
+        return CODEX_FALLBACK_MODEL
+    return chosen
 
 
 def _bind_codex_model(session):
@@ -11094,8 +11192,10 @@ Send a message to start working!""")
         if arg.startswith("codex"):
             carg = arg[len("codex"):].strip()
             if not carg:
+                usage = _codex_usage_line()
                 send_message(chat_id,
-                    f"*Codex model for* `{session.get('name', '')}`*:* `{current_codex}`\n\n"
+                    f"*Codex model for* `{session.get('name', '')}`*:* `{current_codex}`\n"
+                    + (usage + "\n" if usage else "") + "\n"
                     "Set with `/model codex <astra|sol|gpt-5.5>` or `/model codex default` to clear.")
                 return True
             if carg in ("default", "clear", "reset", "off", "none"):
@@ -11120,10 +11220,12 @@ Send a message to start working!""")
             return True
 
         if not arg:
+            usage = _codex_usage_line()
             send_message(chat_id,
                 f"*Models for* `{session.get('name', '')}`\n"
                 f"• `/claude`: `{current}`\n"
-                f"• Codex: `{current_codex}`\n\n"
+                f"• Codex: `{current_codex}`\n"
+                + (usage + "\n" if usage else "") + "\n"
                 "Set Claude: `/model <fable|opus|sonnet|haiku>`\n"
                 "Set Codex: `/model codex <astra|sol|gpt-5.5>`\n"
                 "Clear either with `default` (e.g. `/model default`, `/model codex default`).")
