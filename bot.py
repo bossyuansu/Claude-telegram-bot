@@ -1359,6 +1359,10 @@ def _create_goal(chat_id, session_id, cwd, description, config=None):
         "max_iterations": 50,
         "max_consecutive_failures": 5,
         "execution_mode": "auto",
+        # Refuse to report a goal "completed" while its work is only local or on an unmerged
+        # branch — passing milestones say the code works, not that anyone else can use it.
+        # Set false for goals with nothing to merge (research, ops, investigation).
+        "require_merged_pr": True,
         "auto_replan_threshold": 3,
         "max_total_time": 28800,  # 8 hours in seconds
         "model_call_timeout": 1200,  # non-streaming planning/assessment/verification timeout (hard wall-clock)
@@ -2274,6 +2278,107 @@ def _goal_choose_execution_strategy(goal, milestone, action_description):
         "reviewer": None,
         "reason": "Configured Claude execution.",
     }
+
+
+# --- Goal delivery gate -------------------------------------------------------------------
+# A goal that ends with its work only committed locally, or sitting on an unmerged branch, has not
+# actually delivered anything — nobody else can see or use it. The loop therefore refuses to mark a
+# goal completed until the work is merged through a PR, and spends bounded extra iterations getting
+# it there. Opt out per goal with config.require_merged_pr = false (e.g. research/docs goals).
+GOAL_MAX_DELIVERY_ATTEMPTS = 3
+
+
+def _gh_json(cwd, *args, timeout=45):
+    """Run `gh` in cwd and parse JSON stdout. None if gh is missing, unauthenticated, or errors."""
+    try:
+        r = subprocess.run(("gh",) + args, cwd=cwd, capture_output=True,
+                           stdin=subprocess.DEVNULL, text=True, timeout=timeout)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def _goal_delivery_gaps(cwd):
+    """What still stands between this goal's work and a merged PR.
+
+    Returns (gaps, probe, detail). Empty gaps means delivered — or that there was nothing to
+    deliver, or that cwd is not a git repo and there is nothing to enforce.
+
+    A squash merge rewrites the SHAs, so a merged branch still reports commits "ahead" of base
+    (this repo's own PR #1330 did exactly that). Git alone would therefore call delivered work
+    unmerged, so when the branch is ahead we ask gh for the PR state before deciding.
+    """
+    probe = _workspace_probe(cwd)
+    if not probe:
+        return [], None, ""
+    gaps = []
+    branch = probe["branch"]
+    base_short = (probe["base"] or "").split("/")[-1]
+    ahead = probe["ahead"] or 0
+    detail = ""
+
+    if probe["dirty"]:
+        gaps.append(f"{len(probe['dirty'])} uncommitted file(s) in the working tree")
+
+    if branch == "HEAD":
+        gaps.append("detached HEAD — commits are not on any branch and cannot be PR'd")
+        return gaps, probe, detail
+
+    if base_short and branch == base_short:
+        # Committed straight to the base branch: the work may be "in", but it never went through
+        # review. That is exactly what this gate exists to catch.
+        if ahead:
+            gaps.append(f"{ahead} commit(s) sit directly on base branch `{branch}` — no PR was opened")
+        return gaps, probe, detail
+
+    if ahead:
+        prs = _gh_json(cwd, "pr", "list", "--head", branch, "--state", "all",
+                       "--limit", "5", "--json", "number,state,url")
+        if prs is None:
+            gaps.append(f"{ahead} commit(s) on `{branch}` not in base `{probe['base']}`, "
+                        "and the PR state could not be verified (gh unavailable)")
+        else:
+            merged = [p for p in prs if p.get("state") == "MERGED"]
+            openish = [p for p in prs if p.get("state") == "OPEN"]
+            if merged:
+                # Delivered; the local branch is just unsynced after a squash merge.
+                detail = f"PR #{merged[0]['number']} merged"
+            elif openish:
+                gaps.append(f"PR #{openish[0]['number']} for `{branch}` is still OPEN — not merged yet")
+            else:
+                gaps.append(f"{ahead} commit(s) on `{branch}` with no PR opened")
+    return gaps, probe, detail
+
+
+def _goal_delivery_prompt(goal, gaps, probe):
+    """Instruction for an extra iteration whose only job is to land the work."""
+    gap_lines = "\n".join(f"  - {g}" for g in gaps)
+    return f"""GOAL: {goal.get('title', '')}
+
+All milestones are complete, but the work is NOT yet delivered. Delivery means: merged into
+`{probe['base']}` through a pull request. Right now:
+
+{gap_lines}
+
+Workspace: branch `{probe['branch']}` @ {probe['head']}, base `{probe['base']}`.
+
+YOUR TASK — land this work:
+1. Review what changed and make sure it is coherent and complete. Do NOT invent new scope.
+2. If there are uncommitted changes, review them and commit with a clear message.
+   Never commit secrets, credentials, or unrelated files.
+3. Put the work on a feature branch if it is sitting on the base branch, push it, and open a PR.
+4. If a PR is already open, get it to merged: address review feedback, fix CI, resolve conflicts.
+5. If merging is blocked by something only a human can do (permissions, a required approval, a
+   deploy window, a policy gate), STOP and say exactly what is blocking it. Do not force it.
+
+Do not weaken tests, skip CI, or bypass branch protection to make this pass.
+
+Report at the end:
+DELIVERY: merged | pr-open | blocked
+PR: <url or none>
+"""
 
 
 def _run_goal_codex(prompt, goal, chat_id, session, session_id, context, fresh=False):
@@ -3644,6 +3749,64 @@ def _run_goal_loop(chat_id, session_id, goal_id):
                     )
 
             if not next_milestone_id:
+                # Delivery gate: every milestone can pass while the work is still invisible to
+                # everyone else (uncommitted, unpushed, or on an unmerged branch). Spend bounded
+                # extra iterations landing it rather than reporting a success nobody can use.
+                if goal.get("config", {}).get("require_merged_pr", True):
+                    try:
+                        gaps, probe, detail = _goal_delivery_gaps(goal.get("cwd", os.getcwd()))
+                    except Exception as e:
+                        print(f"[Goal] delivery probe failed: {e}", flush=True)
+                        gaps, probe, detail = [], None, ""
+                    if gaps and probe:
+                        attempts = goal.get("delivery_attempts", 0)
+                        if attempts >= GOAL_MAX_DELIVERY_ATTEMPTS:
+                            send_message(chat_id,
+                                f"⚠️ *Goal not delivered* — {goal.get('title', '')}\n"
+                                f"All milestones pass, but after {attempts} delivery attempt(s) the "
+                                f"work is still not merged:\n"
+                                + "\n".join(f"• {g}" for g in gaps)
+                                + "\n\nPausing for you. Resume with `/goal resume` once unblocked, "
+                                  "or set `require_merged_pr: false` if this goal has nothing to merge.",
+                                parse_mode="Markdown")
+                            goal["status"] = "paused"
+                            goal["delivery_blocked"] = gaps
+                            goal["updated_at"] = datetime.now().isoformat()
+                            _save_goal(goal)
+                            _ws_broadcast_goal(chat_id, "paused", goal_id, {
+                                "reason": "delivery", "gaps": gaps,
+                            })
+                            break
+                        goal["delivery_attempts"] = attempts + 1
+                        goal["updated_at"] = datetime.now().isoformat()
+                        _save_goal(goal)
+                        send_message(chat_id,
+                            f"📦 _Milestones done — landing the work "
+                            f"({attempts + 1}/{GOAL_MAX_DELIVERY_ATTEMPTS})…_\n"
+                            + "\n".join(f"• {g}" for g in gaps),
+                            parse_mode="Markdown")
+                        delivery_milestone = {
+                            "id": "delivery",
+                            "title": "Deliver the work via a merged PR",
+                            "description": "Land all completed work on the base branch through a PR.",
+                            "acceptance_criteria": [
+                                f"Work is merged into {probe['base']} via a pull request",
+                                "No uncommitted or unpushed changes remain",
+                            ],
+                        }
+                        try:
+                            _execute_goal_action(
+                                goal, delivery_milestone,
+                                _goal_delivery_prompt(goal, gaps, probe),
+                                chat_id, session,
+                            )
+                        except Exception as e:
+                            send_message(chat_id, f"Delivery attempt failed: {e}")
+                        _save_goal(goal)
+                        continue  # Re-assess; the gate re-checks before completing.
+                    if detail:
+                        send_message(chat_id, f"✅ _Delivery verified — {detail}._",
+                                     parse_mode="Markdown")
                 send_message(chat_id,
                     f"Goal completed! *{goal.get('title', '')}*\n"
                     f"{len(goal.get('iterations', []))} iterations, "
