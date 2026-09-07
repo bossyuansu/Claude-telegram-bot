@@ -90,9 +90,9 @@ CLAUDE_SINGLE_TURN_GUARDRAIL = (
 # Bot-side auto-continue (#3): when a /claude turn ends flagged INCOMPLETE, the bot resumes
 # it automatically (bounded) so long "monitor until merged/deploy" tasks actually finish.
 try:
-    CLAUDE_AUTO_CONTINUE_MAX = max(0, int(os.environ.get("CLAUDE_AUTO_CONTINUE_MAX", "5")))
+    CLAUDE_AUTO_CONTINUE_MAX = max(0, int(os.environ.get("CLAUDE_AUTO_CONTINUE_MAX", "10")))
 except ValueError:
-    CLAUDE_AUTO_CONTINUE_MAX = 5
+    CLAUDE_AUTO_CONTINUE_MAX = 10
 # Trigger only on the explicit marker Claude is instructed to emit (line-anchored to avoid
 # matching the word "incomplete" mid-sentence). Precision over recall — a false auto-continue
 # wastes tokens and could loop, whereas a miss just reverts to the old manual behavior.
