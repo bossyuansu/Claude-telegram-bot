@@ -290,17 +290,17 @@ def main():
                     file_size = video.get("file_size", 0)
 
                     if file_size > bot.MAX_TELEGRAM_FILE_BYTES:
-                        bot.send_message(chat_id, "❌ Video too large. Maximum size is 50MB.")
+                        bot.send_message(chat_id, bot.telegram_too_large_message("Video", file_size))
                         continue
 
                     bot.send_message(chat_id, f"🎥 _Downloading {file_name}..._")
-                    local_path = bot.download_telegram_file(file_id, file_name)
+                    local_path, dl_err = bot.download_telegram_file_ex(file_id, file_name)
                     if local_path:
                         prompt = bot.build_video_analysis_prompt(local_path, text)
                         print(f"Received video from {chat_id}: {file_name}, saved to {local_path}")
                         bot.handle_message(chat_id, prompt)
                     else:
-                        bot.send_message(chat_id, "❌ Failed to download video.")
+                        bot.send_message(chat_id, dl_err or "❌ Failed to download video.")
                     continue
 
                 # Handle document/file uploads
@@ -313,7 +313,7 @@ def main():
 
                     if file_size > bot.MAX_TELEGRAM_FILE_BYTES:
                         label = "Video" if is_video else "File"
-                        bot.send_message(chat_id, f"❌ {label} too large. Maximum size is 50MB.")
+                        bot.send_message(chat_id, bot.telegram_too_large_message(label, file_size))
                         continue
 
                     if is_video:
@@ -322,7 +322,7 @@ def main():
                     else:
                         bot.send_message(chat_id, f"📄 _Downloading {file_name}..._")
 
-                    local_path = bot.download_telegram_file(file_id, file_name)
+                    local_path, dl_err = bot.download_telegram_file_ex(file_id, file_name)
                     if local_path:
                         if is_video:
                             prompt = bot.build_video_analysis_prompt(local_path, text)
@@ -333,7 +333,7 @@ def main():
                             print(f"Received file from {chat_id}: {file_name}, saved to {local_path}")
                         bot.handle_message(chat_id, prompt)
                     else:
-                        bot.send_message(chat_id, "❌ Failed to download file.")
+                        bot.send_message(chat_id, dl_err or "❌ Failed to download file.")
                     continue
 
                 # Skip if no text content

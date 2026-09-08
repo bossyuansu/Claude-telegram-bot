@@ -6,6 +6,7 @@ Supports interactive prompts, plan mode, and multiple working directories.
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -196,7 +197,15 @@ try:
 except ValueError:
     DEEPREVIEW_CLAUDE_STALE_TIMEOUT = 900
 
-API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+# Telegram Bot API endpoint. The cloud API refuses `getFile` above 20 MB ("Bad Request: file is
+# too big") no matter how large an upload the user's client allowed, so big files could be sent to
+# the bot but never fetched for analysis. A self-hosted local Bot API server raises that to 2000 MB
+# and — in --local mode — returns an absolute path on disk instead of a download URL, skipping the
+# transfer entirely. Point TELEGRAM_API_BASE at it (e.g. http://127.0.0.1:8081) to switch.
+TELEGRAM_CLOUD_API = "https://api.telegram.org"
+TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", TELEGRAM_CLOUD_API).rstrip("/")
+TELEGRAM_LOCAL_API = TELEGRAM_API_BASE != TELEGRAM_CLOUD_API
+API_URL = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}"
 DATA_DIR = Path(__file__).parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 ACTIVE_TASKS_FILE = DATA_DIR / "active_tasks.json"  # Track running tasks for crash recovery
@@ -211,7 +220,13 @@ GOALS_INDEX_FILE = GOALS_DIR / "index.json"  # Maps chat_id -> [goal_ids]
 GLOBAL_LEARNINGS_FILE = GOALS_DIR / "global_learnings.json"  # Cross-goal learnings
 UPLOADS_DIR = DATA_DIR / "uploads"  # Directory for downloaded files
 FILE_CACHE_DIR = DATA_DIR / "file-cache"  # Materialized files for /file fallbacks
-MAX_TELEGRAM_FILE_BYTES = 50 * 1024 * 1024
+# Ceiling for files we accept for analysis. This must track what getFile can actually FETCH, not
+# what a client can send: it was 50 MB against a cloud API that caps downloads at 20 MB, so 20–50 MB
+# files passed the gate and then died at getFile with a bare "Failed to download".
+TELEGRAM_CLOUD_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+TELEGRAM_LOCAL_DOWNLOAD_LIMIT = 2000 * 1024 * 1024
+MAX_TELEGRAM_FILE_BYTES = (TELEGRAM_LOCAL_DOWNLOAD_LIMIT if TELEGRAM_LOCAL_API
+                           else TELEGRAM_CLOUD_DOWNLOAD_LIMIT)
 VIDEO_EXTENSIONS = {
     ".3g2", ".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4",
     ".mpeg", ".mpg", ".ogv", ".webm", ".wmv",
@@ -710,46 +725,88 @@ def handle_command_for_session(chat_id, text, session):
         _active_session_override.session = previous
 
 
+def telegram_too_large_message(label, file_size=0):
+    """Explain a rejected upload in terms the user can act on."""
+    limit_mb = MAX_TELEGRAM_FILE_BYTES // (1024 * 1024)
+    got = f" ({file_size / (1024 * 1024):.0f}MB)" if file_size else ""
+    if TELEGRAM_LOCAL_API:
+        return f"❌ {label} too large{got}. Maximum is {limit_mb}MB."
+    return (f"❌ {label} too large{got}. The cloud Telegram Bot API caps downloads at {limit_mb}MB, "
+            "even though your client let you upload it.\n\n"
+            "Fix: run a local Bot API server (`./scripts/telegram-local-api.sh setup`) to raise "
+            "this to 2000MB — or split the file and send the parts.")
+
+
 def download_telegram_file(file_id, filename=None):
-    """Download a file from Telegram and return the local path."""
+    """Download a file from Telegram and return the local path (None on failure).
+
+    Returns the path as a str. Raises nothing — callers treat None as "tell the user it failed".
+    """
+    path, _err = download_telegram_file_ex(file_id, filename)
+    return path
+
+
+def download_telegram_file_ex(file_id, filename=None):
+    """Download a Telegram file. Returns (local_path, error_message).
+
+    error_message is a user-facing explanation on failure, so the caller can say WHY rather than a
+    bare "Failed to download" — the size ceiling in particular is worth naming, since the user
+    cannot tell from Telegram's UI that a file their client happily uploaded cannot be fetched back.
+    """
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Get file path from Telegram
-        resp = requests.get(f"{API_URL}/getFile", params={"file_id": file_id}, timeout=30)
+        resp = requests.get(f"{API_URL}/getFile", params={"file_id": file_id}, timeout=60)
         resp_json = resp.json()
         if not resp_json.get("ok"):
-            print(f"getFile failed for {file_id}: {resp_json.get('description', resp_json)}")
-            return None
+            desc = str(resp_json.get("description", resp_json))
+            print(f"getFile failed for {file_id}: {desc}")
+            if "too big" in desc.lower():
+                limit_mb = MAX_TELEGRAM_FILE_BYTES // (1024 * 1024)
+                hint = ("" if TELEGRAM_LOCAL_API else
+                        "\n\nThe cloud Bot API caps downloads at 20MB regardless of what your "
+                        "client let you upload. Run a local Bot API server to raise this to 2000MB "
+                        "(see docs/large-files.md), or split the file first.")
+                return None, f"❌ Telegram refused the download: file is over the {limit_mb}MB limit.{hint}"
+            return None, f"❌ Telegram refused the download: {desc}"
+
         file_info = resp_json.get("result", {})
         file_path = file_info.get("file_path")
-
         if not file_path:
             print(f"getFile returned no file_path for {file_id}: {file_info}")
-            return None
+            return None, "❌ Telegram returned no file path for that file."
 
-        # Download the file
-        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-        resp = requests.get(download_url, timeout=60)
-
-        if resp.status_code != 200:
-            return None
-
-        # Determine filename
-        if not filename:
-            filename = file_path.split("/")[-1]
-
-        # Save to uploads directory with timestamp to avoid collisions
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_path = UPLOADS_DIR / f"{timestamp}_{filename}"
+        local_path = UPLOADS_DIR / f"{timestamp}_{filename or os.path.basename(file_path)}"
 
-        with open(local_path, "wb") as f:
-            f.write(resp.content)
+        # A local Bot API server in --local mode hands back an absolute path on disk; the file is
+        # already here, so link it into uploads instead of transferring it over HTTP. Hard-link
+        # first (free, no copy) and fall back to a copy across filesystems.
+        if TELEGRAM_LOCAL_API and os.path.isabs(file_path) and os.path.exists(file_path):
+            try:
+                os.link(file_path, local_path)
+            except OSError:
+                shutil.copyfile(file_path, local_path)
+            return str(local_path), None
 
-        return str(local_path)
+        # Stream to disk: a large file read via resp.content buffers the whole thing in memory, and
+        # the old 60s total timeout aborted downloads that were progressing fine.
+        download_url = f"{TELEGRAM_API_BASE}/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        with requests.get(download_url, timeout=(30, 120), stream=True) as r:
+            if r.status_code != 200:
+                print(f"file download HTTP {r.status_code} for {file_id}")
+                return None, f"❌ Download failed (HTTP {r.status_code})."
+            written = 0
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        written += len(chunk)
+        print(f"Downloaded {written} bytes to {local_path}", flush=True)
+        return str(local_path), None
     except Exception as e:
         print(f"Error downloading file: {e}")
-        return None
+        return None, f"❌ Download failed: {e}"
 
 
 def _safe_upload_filename(filename, fallback_name, mime_type=None):
