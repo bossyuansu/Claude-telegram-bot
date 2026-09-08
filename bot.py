@@ -2352,6 +2352,45 @@ def _goal_delivery_gaps(cwd):
     return gaps, probe, detail
 
 
+def _goal_scope_files(cwd, base_sha):
+    """Files this goal touched: committed since its starting SHA, plus anything still uncommitted."""
+    files = set()
+    if base_sha:
+        out = _git_out(cwd, "diff", "--name-only", f"{base_sha}...HEAD") or ""
+        files.update(x for x in out.splitlines() if x)
+    porcelain = _git_out(cwd, "status", "--porcelain", strip=False) or ""
+    files.update(_porcelain_paths(porcelain))
+    return sorted(f for f in files if f)
+
+
+def _goal_record_review_scope(goal, chat_id, session):
+    """Hand the goal's concrete file list to the session so a later review can find the work.
+
+    A follow-up /deepreview otherwise scopes itself from Claude's conversational memory ("the code
+    you've been working on"). A goal running in Codex mode never enters that memory at all, so the
+    review would look at the wrong thing — or nothing. This leaves a durable, git-derived record.
+    """
+    try:
+        cwd = goal.get("cwd") or os.getcwd()
+        files = _goal_scope_files(cwd, goal.get("base_sha"))
+        if not files:
+            return
+        session["last_goal_scope"] = {
+            "goal_id": goal.get("id") or goal.get("goal_id"),
+            "title": goal.get("title", ""),
+            "base_sha": goal.get("base_sha"),
+            "cwd": cwd,
+            "files": files[:100],
+            "file_count": len(files),
+            "milestones": [m.get("title", "") for m in goal.get("milestones", [])][:20],
+            "ended_at": datetime.now().isoformat(),
+        }
+        save_sessions(force=True)
+        print(f"[Goal] Recorded review scope: {len(files)} file(s) for later review", flush=True)
+    except Exception as e:
+        print(f"[Goal] Failed to record review scope: {e}", flush=True)
+
+
 def _goal_delivery_prompt(goal, gaps, probe):
     """Instruction for an extra iteration whose only job is to land the work."""
     gap_lines = "\n".join(f"  - {g}" for g in gaps)
@@ -3571,6 +3610,15 @@ def _run_goal_loop(chat_id, session_id, goal_id):
     _ws_session_override.name = session.get("name", "")
     _bind_codex_model(session)
 
+    # Pin where this goal started, so "what did the goal change" is answerable afterwards by diff
+    # rather than by memory. Set once — a resumed goal must keep its ORIGINAL baseline, otherwise
+    # the resume silently narrows the scope to whatever is left.
+    if not goal.get("base_sha"):
+        base_sha = _git_out(goal.get("cwd", os.getcwd()), "rev-parse", "HEAD")
+        if base_sha:
+            goal["base_sha"] = base_sha
+            _save_goal(goal)
+
     # Broadcast goal started
     total = len(goal.get("milestones", []))
     done = sum(1 for m in goal.get("milestones", []) if m.get("status") == "completed")
@@ -4144,6 +4192,13 @@ def _run_goal_loop(chat_id, session_id, goal_id):
             final_goal = _load_goal(goal_id)
             if final_goal and final_goal.get("status") == "paused":
                 _schedule_goal_checkin(final_goal)
+        except Exception:
+            pass
+        # Hand the goal's file list to the session for any follow-up review. Done on EVERY exit
+        # path (complete / pause / abandon / error), because a review after a paused or failed goal
+        # is exactly when knowing what it touched matters most.
+        try:
+            _goal_record_review_scope(_load_goal(goal_id) or goal, chat_id, session)
         except Exception:
             pass
         # Never leave an orphaned subprocess behind, whatever the exit reason
@@ -7747,14 +7802,24 @@ _WS_BEHIND_HAZARD = 10        # commits behind base => stale checkout; work like
 _WS_SCOPE_BLEED_FILES = 30    # uncommitted files => mixed/shared checkout with unrelated work
 
 
-def _git_out(cwd, *args, timeout=10):
+def _git_out(cwd, *args, timeout=10, strip=True):
+    """Run git in cwd; stdout or None. Pass strip=False where leading whitespace is significant
+    (`status --porcelain` encodes the unstaged state as a LEADING SPACE — stripping it shifts the
+    line and silently truncates the first character of the first filename)."""
     try:
         r = subprocess.run(["git", *args], cwd=cwd, stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                            text=True, timeout=timeout)
-        return r.stdout.strip() if r.returncode == 0 else None
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() if strip else r.stdout
     except Exception:
         return None
+
+
+def _porcelain_paths(porcelain):
+    """Paths from `git status --porcelain` output. Format is two status chars, a space, then path."""
+    return [ln[3:].strip() for ln in (porcelain or "").splitlines() if ln.strip()]
 
 
 def _workspace_probe(cwd):
@@ -7781,8 +7846,8 @@ def _workspace_probe(cwd):
                 behind, ahead = int(b), int(a)
             except ValueError:
                 pass
-    porcelain = _git_out(cwd, "status", "--porcelain") or ""
-    dirty = [ln[3:] for ln in porcelain.splitlines() if ln.strip()]
+    porcelain = _git_out(cwd, "status", "--porcelain", strip=False) or ""
+    dirty = _porcelain_paths(porcelain)
     changed_vs_base = []
     if base:
         cvb = _git_out(cwd, "diff", "--name-only", f"{base}...HEAD")
@@ -10035,6 +10100,47 @@ def _deepreview_wait(chat_key, seconds):
     return deepreview_active.get(chat_key, {}).get("active", False)
 
 
+_GOAL_SCOPE_HANDOFF_MAX_AGE = 24 * 3600  # a goal from days ago is not what /deepreview means now
+
+
+def _deepreview_scope_context(cwd, session):
+    """Concrete files for /deepreview to review, instead of 'what we discussed'.
+
+    Two sources, both git-derived: the file list a just-finished goal recorded (which survives even
+    when the goal ran entirely in Codex and never touched Claude's context), and the live
+    diff-vs-base workspace scope. Returns "" when neither is available, leaving the original
+    conversational scoping untouched.
+    """
+    parts = []
+    handoff = (session or {}).get("last_goal_scope") or {}
+    files = handoff.get("files") or []
+    if files and os.path.realpath(handoff.get("cwd") or cwd) == os.path.realpath(cwd):
+        fresh = True
+        try:
+            ended = datetime.fromisoformat(handoff["ended_at"])
+            fresh = (datetime.now() - ended).total_seconds() <= _GOAL_SCOPE_HANDOFF_MAX_AGE
+        except Exception:
+            pass
+        if fresh:
+            shown = files[:60]
+            more = handoff.get("file_count", len(files)) - len(shown)
+            parts.append(
+                "\n\nREVIEW THIS — files changed by the goal that just ran"
+                f" (\"{handoff.get('title', '')}\"):\n  - "
+                + "\n  - ".join(shown)
+                + (f"\n  … (+{more} more)" if more > 0 else "")
+                + "\nThis work may have been done by another model (Codex) and may NOT be in your "
+                  "conversation history. Read these files from disk before judging them.\n"
+            )
+    try:
+        scope_block, _hz = _workspace_scope(cwd)
+    except Exception:
+        scope_block = ""
+    if scope_block:
+        parts.append("\n" + scope_block)
+    return "".join(parts)
+
+
 def run_deepreview_loop(chat_id, session):
     """Main deep review loop for /deepreview."""
     session_id = get_session_id(session)
@@ -10193,6 +10299,10 @@ ORIGINAL STEP PROMPT:
                     session_context = f"\n\nSESSION CONTEXT (what we've been working on):\n{session['last_summary'][:2000]}\n"
                 elif session.get("last_prompt"):
                     session_context = f"\n\nLAST TASK: {session['last_prompt']}\n"
+                # Anchor to files that actually changed. Conversational scoping alone reviews the
+                # wrong thing after an autonomous loop — a goal run in Codex mode never entered
+                # Claude's memory, so "the code you've been working on" refers to nothing.
+                session_context += _deepreview_scope_context(cwd, session)
 
                 prompt = f"""Do a deep, thorough review of the code you've been working on in this session. Focus on the files and areas we've touched or discussed — NOT the entire project.{session_context}
 Be ruthlessly critical. Look for:
