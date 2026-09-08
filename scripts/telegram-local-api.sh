@@ -100,10 +100,19 @@ cmd_cutover() {
     echo "✅ already on the local API"; exit 0
   fi
 
-  echo "→ logging the bot out of the cloud API (required to move it)"
-  curl -s --max-time 30 "$CLOUD_BASE/bot${TELEGRAM_TOKEN}/logOut" >/dev/null || true
-  # logOut is asynchronous server-side; the token is unusable on the cloud for ~10min afterwards.
-  sleep 5
+  # The docs say a token must be logOut of the cloud before moving to a local server, but this
+  # server serves getMe/getUpdates/sendMessage for the token without it. logOut is destructive —
+  # it locks the token out of the cloud API for ~10 minutes, so a failed cutover would strand the
+  # bot. Only fall back to it if the local server actually refuses to serve the token.
+  echo "→ checking whether the local server already serves this token"
+  if ! api_ok "$LOCAL_BASE"; then
+    echo "  it does not — logging out of the cloud API (token unusable there for ~10min)"
+    curl -s --max-time 30 "$CLOUD_BASE/bot${TELEGRAM_TOKEN}/logOut" >/dev/null || true
+    sleep 5
+    api_ok "$LOCAL_BASE" || die "local server still will not serve the token; aborting before restart"
+  else
+    echo "  it does — skipping logOut, so rollback stays instant"
+  fi
 
   echo "→ pointing the bot at $LOCAL_BASE"
   set_env_var TELEGRAM_API_BASE "$LOCAL_BASE"
@@ -124,9 +133,10 @@ cmd_cutover() {
 
 cmd_rollback() {
   load_env
-  echo "→ logging out of the local API"
-  curl -s --max-time 30 "$LOCAL_BASE/bot${TELEGRAM_TOKEN}/logOut" >/dev/null || true
-  sleep 3
+  echo "→ returning the bot to the cloud API"
+  # No logOut here: if cutover never logged out of the cloud, the token is still valid there and
+  # rollback is just an env change. Calling logOut on the local server would be the destructive
+  # move, not the safe one.
   set_env_var TELEGRAM_API_BASE ""
   sudo systemctl restart claude-telegram-bot.service
   sleep 5
