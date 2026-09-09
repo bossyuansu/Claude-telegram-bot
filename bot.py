@@ -6296,6 +6296,32 @@ def is_allowed(chat_id):
     return str(chat_id) in ALLOWED_CHAT_IDS
 
 
+def _codex_error_text(err):
+    """Human-readable text from a codex JSON-stream error payload.
+
+    `turn.failed`/`error` carry a `message` that is often itself a JSON envelope, e.g.
+    '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"..."}}'.
+    Unwrap one level so the user sees the actual reason instead of a wall of escaped JSON, and
+    keep codex_error_info (e.g. misalignment_policy_violation) since it names the class of refusal.
+    """
+    if not isinstance(err, dict):
+        return str(err or "").strip()
+    msg = err.get("message") or ""
+    info = err.get("codex_error_info") or ""
+    if isinstance(msg, str) and msg.lstrip().startswith("{"):
+        try:
+            inner = json.loads(msg)
+            nested = inner.get("error") if isinstance(inner.get("error"), dict) else inner
+            msg = nested.get("message") or msg
+            info = info or nested.get("type") or ""
+        except Exception:
+            pass
+    text = str(msg).strip()
+    if info and info not in text:
+        text = f"{text} ({info})" if text else str(info)
+    return text
+
+
 def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, ws_session="", process_key=None):
     """Run Codex synchronously and return the output text.
 
@@ -6416,6 +6442,7 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
 
         # Parse JSONL output to extract agent messages and session ID
         accumulated_text = ""
+        stream_error = ""  # first fatal error on the JSON stream (turn.failed / error)
         thread_id = None
         item_text_lengths = {}  # item_id -> length of text already appended
         processed_item_ids = set()
@@ -6432,6 +6459,14 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
 
                     if etype == "thread.started" and event.get("thread_id"):
                         thread_id = event["thread_id"]
+
+                    # A turn can fail server-side with no assistant message at all — e.g. the
+                    # safety classifier returning misalignment_policy_violation. That arrives ONLY
+                    # on the JSON stream, never on stderr, so _codex_stderr_reason never saw it and
+                    # the user just got a blank reply with no hint anything went wrong.
+                    elif etype in ("turn.failed", "error"):
+                        err = event.get("error") if isinstance(event.get("error"), dict) else event
+                        stream_error = stream_error or _codex_error_text(err)
 
                     elif etype in ["item.started", "item.updated", "item.completed"]:
                         item = event.get("item", {})
@@ -6526,6 +6561,14 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
             print(f"[Codex] Session ID saved: {thread_id}", flush=True)
 
         result = accumulated_text.strip()
+
+        # A blocked or failed turn yields no agent_message. Returning "" showed the user a blank
+        # reply; say why instead. Only substitute when there is nothing to show — a turn that
+        # produced text AND then failed keeps its text, with the reason appended.
+        if stream_error:
+            print(f"[Codex] turn failed: {stream_error[:300]}", flush=True)
+            notice = f"⚠️ _Codex returned no response:_ {stream_error[:500]}"
+            result = f"{result}\n\n{notice}" if result else notice
 
         if streaming:
             _ws_stream(chat_id, "done", ws_msg_id, session=ws_session,
