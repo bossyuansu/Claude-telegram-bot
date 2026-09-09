@@ -11970,10 +11970,20 @@ Send a message to start working!""")
                         return True
                     if goal and _goal_clear_expired_rate_limit(goal):
                         _save_goal(goal)
+                # Drop anything queued while paused. Those messages were addressed to the bot,
+                # not to the loop — injecting them as "user feedback" on resume would steer the
+                # goal with side conversation it was never meant to act on. Routing no longer
+                # captures while paused, so this only clears a backlog from before that fix (and
+                # guards against it recurring).
+                stale = len(user_feedback_queue.pop(goal_key, []) or [])
                 state["paused"] = False
                 resume_event = state.get("resume_event")
                 if resume_event:
                     resume_event.set()
+                if stale:
+                    send_message(chat_id,
+                        f"_Discarded {stale} message(s) queued while paused — they were not sent "
+                        "to the goal._")
                 # Cancel any paused check-in and restore active status on disk
                 if active_gid:
                     goal = _load_goal(active_gid)

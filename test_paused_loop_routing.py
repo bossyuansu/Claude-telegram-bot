@@ -96,6 +96,38 @@ class TestPausedLoopRouting(unittest.TestCase):
         captured, _ = self.send("!urgent")
         self.assertFalse(captured)
 
+    def test_resume_discards_feedback_queued_while_paused(self):
+        """Messages typed while paused were addressed to the bot, not the loop — resuming must
+        not inject them as goal feedback and steer the goal with side conversation."""
+        bot.goal_state[KEY] = {"active": True, "paused": True, "resume_event": mock.MagicMock()}
+        bot.goal_active[KEY] = "goal_x"
+        bot.user_feedback_queue[KEY] = ["what is the status", "are you there"]
+        self.addCleanup(lambda: bot.goal_active.pop(KEY, None))
+        with mock.patch.object(bot, "send_message") as sm, \
+             mock.patch.object(bot, "get_active_session", return_value=SESSION), \
+             mock.patch.object(bot, "_load_goal", return_value=None), \
+             mock.patch.object(bot, "_goal_rate_limit_resume_delay", return_value=(0, None)), \
+             mock.patch.object(bot, "save_active_tasks"), \
+             mock.patch.object(bot, "_ws_broadcast_goal"):
+            bot.handle_command(CHAT, "/goal resume")
+        self.assertNotIn(KEY, bot.user_feedback_queue, "stale feedback must be dropped on resume")
+        self.assertFalse(bot.goal_state[KEY]["paused"], "resume must unpause")
+        said = " ".join(c.args[1] for c in sm.call_args_list)
+        self.assertIn("Discarded 2", said, "the user must be told what was dropped")
+
+    def test_resume_says_nothing_when_queue_is_empty(self):
+        bot.goal_state[KEY] = {"active": True, "paused": True, "resume_event": mock.MagicMock()}
+        bot.goal_active[KEY] = "goal_x"
+        self.addCleanup(lambda: bot.goal_active.pop(KEY, None))
+        with mock.patch.object(bot, "send_message") as sm, \
+             mock.patch.object(bot, "get_active_session", return_value=SESSION), \
+             mock.patch.object(bot, "_load_goal", return_value=None), \
+             mock.patch.object(bot, "_goal_rate_limit_resume_delay", return_value=(0, None)), \
+             mock.patch.object(bot, "save_active_tasks"), \
+             mock.patch.object(bot, "_ws_broadcast_goal"):
+            bot.handle_command(CHAT, "/goal resume")
+        self.assertNotIn("Discarded", " ".join(c.args[1] for c in sm.call_args_list))
+
     def test_no_loop_at_all_is_unaffected(self):
         captured, ran = self.send("plain message")
         self.assertFalse(captured)
