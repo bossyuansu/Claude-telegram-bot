@@ -195,6 +195,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Message IDs being tracked via WS-native stream events (ignore legacy edit events for these). */
     private val streamingMessageIds = mutableSetOf<Int>()
+
+    /**
+     * Streams for sessions the current filter hides.
+     *
+     * "start" persists a row with text = "" for every session, but "append" used to return early
+     * when the session was filtered out — so the DB row stayed empty while the message streamed on
+     * the server. Switching TO that session then showed only the tail, because the reload found the
+     * empty row and later appends built on it. Accumulating here keeps a complete copy to merge in
+     * when the filter changes. Bounded by the number of concurrently streaming messages.
+     */
+    private val offscreenStreams = mutableMapOf<Int, ChatMessage>()
     /** Message IDs currently being inserted from WS replay; prevents duplicate races. */
     private val pendingIncomingMessageIds = mutableSetOf<Int>()
     /** Positive message IDs already persisted in local DB (used for replay dedupe without async races). */
@@ -457,9 +468,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Messages still mid-stream, as of now. Their newest text exists only in memory. */
+    /** Messages still mid-stream, as of now. Their newest text exists only in memory —
+     *  both the ones on screen and the ones accumulating behind the current filter. */
     private fun streamingSnapshot(): List<ChatMessage> =
-        messages.filter { it.messageId in streamingMessageIds }
+        messages.filter { it.messageId in streamingMessageIds } + offscreenStreams.values
 
     /**
      * Replace the visible list with `dbRows`, preserving any message that is still streaming.
@@ -484,6 +496,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 messages.add(s)
             }
+            // Now visible: the on-screen list owns it from here.
+            offscreenStreams.remove(s.messageId)
         }
         rebuildIndex()
     }
@@ -1628,6 +1642,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     messages.add(chatMsg)
                     idToIndex[mid] = idx
                     scrollTrigger.value++
+                } else {
+                    // Hidden by the filter — track it so switching to this session shows the whole
+                    // message rather than whatever arrived after the switch.
+                    offscreenStreams[mid] = chatMsg
                 }
                 viewModelScope.launch(Dispatchers.IO) {
                     dao.upsertByMessageId(chatMsg.toEntity())
@@ -1647,8 +1665,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (idx == null) {
                     // Replayed append for a finalized message we already have in DB: ignore.
                     if (msg.isReplay && mid in finalizedMessageIds) return
-                    // Filtered-out session: skip in-memory tracking
-                    if (!matchesSessionFilter(msg.session)) return
+                    // Filtered-out session: keep accumulating off-screen instead of dropping the
+                    // text. Returning here left the DB row on its empty "start" value, so switching
+                    // to this session mid-stream lost everything generated before the switch.
+                    if (!matchesSessionFilter(msg.session)) {
+                        val cur = offscreenStreams[mid] ?: ChatMessage(
+                            messageId = mid, text = "", isFromBot = true,
+                            session = msg.session, isReplay = msg.isReplay,
+                            timestamp = msg.createdOrNow
+                        )
+                        val merged = cur.copy(text = cur.text + msg.text)
+                        offscreenStreams[mid] = merged
+                        val nowOff = System.currentTimeMillis()
+                        if (nowOff - (lastStreamPersist[mid] ?: 0L) >= STREAM_PERSIST_INTERVAL_MS) {
+                            lastStreamPersist[mid] = nowOff
+                            viewModelScope.launch(Dispatchers.IO) {
+                                dao.upsertByMessageId(merged.toEntity())
+                            }
+                        }
+                        return
+                    }
                     val chatMsg = ChatMessage(
                         messageId = mid, text = "", isFromBot = true,
                         session = msg.session, isReplay = msg.isReplay, timestamp = msg.createdOrNow
@@ -1708,6 +1744,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "done" -> {
                 streamingMessageIds.remove(mid)
                 lastStreamPersist.remove(mid)
+                // The terminal event carries the authoritative full text, so any partial copy we
+                // accumulated behind the filter is now redundant.
+                offscreenStreams.remove(mid)
                 val doneExisting = findMessageIndex(mid)
                 // Skip if already finalized in memory (replay of completed message)
                 if (doneExisting != null && messages[doneExisting].text.contains("———")) return
