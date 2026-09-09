@@ -1159,6 +1159,25 @@ def _ws_broadcast_status(chat_id, mode, phase, step, active=True, task="", start
     })
 
 
+def _ws_busy(chat_id, active, session_name=None):
+    """Broadcast the busy indicator, scoped to the session it belongs to.
+
+    The app treats an ABSENT session as "matches whatever I'm viewing"
+    (ChatViewModel: `msg.session.isEmpty() || msg.session == effectiveSession`), so an untagged
+    busy event marked the UI busy in whichever session the user had open — including work started
+    by a timer or by the app against a non-active session.
+
+    Same precedence as send_message: explicit arg > thread-local override > active session.
+    """
+    if session_name is None:
+        session_name = getattr(_ws_session_override, 'name', None)
+        if session_name is None:
+            _s = get_active_session(chat_id)
+            session_name = _s.get("name", "") if _s else ""
+    _ws_broadcast(chat_id, "status",
+                  {"mode": "busy", "active": active, "session": session_name or ""})
+
+
 def _ws_broadcast_goal(chat_id, event, goal_id, data=None):
     """Broadcast a goal event over WS.
 
@@ -5154,7 +5173,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
 
         # Track active process for cancellation (by session_id for parallel support)
         active_processes[process_key] = process
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        _ws_busy(chat_id, True)
 
         # Drain stderr in background so errors are logged instead of silently lost
         claude_stderr_lines = []
@@ -5594,7 +5613,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         # Also pop the other key in case both exist
         active_processes.pop(process_key, None)
         cron_bg_sessions.pop(_cron_bg_key, None)
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+        _ws_busy(chat_id, False)
         mark_session_done(process_key)
 
         _ws_suppress.active = False
@@ -5604,7 +5623,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         _ws_suppress.active = False
         active_processes.pop(_cron_bg_key or process_key, None)
         active_processes.pop(process_key, None)
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+        _ws_busy(chat_id, False)
         mark_session_done(process_key)
         _ws_stream(chat_id, "done", message_id, session=_stream_session,
                    text="Error: Claude CLI not found", cancelled=False, file_changes=[])
@@ -5614,7 +5633,7 @@ def run_claude_streaming(prompt, chat_id, cwd=None, continue_session=False, sess
         _ws_suppress.active = False
         active_processes.pop(_cron_bg_key or process_key, None)
         active_processes.pop(process_key, None)
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+        _ws_busy(chat_id, False)
         mark_session_done(process_key)
         # Ensure subprocess pipes are cleaned up
         try:
@@ -6656,7 +6675,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
 
         # Register for /cancel support
         active_processes[process_key] = process
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        _ws_busy(chat_id, True)
 
         # Drain stderr in background
         stderr_lines = []
@@ -6899,7 +6918,7 @@ def run_gemini_streaming(prompt, chat_id, cwd=None, session=None, session_id=Non
         except UnboundLocalError:
             pass
         active_processes.pop(process_key, None)
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+        _ws_busy(chat_id, False)
         # Ensure subprocess is cleaned up
         if process is not None:
             try:
@@ -7047,7 +7066,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
 
             # Track as active so messages get queued
             active_processes[session_id] = process
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+            _ws_busy(chat_id, True)
 
             # Drain stderr in background so errors are logged instead of silently lost
             codex_stderr_lines = []
@@ -7324,14 +7343,14 @@ def run_codex_task(chat_id, task, cwd, session=None):
             _ws_session_override.name = None
             mark_session_done(session_id)
             active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+            _ws_busy(chat_id, False)
             process_message_queue(chat_id, session)
 
     # Mark active under lock to prevent race with incoming messages
     lock = get_session_lock(session_id)
     with lock:
         active_processes[session_id] = None
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        _ws_busy(chat_id, True)
     thread = threading.Thread(target=codex_thread, daemon=True)
     thread.start()
     return thread
@@ -7396,7 +7415,7 @@ def run_gemini_task(chat_id, task, cwd, session=None):
 
             # Track as active so messages get queued
             active_processes[session_id] = process
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+            _ws_busy(chat_id, True)
 
             # Drain stderr in background so errors are logged instead of silently lost
             gemini_stderr_lines = []
@@ -7667,14 +7686,14 @@ def run_gemini_task(chat_id, task, cwd, session=None):
             _ws_session_override.name = None
             mark_session_done(session_id)
             active_processes.pop(session_id, None)
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+            _ws_busy(chat_id, False)
             process_message_queue(chat_id, session)
 
     # Mark active under lock to prevent race with incoming messages
     lock = get_session_lock(session_id)
     with lock:
         active_processes[session_id] = None
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        _ws_busy(chat_id, True)
     thread = threading.Thread(target=gemini_thread, daemon=True)
     thread.start()
     return thread, result
@@ -11368,7 +11387,7 @@ Send a message to start working!""")
                     active_processes.pop(session_id, None)
                     active_processes.pop(f"cron:{session_id}", None)
                     cron_bg_sessions.pop(f"cron:{session_id}", None)
-                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+                    _ws_busy(chat_id, False)
                     if goal_was_active:
                         send_message(chat_id, f"⚠️ *Goal cancelled* for `{session['name']}`.\n_Session preserved._")
                     elif justdoit_was_active:
@@ -11386,7 +11405,7 @@ Send a message to start working!""")
                     active_processes.pop(session_id, None)
                     active_processes.pop(f"cron:{session_id}", None)
                     cron_bg_sessions.pop(f"cron:{session_id}", None)
-                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+                    _ws_busy(chat_id, False)
                     send_message(chat_id, f"⚠️ Cancelled (process already finished).")
                 except Exception as e:
                     print(f"Cancel error: {e}", flush=True)
@@ -11396,7 +11415,7 @@ Send a message to start working!""")
                         active_processes.pop(session_id, None)
                         active_processes.pop(f"cron:{session_id}", None)
                         cron_bg_sessions.pop(f"cron:{session_id}", None)
-                        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+                        _ws_busy(chat_id, False)
                     except Exception:
                         pass
                     send_message(chat_id, f"⚠️ Cancelled operation for `{session['name']}`.")
@@ -11596,7 +11615,7 @@ Send a message to start working!""")
                 send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
                 return True
             active_processes[sid] = None
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+            _ws_busy(chat_id, True)
         session["last_cli"] = "Claude"
         run_claude_in_thread(chat_id, task, session=session)
         return True
@@ -11619,7 +11638,7 @@ Send a message to start working!""")
                 send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
                 return True
             active_processes[sid] = None
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+            _ws_busy(chat_id, True)
         session["last_cli"] = "Codex"
         run_codex_task(chat_id, task, session["cwd"], session=session)
         return True
@@ -11642,7 +11661,7 @@ Send a message to start working!""")
                 send_message(chat_id, f"📋 _Message queued (#{queue_pos}) for `{session.get('name', 'default')}`. Will process after current task._")
                 return True
             active_processes[sid] = None
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+            _ws_busy(chat_id, True)
         session["last_cli"] = "Gemini"
         run_gemini_task(chat_id, task, session["cwd"], session=session)
         return True
@@ -12648,7 +12667,7 @@ def handle_callback_query(callback_query):
                             s_lock = get_session_lock(s_id)
                             with s_lock:
                                 active_processes[s_id] = None
-                                _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+                                _ws_busy(chat_id, True)
                             run_claude_in_thread(chat_id, answer_text, session)
                     return
         except (ValueError, IndexError):
@@ -12878,7 +12897,7 @@ def _fire_delayed_resume(chat_id, session_id):
         if message_queue.get(session_id) or session_id in active_processes:
             return
         active_processes[session_id] = None
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        _ws_busy(chat_id, True)
     claude_autocontinue_count[session_id] = claude_autocontinue_count.get(session_id, 0) + 1
     n = claude_autocontinue_count[session_id]
     send_message(chat_id, f"⏳ _Resuming task ({n}/{CLAUDE_AUTO_CONTINUE_MAX})…_")
@@ -12949,7 +12968,7 @@ def _maybe_auto_continue_claude(chat_id, session, response):
         if message_queue.get(sid):
             return False
         active_processes[sid] = None
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        _ws_busy(chat_id, True)
     claude_autocontinue_count[sid] = claude_autocontinue_count.get(sid, 0) + 1
     n = claude_autocontinue_count[sid]
     send_message(chat_id, f"⏳ _Task flagged incomplete — auto-continuing ({n}/{CLAUDE_AUTO_CONTINUE_MAX})…_")
@@ -13064,7 +13083,7 @@ Format as a compact bullet list. This will be used to restore context after rese
             print(f"Error in claude thread: {e}")
             if session_id:
                 active_processes.pop(session_id, None)
-                _ws_broadcast(chat_id, "status", {"mode": "busy", "active": False})
+                _ws_busy(chat_id, False)
         finally:
             _finalize_sched_result(response, strip_completion=True)
             _ws_session_override.name = None
@@ -13087,7 +13106,7 @@ def process_message_queue(chat_id, session=None):
             queued_text = message_queue[session_id].pop(0)
             # Mark as active under lock before launching thread
             active_processes[session_id] = None
-            _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+            _ws_busy(chat_id, True)
         else:
             return
 
@@ -13205,7 +13224,7 @@ def handle_message(chat_id, text, session=None):
                 lock = get_session_lock(session_id)
                 with lock:
                     active_processes[session_id] = None
-                    _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+                    _ws_busy(chat_id, True, session.get("name") if session else None)
                 run_claude_in_thread(chat_id, answer_text, session)
         return
 
@@ -13269,7 +13288,9 @@ def handle_message(chat_id, text, session=None):
 
         # Mark as active immediately under the lock to prevent races
         active_processes[session_id] = None  # placeholder until real process starts
-        _ws_broadcast(chat_id, "status", {"mode": "busy", "active": True})
+        # `session` may be an app-targeted session that is NOT the active one; naming it explicitly
+        # stops the busy indicator lighting up whichever session the user is currently viewing.
+        _ws_busy(chat_id, True, session.get("name") if session else None)
 
     # Dispatch to the appropriate CLI runner based on session state
     last_cli = session.get("last_cli", "Claude") if session else "Claude"

@@ -134,8 +134,6 @@ class TestPausedLoopRouting(unittest.TestCase):
         self.assertTrue(ran)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestDelayedResumeSessionTag(unittest.TestCase):
@@ -187,3 +185,45 @@ class TestDelayedResumeSessionTag(unittest.TestCase):
         """The actual regression: the message landed in whatever session was open at the time."""
         seen = self.fire()
         self.assertNotEqual(seen.get("override"), "some-other-project")
+
+
+class TestBusyIndicatorScoping(unittest.TestCase):
+    """The busy indicator must name the session it belongs to.
+
+    The app treats an ABSENT session as "matches whatever I'm viewing"
+    (ChatViewModel: `msg.session.isEmpty() || msg.session == effectiveSession`), so an untagged
+    busy event lights up the wrong session's UI.
+    """
+
+    def broadcast(self, **kw):
+        seen = {}
+        with mock.patch.object(bot, "_ws_broadcast", side_effect=lambda c, t, d: seen.update(d)), \
+             mock.patch.object(bot, "get_active_session",
+                               return_value={"name": "currently-viewed", "id": "x"}):
+            bot._ws_busy(CHAT, True, **kw)
+        return seen
+
+    def test_explicit_session_wins(self):
+        self.assertEqual(self.broadcast(session_name="the-task-session")["session"],
+                         "the-task-session")
+
+    def test_thread_local_override_is_used_when_no_explicit_name(self):
+        bot._ws_session_override.name = "loop-session"
+        self.addCleanup(lambda: setattr(bot._ws_session_override, "name", None))
+        self.assertEqual(self.broadcast()["session"], "loop-session")
+
+    def test_falls_back_to_active_session(self):
+        bot._ws_session_override.name = None
+        self.assertEqual(self.broadcast()["session"], "currently-viewed")
+
+    def test_session_key_is_always_present(self):
+        """An absent key is what the app misreads as 'mine' — it must never be omitted."""
+        bot._ws_session_override.name = None
+        with mock.patch.object(bot, "get_active_session", return_value=None):
+            with mock.patch.object(bot, "_ws_broadcast",
+                                   side_effect=lambda c, t, d: self.assertIn("session", d)):
+                bot._ws_busy(CHAT, False)
+
+
+if __name__ == "__main__":
+    unittest.main()
