@@ -13110,7 +13110,13 @@ def handle_message(chat_id, text, session=None):
             (omni_state, "Omni"),
             (deepreview_state, "Deep review"),
         ]:
-            if candidate_state.get("active"):
+            # A PAUSED loop must not keep capturing messages. `/goal pause` (and the other
+            # pause paths) set paused=True but deliberately leave active=True, since `active`
+            # doubles as the not-cancelled flag the loops poll to decide whether to keep going.
+            # Gating on `active` alone therefore swallowed every message into the feedback queue
+            # of a loop that was not running to consume it — the user pauses precisely to talk to
+            # the bot normally, and instead got silence.
+            if candidate_state.get("active") and not candidate_state.get("paused"):
                 active_state = candidate_state
                 mode = candidate_mode
                 break
