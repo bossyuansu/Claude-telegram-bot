@@ -435,8 +435,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         isBotBusy.value = viewing.isNotEmpty() && activeTasks.containsKey(viewing)
         filterGeneration++
         val gen = filterGeneration
-        messages.clear()
-        idToIndex.clear()
+        // Carry in-flight streams across the reload. Snapshot BEFORE anything clears, and note the
+        // list is NOT cleared synchronously any more: doing so left a window in which "append"
+        // events arrived with an empty list, recreated the message from "" at index 0, and were
+        // then shuffled behind the DB rows appended after them.
+        val carry = streamingSnapshot()
         dbOffset = 0
         allLoaded.value = false
         isLoadingMore.value = false
@@ -447,13 +450,42 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             // Discard if another filter change happened while loading
             if (gen != filterGeneration) return@launch
-            val chatMsgs = entities.reversed().map { it.toChatMessage() }
-            messages.addAll(chatMsgs)
-            rebuildIndex()
+            swapMessages(entities.reversed().map { it.toChatMessage() }, carry)
             dbOffset = entities.size
             if (entities.size < PAGE_SIZE) allLoaded.value = true
             if (messages.isNotEmpty()) scrollTrigger.value++
         }
+    }
+
+    /** Messages still mid-stream, as of now. Their newest text exists only in memory. */
+    private fun streamingSnapshot(): List<ChatMessage> =
+        messages.filter { it.messageId in streamingMessageIds }
+
+    /**
+     * Replace the visible list with `dbRows`, preserving any message that is still streaming.
+     *
+     * A streaming message is only checkpointed to the DB every STREAM_PERSIST_INTERVAL_MS (2s), so
+     * reloading straight from disk either drops it — it may not be in the newest page at all — or
+     * rewinds it to the last checkpoint. Either way the user watches live text vanish or jump
+     * backwards mid-generation, which is what switching view filters used to do.
+     */
+    private fun swapMessages(dbRows: List<ChatMessage>, keepStreaming: List<ChatMessage>) {
+        messages.clear()
+        idToIndex.clear()
+        messages.addAll(dbRows)
+        for (s in keepStreaming) {
+            // A stream from a session the new filter excludes must not be carried in.
+            if (!matchesSessionFilter(s.session)) continue
+            val existing = messages.indexOfLast { it.messageId == s.messageId }
+            if (existing >= 0) {
+                // In-memory text is fresher than the throttled DB copy; keep whichever is longer so
+                // a terminal "———" row already persisted is never rewound either.
+                if (s.text.length > messages[existing].text.length) messages[existing] = s
+            } else {
+                messages.add(s)
+            }
+        }
+        rebuildIndex()
     }
 
     private fun matchesSessionFilter(session: String): Boolean {
@@ -485,11 +517,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             // Discard if a filter change raced this load.
             if (gen != filterGeneration) return@launch
-            // Swap contents only after the IO completes, to minimise flicker.
-            messages.clear()
-            idToIndex.clear()
-            messages.addAll(entities.reversed().map { it.toChatMessage() })
-            rebuildIndex()
+            // Swap contents only after the IO completes, to minimise flicker. Snapshot streams
+            // here rather than before the IO: a stream may have started while it was in flight.
+            val carry = streamingSnapshot()
+            swapMessages(entities.reversed().map { it.toChatMessage() }, carry)
             dbOffset = entities.size
             allLoaded.value = entities.size < PAGE_SIZE
             isLoadingMore.value = false
