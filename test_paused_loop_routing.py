@@ -136,3 +136,54 @@ class TestPausedLoopRouting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDelayedResumeSessionTag(unittest.TestCase):
+    """A delayed auto-continue must be attributed to the session the TASK belongs to.
+
+    _fire_delayed_resume runs on a one-shot threading.Timer, so _ws_session_override is unset and
+    send_message falls back to get_active_session() — tagging "Resuming task…" with whichever
+    session the user happens to be looking at, often a different project entirely.
+    """
+
+    TASK_SESSION = {"id": "taskS", "name": "life-companion", "cwd": "/tmp"}
+    OTHER_SESSION = {"id": "otherS", "name": "some-other-project", "cwd": "/tmp"}
+
+    def setUp(self):
+        bot.claude_autocontinue_count.pop("taskS", None)
+        bot.active_processes.pop("taskS", None)
+        bot.message_queue.pop("taskS", None)
+        bot.cancelled_sessions.discard("taskS")
+        self.addCleanup(lambda: bot.active_processes.pop("taskS", None))
+        self.addCleanup(lambda: bot.claude_autocontinue_count.pop("taskS", None))
+        self.addCleanup(lambda: setattr(bot._ws_session_override, "name", None))
+
+    def fire(self):
+        """Fire the timer callback; return the session tag in force when the message was sent."""
+        seen = {}
+
+        def capture(chat_id, text, *a, **kw):
+            seen["override"] = getattr(bot._ws_session_override, "name", None)
+            seen["text"] = text
+            return 1
+
+        bot._ws_session_override.name = None  # a fresh timer thread has none
+        with mock.patch.object(bot, "send_message", side_effect=capture), \
+             mock.patch.object(bot, "get_session_by_id", return_value=self.TASK_SESSION), \
+             mock.patch.object(bot, "get_active_session", return_value=self.OTHER_SESSION), \
+             mock.patch.object(bot, "run_claude_in_thread"), \
+             mock.patch.object(bot, "_clear_pending_resume"), \
+             mock.patch.object(bot, "_ws_broadcast"):
+            bot._fire_delayed_resume(CHAT, "taskS")
+        return seen
+
+    def test_resume_is_tagged_with_the_tasks_session(self):
+        seen = self.fire()
+        self.assertIn("Resuming task", seen.get("text", ""))
+        self.assertEqual(seen.get("override"), "life-companion",
+                         "resume must be attributed to the task's session, not the active one")
+
+    def test_resume_tag_is_not_the_currently_active_session(self):
+        """The actual regression: the message landed in whatever session was open at the time."""
+        seen = self.fire()
+        self.assertNotEqual(seen.get("override"), "some-other-project")

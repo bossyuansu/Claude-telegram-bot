@@ -12856,6 +12856,11 @@ def _fire_delayed_resume(chat_id, session_id):
     session = get_session_by_id(chat_id, session_id)
     if not session:
         return
+    # Tag everything this callback emits with the session the TASK belongs to. This runs on a
+    # one-shot threading.Timer, so the thread-local is unset and send_message would otherwise fall
+    # back to get_active_session() — attributing "Resuming task…" to whichever session the user
+    # happens to be looking at now, which may be a completely different project.
+    _ws_session_override.name = session.get("name", "")
     key = f"{chat_id}:{session_id}"
     if (justdoit_active.get(key, {}).get("active")
             or goal_state.get(key, {}).get("active")
