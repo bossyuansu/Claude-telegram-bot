@@ -6296,6 +6296,20 @@ def is_allowed(chat_id):
     return str(chat_id) in ALLOWED_CHAT_IDS
 
 
+# A safety-classifier refusal is STICKY. `codex exec resume` replays the entire thread every turn,
+# so whatever tripped the classifier is re-sent and re-trips forever — observed twice on
+# life-companion (2): 5 consecutive blocks on one thread, then 2 more on a fresh one once it had
+# accumulated the same kind of content. Only these markers are treated as poisoned; a quota or
+# network failure must NOT discard a working thread.
+_CODEX_POISONED_MARKERS = ("misalignment_policy_violation", "blocked by our safety systems")
+
+
+def _codex_thread_poisoned(err_text):
+    """True when the failure is a policy block that resuming this thread cannot recover from."""
+    t = (err_text or "").lower()
+    return any(m in t for m in _CODEX_POISONED_MARKERS)
+
+
 def _codex_error_text(err):
     """Human-readable text from a codex JSON-stream error payload.
 
@@ -6322,7 +6336,8 @@ def _codex_error_text(err):
     return text
 
 
-def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, ws_session="", process_key=None):
+def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, ws_session="",
+              process_key=None, _fresh_retry=False):
     """Run Codex synchronously and return the output text.
 
     Uses a stale-output watchdog instead of a hard wall-clock timeout:
@@ -6567,7 +6582,39 @@ def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, w
         # produced text AND then failed keeps its text, with the reason appended.
         if stream_error:
             print(f"[Codex] turn failed: {stream_error[:300]}", flush=True)
+
+            # Resuming a policy-blocked thread can never succeed — the offending history is
+            # re-sent each turn. Drop the thread and retry ONCE on a fresh one. Bounded by
+            # _fresh_retry so a prompt that is itself refused fails after two attempts, not
+            # in a loop. Only when we were actually resuming: a fresh thread that gets blocked
+            # has nothing to reset.
+            if not _fresh_retry and codex_sid and session and _codex_thread_poisoned(stream_error):
+                print(f"[Codex] thread {codex_sid[:8]} poisoned — resetting and retrying fresh",
+                      flush=True)
+                session["codex_session_id"] = None
+                try:
+                    save_sessions(force=True)
+                except Exception:
+                    pass
+                if streaming:
+                    # Close this attempt's stream cleanly, or the app is left with an open
+                    # 'start' that never gets a 'done'.
+                    _ws_stream(chat_id, "done", ws_msg_id, session=ws_session,
+                               text="♻️ Codex thread was blocked — retrying on a fresh thread…",
+                               cancelled=False, file_changes=[])
+                    _ws_suppress.active = False
+                    if ws_msg_id:
+                        edit_message(chat_id, ws_msg_id,
+                                     "♻️ _Codex thread was blocked — starting a fresh thread…_",
+                                     force=True)
+                return run_codex(prompt, cwd=cwd, session=session, stale_timeout=stale_timeout,
+                                 chat_id=chat_id, ws_session=ws_session, process_key=process_key,
+                                 _fresh_retry=True)
+
             notice = f"⚠️ _Codex returned no response:_ {stream_error[:500]}"
+            if _fresh_retry and _codex_thread_poisoned(stream_error):
+                notice += ("\n\n_A fresh thread was already tried — the request itself is being "
+                           "refused, not the thread history._")
             result = f"{result}\n\n{notice}" if result else notice
 
         if streaming:
