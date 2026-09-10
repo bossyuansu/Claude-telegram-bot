@@ -9454,11 +9454,25 @@ _Use /cancel to stop at any time._""")
         # Step 0: Ask Claude to consolidate/create a plan file
         # Claude knows its own session context — it knows if it already created a plan somewhere
         print(f"{log_prefix} Step 0: Asking Claude for plan file", flush=True)
+        # Point Step 0 at the other CLIs' session logs. get_context_bridge() only reports activity
+        # SINCE the last Claude call, so it is spent by whichever Claude turn runs first — and
+        # /go's own plan-relevance check is a Claude call, making that near-certain. The loop then
+        # planned with no idea what the preceding Codex discussion had decided.
+        # _goal_session_context() is independent of that ordering: it always lists every non-Claude
+        # CLI used in this session, which is what the goal loop already relies on.
+        prior_cli_context = _goal_session_context(session)
+        if prior_cli_context:
+            print(f"{log_prefix} Step 0: injecting prior-CLI context ({len(prior_cli_context)} chars)",
+                  flush=True)
         plan_setup_prompt = (
-            "Before we begin autonomous implementation, I need a plan file.\n"
+            (prior_cli_context + "\n" if prior_cli_context else "")
+            + "Before we begin autonomous implementation, I need a plan file.\n"
             "IMPORTANT: If you are currently in plan mode, exit plan mode FIRST (use ExitPlanMode), then proceed.\n"
             "Do NOT use EnterPlanMode at any point during this autonomous session.\n"
-            f"1. If you already created a plan/todo file in this project, copy its content to {plan_name} in the project root.\n"
+            + ("0. Another assistant (see SESSION CONTEXT above) discussed this task in this session. "
+               "READ its session log first and carry its conclusions into the plan — do not re-decide "
+               "what was already settled there.\n" if prior_cli_context else "")
+            + f"1. If you already created a plan/todo file in this project, copy its content to {plan_name} in the project root.\n"
             f"2. If no plan exists yet, create {plan_name} with a structured checklist for the task.\n"
             "Use markdown checkboxes: - [ ] for pending, - [x] for done.\n"
             "Then reply with ONLY the text: PLAN_READY"
@@ -9483,8 +9497,16 @@ _Use /cancel to stop at any time._""")
         except Exception:
             pass
 
-        current_prompt = task + (
-            f"\n\nRemember to update {plan_name} checkboxes (- [ ] → - [x]) as you complete each item."
+        # Step 0 runs on CLAUDE_PLANNING_MODEL and the implementation steps on the general model,
+        # each with its OWN per-model Claude session. So this step did NOT witness the planning
+        # conversation — the plan FILE is the handoff, and it has to be told to read it. Saying
+        # only "the plan is already in <file>" left it implementing from the bare task text.
+        current_prompt = (
+            f"FIRST: read {plan_name} in the project root — it holds the agreed plan, written by a "
+            "separate planning step you did not take part in. Follow it rather than re-deriving "
+            "the approach.\n\n"
+            + task
+            + f"\n\nRemember to update {plan_name} checkboxes (- [ ] → - [x]) as you complete each item."
             "\n\nIMPORTANT: Do NOT enter plan mode (EnterPlanMode) during this session. "
             f"Just implement directly — the plan is already in {plan_name}."
         )
