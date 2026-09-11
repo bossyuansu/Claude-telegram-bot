@@ -30,7 +30,9 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -73,7 +75,15 @@ fun InputBar(
     prefillText: String? = null,
     onPrefillConsumed: () -> Unit = {}
 ) {
-    var text by remember { mutableStateOf("") }
+    // TextFieldValue, not String: the String overload of BasicTextField keeps its own selection
+    // internally, and clearing the text on send left a stale cursor offset behind. The next
+    // startInputSession then validated that offset against now-empty text and threw
+    // IllegalStateException: "originalToTransformed returned invalid mapping: 64 -> 64 is not in
+    // range of transformed text [0, 0]", killing the app. Owning the selection here means every
+    // assignment moves the cursor with the text.
+    var input by remember { mutableStateOf(TextFieldValue("")) }
+    // Cursor goes to the END of whatever we just set — never left past the end of the new text.
+    fun setInput(value: String) { input = TextFieldValue(value, TextRange(value.length)) }
     var showMenu by remember { mutableStateOf(false) }
     var showShortcuts by remember { mutableStateOf(false) }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -84,7 +94,7 @@ fun InputBar(
 
     LaunchedEffect(prefillText) {
         val prefill = prefillText ?: return@LaunchedEffect
-        text = prefill
+        setInput(prefill)
         showMenu = false
         showShortcuts = false
         focusRequester.requestFocus()
@@ -93,7 +103,7 @@ fun InputBar(
     }
 
     // Filter commands when user is typing a slash command
-    val typedCmd = text.trim()
+    val typedCmd = input.text.trim()
     val suggestions = if (typedCmd.startsWith("/") && !typedCmd.contains(" ")) {
         COMMANDS.filter { it.cmd.startsWith(typedCmd, ignoreCase = true) && it.cmd != typedCmd }
     } else {
@@ -122,9 +132,9 @@ fun InputBar(
                                 .fillMaxWidth()
                                 .clickable {
                                     if (cmd.needsArgs) {
-                                        text = "${cmd.cmd} "
+                                        setInput("${cmd.cmd} ")
                                     } else {
-                                        text = ""
+                                        setInput("")
                                         onSend(cmd.cmd)
                                         keyboard?.hide()
                                     }
@@ -159,9 +169,9 @@ fun InputBar(
                                 .clickable {
                                     showMenu = false
                                     if (cmd.needsArgs) {
-                                        text = "${cmd.cmd} "
+                                        setInput("${cmd.cmd} ")
                                     } else {
-                                        text = ""
+                                        setInput("")
                                         onSend(cmd.cmd)
                                         keyboard?.hide()
                                     }
@@ -201,10 +211,10 @@ fun InputBar(
                         .clip(RoundedCornerShape(12.dp))
                         .border(1.dp, DisconnectedRed.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
                         .clickable {
-                            if (text.isNotBlank()) {
-                                onSend("!${text.trimStart('!')}"); text = ""; showShortcuts = false
+                            if (input.text.isNotBlank()) {
+                                onSend("!${input.text.trimStart('!')}"); setInput(""); showShortcuts = false
                             } else {
-                                text = "!"
+                                setInput("!")
                             }
                         }
                         .padding(horizontal = 10.dp, vertical = 4.dp)
@@ -267,10 +277,10 @@ fun InputBar(
                 val shape = RoundedCornerShape(24.dp)
 
                 BasicTextField(
-                    value = text,
+                    value = input,
                     onValueChange = {
-                        text = it
-                        if (it.startsWith("/")) showMenu = false
+                        input = it
+                        if (it.text.startsWith("/")) showMenu = false
                     },
                     modifier = Modifier
                         .weight(1f)
@@ -285,7 +295,7 @@ fun InputBar(
                     cursorBrush = SolidColor(AccentOrange),
                     maxLines = 4,
                     decorationBox = { innerTextField ->
-                        if (text.isEmpty()) {
+                        if (input.text.isEmpty()) {
                             val hint = if (currentSession.isNotEmpty()) currentSession else "Message or /command..."
                             Text(hint, color = PlaceholderText, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
                         }
@@ -295,7 +305,7 @@ fun InputBar(
 
                 Spacer(Modifier.width(8.dp))
 
-                if (isBusy && text.isBlank()) {
+                if (isBusy && input.text.isBlank()) {
                     // Cancel button when bot is busy and no text typed
                     FilledIconButton(
                         onClick = {
@@ -314,19 +324,19 @@ fun InputBar(
                     // Send button with punch animation
                     FilledIconButton(
                         onClick = {
-                            if (text.isNotBlank()) {
+                            if (input.text.isNotBlank()) {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 scope.launch {
                                     sendScale.animateTo(0.7f, tween(50))
                                     sendScale.animateTo(1.1f, tween(80))
                                     sendScale.animateTo(1f, tween(70))
                                 }
-                                onSend(text.trim())
-                                text = ""
+                                onSend(input.text.trim())
+                                setInput("")
                                 keyboard?.hide()
                             }
                         },
-                        enabled = enabled && text.isNotBlank(),
+                        enabled = enabled && input.text.isNotBlank(),
                         modifier = Modifier.graphicsLayer(
                             scaleX = sendScale.value,
                             scaleY = sendScale.value
