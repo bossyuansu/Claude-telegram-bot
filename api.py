@@ -647,7 +647,7 @@ async def post_crash(request: Request):
     # detected by its watchdog. Keep the tag in the log line so a freeze is greppable — an ANR
     # never throws, so before the watchdog existed it produced no report at all.
     kind = "CRASH"
-    for tag in ("ANR", "HELLO", "CRASH"):
+    for tag in ("ANR", "HELLO", "HEALTH", "CRASH"):
         if text.startswith(f"[{tag}]"):
             kind = tag
             break

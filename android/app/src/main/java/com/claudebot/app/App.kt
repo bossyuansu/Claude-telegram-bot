@@ -20,6 +20,8 @@ class App : Application() {
         /** Don't spam while a long stall persists — one report per window. */
         private const val REPORT_COOLDOWN_MS = 60_000L
         private const val PENDING_DIR = "pending-reports"
+        /** How often to report main-thread lag / heap, to quantify "feels sluggish". */
+        private const val HEALTH_INTERVAL_MS = 120_000L
     }
 
     override fun onCreate() {
@@ -60,11 +62,41 @@ class App : Application() {
         val mainHandler = Handler(Looper.getMainLooper())
         val watchdog = Thread {
             var lastReported = 0L
+            var lastHealth = System.currentTimeMillis()
+            var worstLagMs = 0L
+            var totalLagMs = 0L
+            var samples = 0
             while (!Thread.currentThread().isInterrupted) {
                 try {
+                    // Measure how long the main thread takes to run a trivial task. A device that
+                    // is merely SLUGGISH never blocks for a full STALL_THRESHOLD_MS, so the stall
+                    // check alone reports nothing — which is why "less responsive" produced no
+                    // evidence. Sampling the lag quantifies it.
+                    val postedAt = System.currentTimeMillis()
                     val responded = AtomicBoolean(false)
-                    mainHandler.post { responded.set(true) }
+                    mainHandler.post {
+                        responded.set(true)
+                        val lag = System.currentTimeMillis() - postedAt
+                        if (lag > worstLagMs) worstLagMs = lag
+                        totalLagMs += lag
+                        samples++
+                    }
                     Thread.sleep(STALL_THRESHOLD_MS)
+
+                    if (System.currentTimeMillis() - lastHealth >= HEALTH_INTERVAL_MS) {
+                        lastHealth = System.currentTimeMillis()
+                        val rt = Runtime.getRuntime()
+                        val usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024)
+                        val maxMb = rt.maxMemory() / (1024 * 1024)
+                        val avg = if (samples > 0) totalLagMs / samples else 0
+                        report(
+                            settings, "HEALTH",
+                            "mainThreadLag avg=${avg}ms worst=${worstLagMs}ms samples=$samples " +
+                                "heap=${usedMb}/${maxMb}MB threads=${Thread.activeCount()}"
+                        )
+                        worstLagMs = 0; totalLagMs = 0; samples = 0
+                    }
+
                     if (responded.get()) continue
 
                     val now = System.currentTimeMillis()
