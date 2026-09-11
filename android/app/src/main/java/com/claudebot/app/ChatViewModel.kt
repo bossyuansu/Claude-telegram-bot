@@ -205,7 +205,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * empty row and later appends built on it. Accumulating here keeps a complete copy to merge in
      * when the filter changes. Bounded by the number of concurrently streaming messages.
      */
-    private val offscreenStreams = mutableMapOf<Int, ChatMessage>()
+    private val offscreenStreams = mutableMapOf<Int, OffscreenStream>()
+
+    /**
+     * A hidden stream's accumulating text.
+     *
+     * StringBuilder, not String: handleStreamEvent runs on the MAIN thread, so rebuilding the whole
+     * message on every delta (`text = text + delta`) is O(total) per append — quadratic per stream,
+     * multiplied by however many background sessions are streaming at once. That froze the UI.
+     * Appending to a builder is O(delta); the full string is materialised only when persisted
+     * (throttled, on IO) or when the filter changes to show it.
+     */
+    private class OffscreenStream(
+        val session: String,
+        val timestamp: Long,
+        val isReplay: Boolean,
+    ) {
+        val text = StringBuilder()
+
+        fun toChatMessage(messageId: Int) = ChatMessage(
+            messageId = messageId, text = text.toString(), isFromBot = true,
+            session = session, isReplay = isReplay, timestamp = timestamp
+        )
+    }
     /** Message IDs currently being inserted from WS replay; prevents duplicate races. */
     private val pendingIncomingMessageIds = mutableSetOf<Int>()
     /** Positive message IDs already persisted in local DB (used for replay dedupe without async races). */
@@ -471,7 +493,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** Messages still mid-stream, as of now. Their newest text exists only in memory —
      *  both the ones on screen and the ones accumulating behind the current filter. */
     private fun streamingSnapshot(): List<ChatMessage> =
-        messages.filter { it.messageId in streamingMessageIds } + offscreenStreams.values
+        messages.filter { it.messageId in streamingMessageIds } +
+            offscreenStreams.map { (mid, s) -> s.toChatMessage(mid) }
 
     /**
      * Replace the visible list with `dbRows`, preserving any message that is still streaming.
@@ -1645,7 +1668,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     // Hidden by the filter — track it so switching to this session shows the whole
                     // message rather than whatever arrived after the switch.
-                    offscreenStreams[mid] = chatMsg
+                    offscreenStreams[mid] = OffscreenStream(
+                        msg.session, chatMsg.timestamp, msg.isReplay
+                    )
                 }
                 viewModelScope.launch(Dispatchers.IO) {
                     dao.upsertByMessageId(chatMsg.toEntity())
@@ -1669,18 +1694,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // text. Returning here left the DB row on its empty "start" value, so switching
                     // to this session mid-stream lost everything generated before the switch.
                     if (!matchesSessionFilter(msg.session)) {
-                        val cur = offscreenStreams[mid] ?: ChatMessage(
-                            messageId = mid, text = "", isFromBot = true,
-                            session = msg.session, isReplay = msg.isReplay,
-                            timestamp = msg.createdOrNow
-                        )
-                        val merged = cur.copy(text = cur.text + msg.text)
-                        offscreenStreams[mid] = merged
+                        val cur = offscreenStreams.getOrPut(mid) {
+                            OffscreenStream(msg.session, msg.createdOrNow, msg.isReplay)
+                        }
+                        cur.text.append(msg.text)          // O(delta), not O(total)
                         val nowOff = System.currentTimeMillis()
                         if (nowOff - (lastStreamPersist[mid] ?: 0L) >= STREAM_PERSIST_INTERVAL_MS) {
                             lastStreamPersist[mid] = nowOff
+                            // Materialise once per throttle window, and only for the DB write.
+                            val snapshot = cur.toChatMessage(mid)
                             viewModelScope.launch(Dispatchers.IO) {
-                                dao.upsertByMessageId(merged.toEntity())
+                                dao.upsertByMessageId(snapshot.toEntity())
                             }
                         }
                         return
