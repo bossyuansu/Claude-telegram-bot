@@ -642,7 +642,12 @@ def _app_request_origin():
 async def post_crash(request: Request):
     """Receive crash reports from the Android app."""
     body = await request.body()
-    print(f"[CRASH] Android app crash:\n{body.decode('utf-8', errors='replace')}", flush=True)
+    text = body.decode("utf-8", errors="replace")
+    # The app tags its own reports: [CRASH] for a thrown exception, [ANR] for a stalled UI thread
+    # detected by its watchdog. Keep the tag in the log line so a freeze is greppable — an ANR
+    # never throws, so before the watchdog existed it produced no report at all.
+    kind = "ANR" if text.startswith("[ANR]") else "CRASH"
+    print(f"[{kind}] Android app report:\n{text}", flush=True)
     return {"ok": True}
 
 @app.post("/api/message")
