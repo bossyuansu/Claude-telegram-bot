@@ -646,7 +646,11 @@ async def post_crash(request: Request):
     # The app tags its own reports: [CRASH] for a thrown exception, [ANR] for a stalled UI thread
     # detected by its watchdog. Keep the tag in the log line so a freeze is greppable — an ANR
     # never throws, so before the watchdog existed it produced no report at all.
-    kind = "ANR" if text.startswith("[ANR]") else "CRASH"
+    kind = "CRASH"
+    for tag in ("ANR", "HELLO", "CRASH"):
+        if text.startswith(f"[{tag}]"):
+            kind = tag
+            break
     print(f"[{kind}] Android app report:\n{text}", flush=True)
     return {"ok": True}
 
