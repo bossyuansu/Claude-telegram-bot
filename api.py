@@ -97,6 +97,12 @@ _server_id = str(uuid.uuid4())[:8]  # Unique ID per server boot
 # app always catches up to the current in-progress content.
 _active_streams: dict[int, dict] = {}
 _ACTIVE_STREAM_TEXT_CAP = 200_000  # guard against unbounded growth on a runaway stream
+# An entry is normally removed on 'done'. A stream that never sends one — cancelled, errored, or
+# interrupted by a hot reload (loader preserves _active_streams across reloads) — would otherwise be
+# re-sent on EVERY reconnect forever, so the last message reappears on every refresh. The longest
+# legitimate stream is bounded by the goal loop's execution_stale_timeout (1200s); 30 min clears
+# anything that can no longer be live.
+_ACTIVE_STREAM_MAX_AGE_MS = 30 * 60 * 1000
 
 
 def _with_replay_flag(payload: str, is_replay: bool) -> str:
@@ -829,6 +835,45 @@ def patch_session(chat_id: int, session_name: str, body: dict, _=Depends(verify_
                 _save_sessions(force=True)
             return {"ok": True, "session": s}
     raise HTTPException(status_code=404, detail=f"Session '{session_name}' not found")
+
+
+def _prune_stale_active_streams():
+    """Drop catch-up snapshots too old to be live. Caller must hold _ws_lock."""
+    import time as _t
+    cutoff = int(_t.time() * 1000) - _ACTIVE_STREAM_MAX_AGE_MS
+    stale = [m for m, v in _active_streams.items() if int(v.get("created_at") or 0) < cutoff]
+    for m in stale:
+        _active_streams.pop(m, None)
+    if stale:
+        print(f"[WS] Pruned {len(stale)} stale active-stream snapshot(s): {stale[:5]}", flush=True)
+    return stale
+
+
+@app.get("/api/ws-active-streams")
+def ws_active_streams(_=Depends(verify_auth)):
+    """In-flight stream snapshots used for reconnect catch-up.
+
+    These are re-sent (start + full append) on EVERY WebSocket connect. An entry is only removed
+    on 'done', so a stream that ended without one — cancelled, errored, process killed — lingers
+    and is replayed forever, which looks like the last message reappearing on every refresh.
+    """
+    import time as _t
+    with _ws_lock:
+        _prune_stale_active_streams()
+        snap = [(m, dict(v)) for m, v in _active_streams.items()]
+    now_ms = int(_t.time() * 1000)
+    return {
+        "count": len(snap),
+        "streams": [
+            {
+                "message_id": m,
+                "session": v.get("session", ""),
+                "text_len": len(v.get("text", "")),
+                "age_sec": round((now_ms - int(v.get("created_at") or now_ms)) / 1000, 1),
+            }
+            for m, v in snap
+        ],
+    }
 
 
 @app.get("/api/health")
@@ -1706,6 +1751,7 @@ async def ws_endpoint(
     # buffered 'start' (above) reset the message text to ""; re-send 'start' (idempotent clear)
     # then one 'append' carrying the full running text so the live view resumes where it is.
     with _ws_lock:
+        _prune_stale_active_streams()
         active_snapshot = [(m, dict(s)) for m, s in _active_streams.items()]
     for mid, snap in active_snapshot:
         if not snap["text"]:
