@@ -183,14 +183,15 @@ CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6-astra")
 # long autonomous loop degrades to a cheaper model instead of dying on a hard rate limit mid-run.
 CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.6-sol")
 CODEX_PREMIUM_MODELS = {"gpt-6-astra"}
-# 10%, not 80%: at 80 the premium model ran nearly the whole window and the weekly quota went 4% ->
-# 81% in four days, so the guard only engaged once the budget was almost gone. Treating the first
-# tenth of the window as the astra allowance keeps a premium reviewer available for the start of
-# each week and spends the rest on sol, instead of the reverse.
+# This is the point at which the premium model STOPS being used — i.e. astra runs until the window
+# is 80% spent, and the last 20% is reserved for sol. It was briefly 10 (astra for only the first
+# tenth), which downgraded with ~63% of the budget still unused and no reason to conserve.
+# The burn rate that originally justified conserving has since dropped: pr-monitor moved from
+# xhigh to high, taking a window from 81% in four days to ~37% in four and a half.
 try:
-    CODEX_USAGE_FALLBACK_PERCENT = float(os.environ.get("CODEX_USAGE_FALLBACK_PERCENT", "10"))
+    CODEX_USAGE_FALLBACK_PERCENT = float(os.environ.get("CODEX_USAGE_FALLBACK_PERCENT", "80"))
 except ValueError:
-    CODEX_USAGE_FALLBACK_PERCENT = 10.0
+    CODEX_USAGE_FALLBACK_PERCENT = 80.0
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 try:
     DEEPREVIEW_MIN_CLEAN_ITERATIONS = max(1, int(os.environ.get("DEEPREVIEW_MIN_CLEAN_ITERATIONS", "2")))
