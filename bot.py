@@ -7095,6 +7095,14 @@ def run_codex_task(chat_id, task, cwd, session=None):
         message_ids = []
         file_changes = []
         processed_item_ids = set()
+        # A "start" with no matching "done" leaves the stream open forever: the server keeps
+        # replaying its snapshot on every reconnect, and the app keeps the id in
+        # streamingMessageIds and re-appends the message on every refresh. The error paths below
+        # used to return without a "done" — unlike run_claude_streaming and run_codex, which both
+        # emit one. These flags let the finally close whatever the happy path didn't.
+        _ws_stream_open = False
+        _ws_stream_mid = 0
+        _ws_stream_label = ""
         _ws_session_override.name = session.get("name", "") if session else ""
         _bind_codex_model(session)
         try:
@@ -7189,6 +7197,9 @@ def run_codex_task(chat_id, task, cwd, session=None):
             # WS-native streaming: app renders one continuous message
             _codex_stream_session = session.get("name", "") if session else ""
             _ws_stream(chat_id, "start", message_id, session=_codex_stream_session)
+            _ws_stream_open = True
+            _ws_stream_mid = message_id
+            _ws_stream_label = _codex_stream_session
             # Suppress legacy WS message/edit broadcasts — stream events replace them
             _ws_suppress.active = True
             # Force the first streaming update to be visible immediately.
@@ -7403,6 +7414,7 @@ def run_codex_task(chat_id, task, cwd, session=None):
                        text=_strip_file_ops_text(accumulated_text.strip()),
                        cancelled=cancelled,
                        file_changes=file_changes)
+            _ws_stream_open = False
 
             # Keep _ws_suppress active — stream done has the full text for the app
 
@@ -7433,6 +7445,19 @@ def run_codex_task(chat_id, task, cwd, session=None):
             else:
                 send_message(chat_id, error_text[:4000])
         finally:
+            # Close the stream on the paths that raised. Without this the app never learns the
+            # turn ended, so the message stays "streaming" for the life of the app process and
+            # gets re-appended to the bottom of the list on every foreground refresh.
+            if _ws_stream_open:
+                try:
+                    _ws_stream(chat_id, "done", _ws_stream_mid,
+                               session=_ws_stream_label,
+                               text=_strip_file_ops_text(accumulated_text.strip()),
+                               cancelled=True,
+                               file_changes=file_changes)
+                except Exception:
+                    pass
+                _ws_stream_open = False
             _ws_suppress.active = False
             _finalize_sched_result(accumulated_text)
             _ws_session_override.name = None

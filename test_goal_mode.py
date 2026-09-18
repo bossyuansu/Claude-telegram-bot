@@ -1610,15 +1610,22 @@ class TestGlobalLearnings(unittest.TestCase):
         self.assertEqual(results, [])
 
     def test_decay_removes_old_unconfirmed(self):
-        """Decay prunes learnings older than 90 days with 1 confirmation."""
+        """Decay prunes learnings older than 90 days with 1 confirmation.
+
+        Dates are relative to today on purpose: a hardcoded "recent" date silently ages past the
+        90-day window and turns this into a failure that has nothing to do with the code.
+        """
+        from datetime import datetime, timedelta
+        stale = (datetime.now() - timedelta(days=200)).date().isoformat()
+        fresh = (datetime.now() - timedelta(days=5)).date().isoformat()
         self.bot._save_global_learnings([
             {"insight": "Old stale", "category": "technical", "tags": [],
              "problem_type": "general", "confirmations": 1, "pinned": False,
-             "created_at": "2025-01-01", "last_confirmed": "2025-01-01",
+             "created_at": stale, "last_confirmed": stale,
              "source_goal_id": "g1", "source_project": "/tmp"},
             {"insight": "Recent fresh", "category": "technical", "tags": [],
              "problem_type": "general", "confirmations": 1, "pinned": False,
-             "created_at": "2026-06-15", "last_confirmed": "2026-06-15",
+             "created_at": fresh, "last_confirmed": fresh,
              "source_goal_id": "g2", "source_project": "/tmp"},
         ])
         pruned = self.bot._decay_global_learnings()

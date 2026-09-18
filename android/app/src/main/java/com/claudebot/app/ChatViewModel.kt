@@ -239,6 +239,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val lastStreamPersist = mutableMapOf<Int, Long>()
     private val STREAM_PERSIST_INTERVAL_MS = 2000L
 
+    /**
+     * Last time each streaming message produced anything (start / append / tool).
+     *
+     * A stream is only ever forgotten on "done". If that "done" never arrives — the bot restarted
+     * or hot-reloaded mid-turn, or a code path returned without emitting one — the id stays in
+     * streamingMessageIds for the whole life of the app process. streamingSnapshot() then keeps
+     * handing it to swapMessages on every foreground refresh and every filter switch, and
+     * swapMessages re-appends it to the BOTTOM of the list because an old message is no longer in
+     * the newest page. That is the "an older message keeps getting appended" symptom.
+     *
+     * The server already drops its own snapshot of such a stream after 30 minutes
+     * (_ACTIVE_STREAM_MAX_AGE_MS); this is the client's half of that, which matters more because
+     * the app process outlives bot restarts.
+     */
+    private val lastStreamActivity = mutableMapOf<Int, Long>()
+    private val STREAM_STALE_AFTER_MS = 30 * 60 * 1000L
+
     companion object {
         private const val PAGE_SIZE = 50
         private const val SEARCH_PAGE_SIZE = 30
@@ -492,9 +509,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Messages still mid-stream, as of now. Their newest text exists only in memory —
      *  both the ones on screen and the ones accumulating behind the current filter. */
-    private fun streamingSnapshot(): List<ChatMessage> =
-        messages.filter { it.messageId in streamingMessageIds } +
+    private fun streamingSnapshot(): List<ChatMessage> {
+        expireStaleStreams()
+        return messages.filter { it.messageId in streamingMessageIds } +
             offscreenStreams.map { (mid, s) -> s.toChatMessage(mid) }
+    }
+
+    /**
+     * Forget streams that have been silent past STREAM_STALE_AFTER_MS.
+     *
+     * Their "done" is never coming, so without this they are carried forward forever and re-added
+     * to the bottom of the list on every reload. Whatever text they did produce is already
+     * checkpointed in the DB, so dropping the in-memory carry loses nothing — the message still
+     * renders from disk, in its correct chronological place.
+     */
+    private fun expireStaleStreams() {
+        if (streamingMessageIds.isEmpty() && offscreenStreams.isEmpty()) return
+        val cutoff = System.currentTimeMillis() - STREAM_STALE_AFTER_MS
+        val stale = (streamingMessageIds + offscreenStreams.keys).filter {
+            (lastStreamActivity[it] ?: 0L) < cutoff
+        }
+        for (mid in stale) {
+            streamingMessageIds.remove(mid)
+            offscreenStreams.remove(mid)
+            lastStreamActivity.remove(mid)
+            lastStreamPersist.remove(mid)
+        }
+    }
 
     /**
      * Replace the visible list with `dbRows`, preserving any message that is still streaming.
@@ -517,7 +558,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // a terminal "———" row already persisted is never rewound either.
                 if (s.text.length > messages[existing].text.length) messages[existing] = s
             } else {
-                messages.add(s)
+                // Not in the newest page — so it is an OLD message. Appending it blindly puts it
+                // below messages that came after it, which is how a stream the server never closed
+                // showed up as "an older message stuck at the bottom". Place it by timestamp.
+                val at = messages.indexOfFirst { it.timestamp > s.timestamp }
+                if (at >= 0) messages.add(at, s) else messages.add(s)
             }
             // Now visible: the on-screen list owns it from here.
             offscreenStreams.remove(s.messageId)
@@ -1627,6 +1672,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun handleStreamEvent(msg: WsMessage) {
         val mid = msg.messageId ?: return
+        // Any event is proof the stream is alive; silence past STREAM_STALE_AFTER_MS is what marks
+        // it abandoned. Tool events count — a long turn can go minutes between text deltas.
+        if (msg.op != "done") lastStreamActivity[mid] = System.currentTimeMillis()
         when (msg.op) {
             "start" -> {
                 // Mark this message for stream-based updates (skip legacy edit events)
@@ -1635,6 +1683,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (existing != null) {
                     if (messages[existing].text.contains("———")) {
                         streamingMessageIds.remove(mid)
+                        lastStreamActivity.remove(mid)
                         return  // Already finalized, skip
                     }
                     messages[existing] = messages[existing].copy(
@@ -1648,6 +1697,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // Already finalized from earlier replay/session; do not resurrect.
                 if (msg.isReplay && mid in finalizedMessageIds) {
                     streamingMessageIds.remove(mid)
+                    lastStreamActivity.remove(mid)
                     return
                 }
 
@@ -1727,6 +1777,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // Terminal text is authoritative; ignore late append replay/update.
                     streamingMessageIds.remove(mid)
                     lastStreamPersist.remove(mid)
+                    lastStreamActivity.remove(mid)
                     finalizedMessageIds.add(mid)
                     return
                 }
@@ -1768,6 +1819,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             "done" -> {
                 streamingMessageIds.remove(mid)
                 lastStreamPersist.remove(mid)
+                lastStreamActivity.remove(mid)
                 // The terminal event carries the authoritative full text, so any partial copy we
                 // accumulated behind the filter is now redundant.
                 offscreenStreams.remove(mid)
