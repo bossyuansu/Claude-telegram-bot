@@ -6341,6 +6341,63 @@ def _codex_error_text(err):
     return text
 
 
+def _codex_rollout_path(thread_id):
+    """Newest rollout JSONL for a codex thread, or None."""
+    if not thread_id:
+        return None
+    try:
+        import glob as _glob
+        home = os.path.expanduser("~")
+        matches = _glob.glob(f"{home}/.codex/sessions/**/*{thread_id}*.jsonl", recursive=True)
+        return max(matches, key=os.path.getmtime) if matches else None
+    except Exception:
+        return None
+
+
+def _codex_rollout_error(thread_id, tail_bytes=200_000):
+    """Failure reason for the last turn, read from the thread's rollout log.
+
+    The `--json` exec stream is not a reliable channel for this. On 2026-09-19 a life-companion
+    turn was refused server-side and the stream carried no turn.failed at all — the only record
+    was in the rollout:
+
+        {"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null,
+         "error":{"message":"This request was blocked by our safety systems. ...",
+                  "codex_error_info":"misalignment_policy_violation"}}}
+
+    The rollout is written by codex itself and is authoritative, so it is the right place to look
+    when a turn produced no text. Only a task_complete whose last_agent_message is null counts —
+    a turn that answered is not a failure, however it ended.
+    """
+    path = _codex_rollout_path(thread_id)
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail_bytes))
+            chunk = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    reason = ""
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or "task_complete" not in line:
+            continue
+        try:
+            payload = json.loads(line).get("payload") or {}
+        except Exception:
+            continue
+        if payload.get("type") != "task_complete":
+            continue
+        # Last one wins — we want the turn that just ended, not an earlier failure.
+        if payload.get("last_agent_message"):
+            reason = ""
+        else:
+            reason = _codex_error_text(payload.get("error"))
+    return reason
+
+
 def run_codex(prompt, cwd=None, session=None, stale_timeout=300, chat_id=None, ws_session="",
               process_key=None, _fresh_retry=False):
     """Run Codex synchronously and return the output text.
@@ -7095,6 +7152,10 @@ def run_codex_task(chat_id, task, cwd, session=None):
         message_ids = []
         file_changes = []
         processed_item_ids = set()
+        # First fatal error on the JSON stream (turn.failed / error). run_codex has captured this
+        # since b33885d, but this function — the path a plain message to a Codex session takes —
+        # never did, so a server-side refusal arrived as a blank message with no reason at all.
+        stream_error = ""
         # A "start" with no matching "done" leaves the stream open forever: the server keeps
         # replaying its snapshot on every reconnect, and the app keeps the id in
         # streamingMessageIds and re-appends the message on every refresh. The error paths below
@@ -7252,6 +7313,14 @@ def run_codex_task(chat_id, task, cwd, session=None):
                     if etype == "thread.started":
                         new_thread_id = event.get("thread_id")
 
+                    # A turn can fail server-side with no assistant message at all — e.g. the
+                    # safety classifier returning misalignment_policy_violation. It arrives only
+                    # on the JSON stream, never on stderr, so without this the turn ends with an
+                    # empty accumulated_text and the user gets a blank reply.
+                    elif etype in ("turn.failed", "error"):
+                        err = event.get("error") if isinstance(event.get("error"), dict) else event
+                        stream_error = stream_error or _codex_error_text(err)
+
                     elif etype in ["item.started", "item.updated", "item.completed"]:
                         item = event.get("item", {})
                         itype = item.get("type")
@@ -7400,8 +7469,31 @@ def run_codex_task(chat_id, task, cwd, session=None):
             except Exception:
                 pass
 
+            # A turn that produced nothing must say WHY. Prefer the JSON stream's own error;
+            # fall back to the rollout, which is where a server-side refusal actually lands.
+            if not cancelled and not accumulated_text.strip():
+                if not stream_error:
+                    stream_error = _codex_rollout_error(
+                        new_thread_id or (session.get("codex_session_id") if session else None))
+                if stream_error:
+                    print(f"[Codex] turn failed: {stream_error[:300]}", flush=True)
+
+            notice = ""
+            if not cancelled and not accumulated_text.strip() and stream_error:
+                notice = f"⚠️ _Codex returned no response:_ {stream_error[:500]}"
+                if _codex_thread_poisoned(stream_error):
+                    # Do NOT discard the thread here. Observed 2026-09-19: two consecutive blocks
+                    # on this thread, yet resuming the very same thread minutes later worked. The
+                    # block is often transient, and dropping codex_session_id would throw away the
+                    # whole conversation to "fix" something that was not broken.
+                    notice += ("\n\n_Server-side safety block — usually transient. Send again to "
+                               "retry the same thread; if it keeps failing, `/new` starts a fresh "
+                               "one._")
+
             if cancelled:
                 final_chunk += "\n\n———\n⚠️ _cancelled_"
+            elif notice:
+                final_chunk += f"\n\n———\n{notice}"
             elif not accumulated_text.strip() and codex_stderr_lines:
                 final_chunk += f"\n\n———\n❌ _No output:_ {codex_stderr_lines[-1][:200]}"
             else:
@@ -7409,9 +7501,12 @@ def run_codex_task(chat_id, task, cwd, session=None):
 
             # WS stream: send done event with file changes for diff viewer
             # Strip file ops text — app shows file_changes in a structured widget
+            _ws_done_text = _strip_file_ops_text(accumulated_text.strip())
+            if notice:
+                _ws_done_text = f"{_ws_done_text}\n\n{notice}".strip()
             _ws_stream(chat_id, "done", message_ids[0] if message_ids else (message_id or 0),
                        session=_codex_stream_session,
-                       text=_strip_file_ops_text(accumulated_text.strip()),
+                       text=_ws_done_text,
                        cancelled=cancelled,
                        file_changes=file_changes)
             _ws_stream_open = False

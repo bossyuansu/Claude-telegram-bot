@@ -10,6 +10,7 @@ The user saw a blank reply. run_codex derived failures only from STDERR
 `turn.failed` / `error`, so nothing was logged and nothing was shown.
 """
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -193,6 +194,122 @@ class TestPoisonedThreadAutoReset(unittest.TestCase):
         out, cmds = self._run([self.BLOCK], session)
         self.assertEqual(len(cmds), 1)
         self.assertIn("blocked by our safety systems", out)
+
+
+class TestRolloutIsTheAuthoritativeFailureRecord(unittest.TestCase):
+    """The JSON stream is not a reliable channel for a server-side refusal.
+
+    2026-09-19, life-companion: two turns ("next" at 01:19:53 and 01:20:42) each produced a blank
+    message. The bot logged no error and broadcast only stream start + done. The rollout held the
+    only record:
+
+        payload = {"type": "task_complete", "last_agent_message": null,
+                   "error": {"message": "This request was blocked by our safety systems. ...",
+                             "codex_error_info": "misalignment_policy_violation"}}
+    """
+
+    REAL_ERROR = {
+        "message": "This request was blocked by our safety systems. "
+                   "Reason: Potentially unintended activity.",
+        "codex_error_info": "misalignment_policy_violation",
+    }
+
+    def _rollout(self, payloads):
+        """Write a rollout file and point the reader at it. Returns the extracted reason."""
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w") as f:
+            for p in payloads:
+                f.write(json.dumps({"type": "event_msg", "payload": p}) + "\n")
+        self.addCleanup(os.unlink, path)
+        with mock.patch.object(bot, "_codex_rollout_path", return_value=path):
+            return bot._codex_rollout_error("tid")
+
+    def test_reads_the_reason_from_a_failed_turn(self):
+        reason = self._rollout([
+            {"type": "task_complete", "last_agent_message": None, "error": self.REAL_ERROR},
+        ])
+        self.assertIn("blocked by our safety systems", reason)
+        self.assertIn("misalignment_policy_violation", reason)
+
+    def test_a_turn_that_answered_is_not_a_failure(self):
+        """However it ended, a turn with an assistant message must not raise a failure notice."""
+        self.assertEqual(self._rollout([
+            {"type": "task_complete", "last_agent_message": "here you go", "error": None},
+        ]), "")
+
+    def test_only_the_most_recent_turn_counts(self):
+        """A rollout accumulates every turn. An old failure must not be reported as today's."""
+        self.assertEqual(self._rollout([
+            {"type": "task_complete", "last_agent_message": None, "error": self.REAL_ERROR},
+            {"type": "task_complete", "last_agent_message": "recovered", "error": None},
+        ]), "", "the thread recovered — reporting the earlier block would be wrong")
+
+    def test_a_later_failure_after_an_earlier_success_is_reported(self):
+        reason = self._rollout([
+            {"type": "task_complete", "last_agent_message": "fine", "error": None},
+            {"type": "task_complete", "last_agent_message": None, "error": self.REAL_ERROR},
+        ])
+        self.assertIn("blocked by our safety systems", reason)
+
+    def test_missing_or_unreadable_rollout_is_not_an_error(self):
+        with mock.patch.object(bot, "_codex_rollout_path", return_value=None):
+            self.assertEqual(bot._codex_rollout_error("tid"), "")
+        with mock.patch.object(bot, "_codex_rollout_path", return_value="/nope/missing.jsonl"):
+            self.assertEqual(bot._codex_rollout_error("tid"), "")
+        self.assertEqual(bot._codex_rollout_error(None), "")
+
+    def test_garbage_lines_are_skipped(self):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w") as f:
+            f.write("not json\n{broken\n")
+            f.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "last_agent_message": None,
+                "error": self.REAL_ERROR}}) + "\n")
+        self.addCleanup(os.unlink, path)
+        with mock.patch.object(bot, "_codex_rollout_path", return_value=path):
+            self.assertIn("safety systems", bot._codex_rollout_error("tid"))
+
+
+class TestInteractivePathSurfacesErrorsToo(unittest.TestCase):
+    """run_codex_task is the path a plain message to a Codex session takes.
+
+    Every piece of error surfacing built in b33885d / 4f5d51a went into run_codex only, so this
+    path returned a blank message with no reason for months. Same shape of omission as the missing
+    'done' fixed in 83b0ef2 — two of the three streaming functions were updated, not the third.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = open("bot.py").read()
+        start = src.index("def run_codex_task(")
+        cls.body = src[start:src.index("\ndef run_gemini_task")]
+
+    def test_it_captures_stream_errors(self):
+        self.assertIn("turn.failed", self.body,
+                      "run_codex_task must watch the JSON stream for a failed turn")
+        self.assertIn("_codex_error_text", self.body)
+
+    def test_it_falls_back_to_the_rollout(self):
+        self.assertIn("_codex_rollout_error", self.body,
+                      "the stream carried no error in the 2026-09-19 incident — the rollout did")
+
+    def test_an_empty_turn_produces_a_notice(self):
+        self.assertRegex(self.body, r"Codex returned no response",
+                         "an empty turn must tell the user why")
+
+    def test_the_notice_reaches_the_app_not_just_telegram(self):
+        """The app renders the WS 'done' text, so a notice only in final_chunk is invisible there."""
+        self.assertRegex(self.body, r"_ws_done_text\s*=\s*f?\"?.*notice|notice.*_ws_done_text",
+                         "the failure notice must be included in the WS done payload")
+
+    def test_it_does_not_discard_the_thread(self):
+        """2026-09-19: the same thread resumed fine minutes after two consecutive blocks, so the
+        block is often transient and dropping the thread would destroy the conversation."""
+        self.assertNotRegex(
+            self.body, r'session\["codex_session_id"\]\s*=\s*None',
+            "run_codex_task must not reset the thread on a policy block — it is usually transient")
 
 
 if __name__ == "__main__":
