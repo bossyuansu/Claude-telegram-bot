@@ -527,11 +527,16 @@ def broadcast_ws(chat_id, event_type, data):
                         "session": data.get("session", ""),
                         "text": "",
                         "created_at": _created_ms,
+                        "updated_at": _created_ms,
                     }
-                elif op == "append":
+                elif op in ("append", "tool"):
+                    # 'tool' carries no text but proves the stream is alive. Without it, a turn
+                    # that spends >30 min in tool calls — common — looks abandoned to the prune.
                     snap = _active_streams.get(mid)
-                    if snap is not None and len(snap["text"]) < _ACTIVE_STREAM_TEXT_CAP:
-                        snap["text"] += data.get("text", "")
+                    if snap is not None:
+                        snap["updated_at"] = _created_ms
+                        if op == "append" and len(snap["text"]) < _ACTIVE_STREAM_TEXT_CAP:
+                            snap["text"] += data.get("text", "")
                 elif op == "done":
                     _active_streams.pop(mid, None)
 
@@ -841,7 +846,12 @@ def _prune_stale_active_streams():
     """Drop catch-up snapshots too old to be live. Caller must hold _ws_lock."""
     import time as _t
     cutoff = int(_t.time() * 1000) - _ACTIVE_STREAM_MAX_AGE_MS
-    stale = [m for m, v in _active_streams.items() if int(v.get("created_at") or 0) < cutoff]
+    # Age from the LAST append, not from 'start'. Keying off created_at pruned streams that were
+    # still actively producing — a goal loop or a long CLI turn easily runs past 30 minutes — and
+    # once pruned the entry is gone, so later appends land nowhere (`_active_streams.get` → None)
+    # and reconnect catch-up has nothing to send. The live view then freezes until 'done'.
+    stale = [m for m, v in _active_streams.items()
+             if int(v.get("updated_at") or v.get("created_at") or 0) < cutoff]
     for m in stale:
         _active_streams.pop(m, None)
     if stale:
@@ -870,6 +880,10 @@ def ws_active_streams(_=Depends(verify_auth)):
                 "session": v.get("session", ""),
                 "text_len": len(v.get("text", "")),
                 "age_sec": round((now_ms - int(v.get("created_at") or now_ms)) / 1000, 1),
+                # What the prune actually keys off. A large idle_sec on a stream you believe is
+                # running is the signal that the live view has nothing to catch up on.
+                "idle_sec": round(
+                    (now_ms - int(v.get("updated_at") or v.get("created_at") or now_ms)) / 1000, 1),
             }
             for m, v in snap
         ],

@@ -180,9 +180,20 @@ class WebSocketManager(
                 if (code != 1000) {
                     val msg = if (reason.isNotBlank()) "Closed ($code): $reason" else "Closed ($code)"
                     onError?.invoke(msg)
-                    scheduleReconnect()
                 }
-                else onStateChange(ConnectionState.DISCONNECTED)
+                // Reconnect on ANY close we did not initiate — including a clean 1000.
+                //
+                // Treating 1000 as "stay down" conflated the peer closing politely with US wanting
+                // to stop. Our intent is already held in shouldReconnect, which only disconnect()
+                // clears; a stale socket is already filtered by isStale above. So when the server
+                // or a relay closed the socket normally, the app went DISCONNECTED and never came
+                // back, while the bot kept streaming. Live deltas are transient (seq=0, dropped
+                // server-side when no client is attached), so nothing was buffered to catch up on
+                // and the message simply froze on screen.
+                //
+                // scheduleReconnect() itself returns to DISCONNECTED when shouldReconnect is false,
+                // so a user-initiated disconnect still stays down.
+                scheduleReconnect()
             }
         })
         ws = newWs
