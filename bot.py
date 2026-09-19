@@ -5702,6 +5702,17 @@ def create_session(chat_id, project_name, cwd):
     user_sessions[chat_key]["active"] = session_id  # Use session_id as identifier
     save_sessions(force=True)
 
+    # Tell the app the active session moved. /switch and the session picker have always done this;
+    # creation did not, so after `/new life-companion` the server was on "life-companion (4)" while
+    # the app still targeted "life-companion" — and the next message from the app was delivered to
+    # the OLD session (observed 2026-09-19 12:54). Telegram-originated input was unaffected because
+    # it reads the active session directly, which is what made it look like the app "sent it to the
+    # wrong place". Broadcast from here rather than from /new so any future creator cannot skip it.
+    try:
+        _ws_broadcast(chat_id, "active_session", {"session": display_name})
+    except Exception:
+        pass
+
     return session
 
 

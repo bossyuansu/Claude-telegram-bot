@@ -1520,6 +1520,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "active_session" -> {
                     if (msg.session.isNotEmpty()) {
                         currentSession.value = msg.session
+                        // Follow the switch in the view too. This event only fires on an explicit
+                        // user action — /new, /switch, or the session picker — and sends go to
+                        // `sessionFilter ?: currentSession`, so leaving a stale filter in place
+                        // means the message the user types next still goes to the session they
+                        // just moved away from. Never widens a filter to "All"; only repoints it.
+                        val filter = sessionFilter.value
+                        if (filter != null && filter != msg.session) {
+                            setSessionFilter(msg.session)
+                        }
                     }
                 }
                 "schedule" -> {
