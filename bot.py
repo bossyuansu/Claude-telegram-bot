@@ -723,11 +723,18 @@ def cancel_goal_session(chat_id, session_id, goal_id=None, reason="cancelled"):
 def handle_command_for_session(chat_id, text, session):
     """Run a slash command against a specific session without switching active session."""
     previous = getattr(_active_session_override, "session", None)
+    # Also pin how the command's OUTPUT is labelled. _active_session_override alone only steers
+    # which session the command operates ON; send_message checks _ws_session_override FIRST and
+    # only then falls back to the active session, so anything left over on this thread would
+    # attribute the reply to a different session than the command ran against.
+    previous_ws = getattr(_ws_session_override, "name", None)
     _active_session_override.session = session
+    _ws_session_override.name = (session or {}).get("name", "") or None
     try:
         return handle_command(chat_id, text)
     finally:
         _active_session_override.session = previous
+        _ws_session_override.name = previous_ws
 
 
 def telegram_too_large_message(label, file_size=0):
@@ -12026,7 +12033,12 @@ Send a message to start working!""")
         import mimetypes as _mt
         mime, _ = _mt.guess_type(file_path)
         _ws_broadcast(chat_id, "file", {
-            "session": get_session_id(session) if session else "",
+            # NAME, not id. Every other WS event carries the session name, and the app matches on
+            # it (`matchesSessionFilter(msg.session)`, `msg.session == effectiveSession`). An 8-char
+            # uuid matches no session, so the download card never landed in the session the /file
+            # command was typed in — and `availableSessions.add(msg.session)` put the raw uuid in
+            # the session picker as a phantom entry.
+            "session": session.get("name", "") if session else "",
             "file_name": os.path.basename(file_path),
             "file_size": file_size,
             "mime_type": mime or "application/octet-stream",
