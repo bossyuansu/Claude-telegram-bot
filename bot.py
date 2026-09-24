@@ -176,13 +176,25 @@ _INCOMPLETE_TAIL_CHARS = 700
 # gpt-6-astra: promoted to default after a blind integration-defect benchmark (missing wiring /
 # wrong protocol / logic mismatch) where it caught 3/3 vs gpt-5.6-sol's 2/3 — sol missed the
 # missing-wiring defect entirely, which is the class that costs the most deepreview iterations.
-# Requires codex CLI >= 0.153.4. Astra costs materially more per token, hence the quota-aware
+# Requires codex CLI >= 0.156.1. Astra costs materially more per token, hence the quota-aware
 # fallback below. Revert = export CODEX_MODEL=gpt-5.6-sol. Per-session override: /model codex <name>.
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6-astra")
 # Premium models get de-escalated to the fallback as the account's Codex quota window fills, so a
 # long autonomous loop degrades to a cheaper model instead of dying on a hard rate limit mid-run.
-CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.6-sol")
+# gpt-6-sol over gpt-5.6-sol: same 3/3 on the integration-defect benchmark, but ~24% fewer input
+# and ~37% fewer output tokens, and it reasoned further on the payload-mismatch case (noting stock
+# is decremented BEFORE the KeyError). Requires codex CLI >= 0.156.1 — 0.153.4 has no metadata for
+# it and the API then rejects it with the same 400 it gives a model name that does not exist, so a
+# CLI downgrade turns the fallback into a hard failure. Revert = export CODEX_FALLBACK_MODEL=gpt-5.6-sol.
+# Not yet measured: per-token quota WEIGHT. used_percent moves in whole percent over a 10080-minute
+# window, too coarse to attribute to one turn — so "cheaper in tokens" is not proven to be cheaper
+# against the rate limit. Watch the window burn rate after this change.
+CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-6-sol")
 CODEX_PREMIUM_MODELS = {"gpt-6-astra"}
+# How many recent rollouts to search for a rate_limits snapshot. Short/failed/probe runs produce
+# rollouts with none, and stopping at the first file made the quota reading — and therefore the
+# fallback — disappear. A handful is plenty; they are scanned newest-first and the first hit wins.
+_CODEX_USAGE_SCAN_ROLLOUTS = 12
 # This is the point at which the premium model STOPS being used — i.e. astra runs until the window
 # is 80% spent, and the last 20% is reserved for sol. It was briefly 10 (astra for only the first
 # tenth), which downgraded with ~63% of the budget still unused and no reason to conserve.
@@ -1048,8 +1060,15 @@ def _codex_usage(max_age=90):
 
     The CLI exposes no usage command, but every session rollout records a `rate_limits` payload
     (used_percent / window_minutes / resets_at / plan_type / rate_limit_reached_type). We read the
-    newest rollout's last snapshot. It is therefore only as fresh as the most recent codex run —
+    newest snapshot we can find. It is therefore only as fresh as the most recent codex run —
     treat it as a floor on usage, not a live meter.
+
+    Searches BACK through recent rollouts rather than reading only the newest file. Not every
+    rollout carries a rate_limits event — a very short turn, a turn that failed before the first
+    token_count, or a probe run will not — and reading only the newest meant one such run made
+    usage unknown, which silently disables the quota fallback and lets the premium model keep
+    burning a nearly-full window. Observed at 86% used: _codex_usage_percent() returned None and
+    _codex_model() resolved to astra.
     """
     now = time.time()
     cached = getattr(_codex_model_ctx, "_usage_cache", None)
@@ -1058,20 +1077,26 @@ def _codex_usage(max_age=90):
     snap = None
     try:
         base = os.path.expanduser("~/.codex/sessions")
-        newest, newest_mt = None, 0
+        rollouts = []
         for root, _dirs, files in os.walk(base):
             for fn in files:
                 if fn.startswith("rollout-") and fn.endswith(".jsonl"):
                     p = os.path.join(root, fn)
-                    mt = os.path.getmtime(p)
-                    if mt > newest_mt:
-                        newest, newest_mt = p, mt
-        if newest:
+                    try:
+                        rollouts.append((os.path.getmtime(p), p))
+                    except OSError:
+                        pass
+        rollouts.sort(reverse=True)
+        expired = False
+        for _mt, path in rollouts[:_CODEX_USAGE_SCAN_ROLLOUTS]:
             # Tail the file — rollouts get large and the newest snapshot is at the end.
-            with open(newest, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - 400_000))
-                tail = f.read().decode("utf-8", "replace")
+            try:
+                with open(path, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - 400_000))
+                    tail = f.read().decode("utf-8", "replace")
+            except OSError:
+                continue
             for line in reversed(tail.split("\n")):
                 if '"rate_limits"' not in line:
                     continue
@@ -1080,8 +1105,23 @@ def _codex_usage(max_age=90):
                 except Exception:
                     continue
                 if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
-                    snap = payload["rate_limits"]
+                    candidate = payload["rate_limits"]
+                    # A snapshot whose window has already reset describes a window that no longer
+                    # exists. Using it would pin usage at an old high reading and force the
+                    # fallback for hours after the quota actually refilled.
+                    win = candidate.get("primary")
+                    if (isinstance(win, dict) and isinstance(win.get("resets_at"), (int, float))
+                            and win["resets_at"] < now):
+                        # Newest reading we have is for a window that already reset, so the quota
+                        # has refilled and we know nothing about the current one. Older rollouts
+                        # can only be staler — stop and report unknown rather than force a
+                        # fallback on a dead reading.
+                        expired = True
+                    else:
+                        snap = candidate
                     break
+            if snap is not None or expired:
+                break
     except Exception as e:
         print(f"[Codex] usage probe failed: {e}", flush=True)
     _codex_model_ctx._usage_cache = (now, snap)
