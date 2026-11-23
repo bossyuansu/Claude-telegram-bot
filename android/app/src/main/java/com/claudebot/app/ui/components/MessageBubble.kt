@@ -41,6 +41,7 @@ import com.claudebot.app.data.InlineButton
 import com.claudebot.app.ui.theme.*
 import com.claudebot.app.util.MessageSegment
 import com.claudebot.app.util.parseMarkdown
+import com.claudebot.app.util.parseMessageImages
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -117,9 +118,11 @@ fun MessageBubble(
         ) {
             SelectionContainer {
                 Column {
-                    val segments = if (isBot) parseMarkdown(message.text) else emptyList()
+                    val segments = remember(message.text, isBot) {
+                        if (isBot) parseMarkdown(message.text) else parseMessageImages(message.text)
+                    }
 
-                    if (isBot) {
+                    if (isBot || segments.any { it is MessageSegment.Image }) {
                         segments.forEach { segment ->
                             when (segment) {
                                 is MessageSegment.Text -> {
@@ -130,6 +133,7 @@ fun MessageBubble(
                                         onUrlClick = onUrlClick
                                     )
                                 }
+                                is MessageSegment.Image -> InlineImage(segment.url, segment.altText, onUrlClick)
                                 is MessageSegment.CodeBlock -> {
                                     Spacer(Modifier.height(6.dp))
                                     Column(

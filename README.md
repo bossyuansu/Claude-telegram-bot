@@ -14,6 +14,7 @@ A Telegram bot that provides access to Claude CLI with streaming responses, sess
 - **Goal Mode** - `/goal` decomposes a larger objective into milestones, iterates with assessment/verification, and records learnings
 - **Question handling** - Interactive buttons for Claude's questions
 - **Photo, video & file uploads** - Send images, videos, and files for Claude to analyze (up to 50MB)
+- **Inline images (Android)** - Preview Markdown images, direct image URLs, and QR image links in chat. Tap to enlarge and pinch to zoom; use Open original to open the URL externally. Explicit Markdown images support image endpoints without a filename extension.
 
 ## Commands
 
