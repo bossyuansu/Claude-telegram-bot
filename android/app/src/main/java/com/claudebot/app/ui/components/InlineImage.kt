@@ -28,12 +28,17 @@ import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.claudebot.app.ui.theme.AccentOrange
-import com.claudebot.app.ui.theme.SessionLabel
 
 private enum class ImageStatus { Loading, Loaded, Failed }
 
 @Composable
-internal fun InlineImage(url: String, altText: String, onOpenUrl: (String) -> Unit) {
+internal fun InlineImage(
+    url: String,
+    altText: String,
+    onOpenUrl: (String) -> Unit,
+    captionColor: Color,
+    linkColor: Color,
+) {
     val context = LocalContext.current
     val request = remember(context, url) { ImageRequest.Builder(context).data(url).build() }
     var status by remember(url) { mutableStateOf(ImageStatus.Loading) }
@@ -68,10 +73,10 @@ internal fun InlineImage(url: String, altText: String, onOpenUrl: (String) -> Un
         }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
-                altText.ifBlank { "Image" }, color = SessionLabel, fontSize = 11.sp,
+                altText.ifBlank { "Image" }, color = captionColor, fontSize = 11.sp,
                 maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
             )
-            TextButton(onClick = { onOpenUrl(url) }) { Text("Open original", color = AccentOrange, fontSize = 11.sp) }
+            TextButton(onClick = { onOpenUrl(url) }) { Text("Open original", color = linkColor, fontSize = 11.sp) }
         }
     }
     if (expanded) ImageViewer(url, altText, onOpenUrl) { expanded = false }

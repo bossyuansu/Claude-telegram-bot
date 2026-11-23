@@ -133,7 +133,11 @@ fun MessageBubble(
                                         onUrlClick = onUrlClick
                                     )
                                 }
-                                is MessageSegment.Image -> InlineImage(segment.url, segment.altText, onUrlClick)
+                                is MessageSegment.Image -> InlineImage(
+                                    segment.url, segment.altText, onUrlClick,
+                                    captionColor = textColor,
+                                    linkColor = if (isBot) AccentOrange else textColor,
+                                )
                                 is MessageSegment.CodeBlock -> {
                                     Spacer(Modifier.height(6.dp))
                                     Column(
