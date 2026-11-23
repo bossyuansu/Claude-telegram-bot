@@ -1,8 +1,15 @@
 package com.claudebot.app
 
 import android.app.Application
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import coil.ImageLoader
+import coil.ImageLoaderFactory
+import coil.decode.GifDecoder
+import coil.decode.ImageDecoderDecoder
+import coil.decode.SvgDecoder
+import coil.memory.MemoryCache
 import com.claudebot.app.data.SettingsRepository
 import java.io.File
 import java.net.HttpURLConnection
@@ -12,7 +19,16 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
-class App : Application() {
+class App : Application(), ImageLoaderFactory {
+
+    override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
+        .memoryCache { MemoryCache.Builder(this).maxSizePercent(0.10).build() }
+        .components {
+            add(SvgDecoder.Factory())
+            if (Build.VERSION.SDK_INT >= 28) add(ImageDecoderDecoder.Factory())
+            else add(GifDecoder.Factory())
+        }
+        .build()
 
     companion object {
         /** How long the main thread may be unresponsive before we call it a stall. */

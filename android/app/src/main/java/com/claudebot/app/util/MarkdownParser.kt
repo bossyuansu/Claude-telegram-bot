@@ -15,6 +15,7 @@ import com.claudebot.app.ui.theme.InlineCodeBg
 sealed class MessageSegment {
     data class Text(val annotated: AnnotatedString) : MessageSegment()
     data class CodeBlock(val code: String, val language: String = "") : MessageSegment()
+    data class Image(val url: String, val altText: String = "") : MessageSegment()
 }
 
 fun parseMarkdown(text: String): List<MessageSegment> {
@@ -31,12 +32,16 @@ fun parseMarkdown(text: String): List<MessageSegment> {
             val code = if (lang.isNotEmpty() && lines.size > 1) lines[1] else part
             segments.add(MessageSegment.CodeBlock(code.trimEnd(), lang))
         } else if (part.isNotEmpty()) {
-            segments.add(MessageSegment.Text(parseInlineMarkdown(part)))
+            segments.addAll(splitImageSegments(part, ::parseInlineMarkdown))
         }
     }
 
     return segments.ifEmpty { listOf(MessageSegment.Text(AnnotatedString(text))) }
 }
+
+/** User messages retain their literal formatting while still showing image links. */
+fun parseMessageImages(text: String): List<MessageSegment> =
+    splitImageSegments(text) { AnnotatedString(it) }
 
 private fun parseInlineMarkdown(text: String): AnnotatedString {
     return buildAnnotatedString {
