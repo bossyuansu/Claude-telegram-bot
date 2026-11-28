@@ -92,6 +92,14 @@ export CLAUDE_GENERAL_MODEL=opus
 export CLAUDE_PLANNING_MODEL=opus
 ```
 
+## Codex models
+
+The default is `gpt-6.2-astra`, with quota-aware fallback to `gpt-6.2-sol`.
+Use `/model codex astra` or `/model codex sol` to select the latest model for a session;
+`/model codex default` clears that session's override. Full model IDs also work.
+Older models remain selectable as `astra-6`, `sol-6.1`, `sol-6`, and `sol-5.6`.
+`CODEX_MODEL` and `CODEX_FALLBACK_MODEL` can override the defaults.
+
 ## Goal Mode Manual Tests
 
 After automated tests pass, use [GOAL_MODE_MANUAL_TESTS.md](GOAL_MODE_MANUAL_TESTS.md)

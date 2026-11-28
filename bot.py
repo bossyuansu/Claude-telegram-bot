@@ -172,25 +172,11 @@ _USER_QUESTION_RE = re.compile(
 )
 _INCOMPLETE_TAIL_CHARS = 700
 
-# Codex model for JustDoIt orchestration (update when newer models release)
-# gpt-6-astra: promoted to default after a blind integration-defect benchmark (missing wiring /
-# wrong protocol / logic mismatch) where it caught 3/3 vs gpt-5.6-sol's 2/3 — sol missed the
-# missing-wiring defect entirely, which is the class that costs the most deepreview iterations.
-# Requires codex CLI >= 0.156.1. Astra costs materially more per token, hence the quota-aware
-# fallback below. Revert = export CODEX_MODEL=gpt-5.6-sol. Per-session override: /model codex <name>.
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6-astra")
-# Premium models get de-escalated to the fallback as the account's Codex quota window fills, so a
-# long autonomous loop degrades to a cheaper model instead of dying on a hard rate limit mid-run.
-# gpt-6-sol over gpt-5.6-sol: same 3/3 on the integration-defect benchmark, but ~24% fewer input
-# and ~37% fewer output tokens, and it reasoned further on the payload-mismatch case (noting stock
-# is decremented BEFORE the KeyError). Requires codex CLI >= 0.156.1 — 0.153.4 has no metadata for
-# it and the API then rejects it with the same 400 it gives a model name that does not exist, so a
-# CLI downgrade turns the fallback into a hard failure. Revert = export CODEX_FALLBACK_MODEL=gpt-5.6-sol.
-# Not yet measured: per-token quota WEIGHT. used_percent moves in whole percent over a 10080-minute
-# window, too coarse to attribute to one turn — so "cheaper in tokens" is not proven to be cheaper
-# against the rate limit. Watch the window burn rate after this change.
-CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-6-sol")
-CODEX_PREMIUM_MODELS = {"gpt-6-astra"}
+# Current Codex defaults; environment variables and per-session selections take precedence.
+# Keep Astra quota-aware, including the older Astra when selected explicitly.
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6.2-astra")
+CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-6.2-sol")
+CODEX_PREMIUM_MODELS = {"gpt-6.2-astra", "gpt-6-astra"}
 # How many recent rollouts to search for a rate_limits snapshot. Short/failed/probe runs produce
 # rollouts with none, and stopping at the first file made the quota reading — and therefore the
 # fallback — disappear. A handful is plenty; they are scanned newest-first and the first hit wins.
@@ -9210,7 +9196,7 @@ Use `/omni` again with an explicit decision (accept ops-blocked state, or provid
 GO_STRATEGY_PROMPT = """You are a task routing assistant. Given a user's task, pick the best execution strategy from these commands:
 
 - /claude — One Claude session (single turn, streaming). Best for: quick fixes, Q&A, focused edits, or investigation that doesn't need a separate review pass.
-- /codex — One Codex session (gpt-5.5, full-auto). Best for: well-specified mechanical work a single capable agent can finish in one pass — bulk refactors, migrations, codemods, or running/fixing a specific command.
+- /codex — One Codex session (configured Codex model, full-auto). Best for: well-specified mechanical work a single capable agent can finish in one pass — bulk refactors, migrations, codemods, or running/fixing a specific command.
 - /justdoit — Iterative loop: Claude implements, Codex reviews, repeat until the work is complete and tests pass. Best for: complex features that need reasoning plus a review gate every round.
 - /ralph — Fresh Codex session each iteration, with git history and files as the only memory (no context carried between rounds). The agent rediscovers progress from the repo each time and stops on RALPH_DONE. Best for: very long multi-step work where one context window would rot.
 - /deepreview — Adversarial cross-review: Claude and Codex review already-written code, surface bugs, and fix them (no new feature work). Best for: hardening, bug hunts, and pre-merge verification of existing code.
@@ -11311,7 +11297,7 @@ Example: `/schedule daily 09:00 | Run tests and fix failures`""")
 • `/cancel` - Cancel current session's task
 • `/claude [task]` - Run Claude task (session persists per project)
 • `/model [fable|opus|sonnet|haiku|default]` - Set/show the model `/claude` uses for this session
-• `/model codex [astra|sol|gpt-5.5|default]` - Set/show the Codex model (also used by justdoit/deepreview/goal reviewers)
+• `/model codex [astra|sol|astra-6|sol-6.1|sol-6|sol-5.6|gpt-5.5|default]` - Set/show the Codex model (also used by justdoit/deepreview/goal reviewers)
 • `/codex [task]` - Run Codex task (session persists per project)
 • `/gemini [task]` - Run Gemini task (session persists per project)
   Uses configured Gemini model (default `gemini-3.1-pro-preview`), auto-resumes previous session
@@ -11824,8 +11810,12 @@ Send a message to start working!""")
         }
         # Codex aliases -> the model id passed to `codex exec -m`.
         codex_aliases = {
-            "astra": "gpt-6-astra", "gpt-6-astra": "gpt-6-astra", "gpt6": "gpt-6-astra",
-            "sol": "gpt-5.6-sol", "gpt-5.6-sol": "gpt-5.6-sol",
+            "astra": "gpt-6.2-astra", "gpt-6.2-astra": "gpt-6.2-astra", "gpt6": "gpt-6.2-astra",
+            "sol": "gpt-6.2-sol", "gpt-6.2-sol": "gpt-6.2-sol",
+            "astra-6": "gpt-6-astra", "gpt-6-astra": "gpt-6-astra",
+            "sol-6.1": "gpt-6.1-sol", "gpt-6.1-sol": "gpt-6.1-sol",
+            "sol-6": "gpt-6-sol", "gpt-6-sol": "gpt-6-sol",
+            "sol-5.6": "gpt-5.6-sol", "gpt-5.6-sol": "gpt-5.6-sol",
             "gpt-5.5": "gpt-5.5", "5.5": "gpt-5.5",
         }
         arg = (args or "").strip().lower()
@@ -11840,7 +11830,7 @@ Send a message to start working!""")
                 send_message(chat_id,
                     f"*Codex model for* `{session.get('name', '')}`*:* `{current_codex}`\n"
                     + (usage + "\n" if usage else "") + "\n"
-                    "Set with `/model codex <astra|sol|gpt-5.5>` or `/model codex default` to clear.")
+                    "Set with `/model codex <astra|sol|astra-6|sol-6.1|sol-6|sol-5.6|gpt-5.5>` or `/model codex default` to clear.")
                 return True
             if carg in ("default", "clear", "reset", "off", "none"):
                 session.pop("codex_model_override", None)
@@ -11850,8 +11840,10 @@ Send a message to start working!""")
                 return True
             if carg not in codex_aliases:
                 send_message(chat_id,
-                    f"Unknown Codex model `{carg}`. Choose: `astra` (gpt-6-astra), `sol` (gpt-5.6-sol), "
-                    "`gpt-5.5`, or `default`.")
+                    f"Unknown Codex model `{carg}`. Choose: `astra` (gpt-6.2-astra), "
+                    "`sol` (gpt-6.2-sol), `astra-6` (gpt-6-astra), "
+                    "`sol-6.1` (gpt-6.1-sol), `sol-6` (gpt-6-sol), "
+                    "`sol-5.6` (gpt-5.6-sol), `gpt-5.5`, or `default`.")
                 return True
             chosen_cx = codex_aliases[carg]
             session["codex_model_override"] = chosen_cx
@@ -11871,7 +11863,7 @@ Send a message to start working!""")
                 f"• Codex: `{current_codex}`\n"
                 + (usage + "\n" if usage else "") + "\n"
                 "Set Claude: `/model <fable|opus|sonnet|haiku>`\n"
-                "Set Codex: `/model codex <astra|sol|gpt-5.5>`\n"
+                "Set Codex: `/model codex <astra|sol|astra-6|sol-6.1|sol-6|sol-5.6|gpt-5.5>`\n"
                 "Clear either with `default` (e.g. `/model default`, `/model codex default`).")
             return True
         if arg in ("default", "clear", "reset", "off", "none"):
